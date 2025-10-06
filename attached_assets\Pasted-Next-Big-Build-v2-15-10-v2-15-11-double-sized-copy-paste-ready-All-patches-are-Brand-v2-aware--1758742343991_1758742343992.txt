@@ -1,0 +1,378 @@
+Next Big Build v2.15.10 + v2.15.11 (double-sized, copy-paste ready)
+
+All patches are Brand v2–aware and dev-safe (new endpoints return safe empties if tables/columns aren’t present).
+
+v2.15.10 — CR scale & Kanban quick-edit
+1) Backend — Schedule bulk SLA nudges (next morning) + saved “nudge groups”
+
+server/routers/changes_nudge_schedule.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from typing import List, Optional
+from datetime import datetime, timedelta
+import pytz, os, json
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase, get_service_supabase
+
+router = APIRouter(prefix="/api/changes", tags=["changes"])
+PM_PLUS = require_role({"owner","admin","pm"})
+
+class ScheduleBulkBody(BaseModel):
+    ids: List[str]                       # CR ids to nudge (assignee-based)
+    at_local: Optional[str] = "09:00"    # HH:MM
+    timezone: Optional[str] = None
+    subject: Optional[str] = None        # optional override
+    html: Optional[str] = None           # optional override
+    min_hours_between: int = 12
+    name: Optional[str] = None           # save as group preset name (optional)
+
+@router.post("/schedule_nudge_bulk")
+def schedule_nudge_bulk(body: ScheduleBulkBody, project_id: str = Query(...),
+                        ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx); sbs = get_service_supabase()
+    # compute due time
+    tzname = body.timezone or (sb.table("org_comms_settings").select("timezone")
+               .eq("org_id", ctx.org_id).single().execute().data or {}).get("timezone") or "UTC"
+    tz = pytz.timezone(tzname)
+    hh, mm = (body.at_local or "09:00").split(":")
+    local_now = datetime.now(tz)
+    tomorrow = (local_now + timedelta(days=1)).replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+    due_utc = tomorrow.astimezone(pytz.UTC).isoformat()
+
+    # fetch assignees for the CR ids
+    try:
+        rows = sb.table("changes").select("id,title,assignee,priority,due_date")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id).in_("id", body.ids).execute().data or []
+    except Exception:
+        rows=[]
+
+    # create comms_queue items (one per assignee per CR)
+    queued=0
+    for r in rows:
+        to = r.get("assignee")
+        if not to: continue
+        try:
+            sbs.table("comms_queue").insert({
+                "org_id": ctx.org_id, "project_id": project_id,
+                "kind": "cr_nudge_bulk",
+                "to_email": to,
+                "not_before": due_utc,
+                "details": {
+                    "id": r.get("id"),
+                    "title": r.get("title"),
+                    "due": r.get("due_date"),
+                    "priority": r.get("priority"),
+                    "subject": body.subject,
+                    "html": body.html,
+                    "min_hours_between": body.min_hours_between
+                }
+            }).execute(); queued+=1
+        except Exception: ...
+    # save group preset (optional)
+    try:
+        if body.name:
+            sbs.table("ops_kv").upsert({
+                "key": f"cr_nudge_group:{ctx.org_id}:{project_id}:{body.name}",
+                "val": {"ids": body.ids, "subject": body.subject, "html": body.html}
+            }).execute()
+    except Exception: ...
+    return {"ok": True, "queued": queued, "scheduled_for": due_utc}
+
+@router.get("/nudge_groups")
+def nudge_groups(project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    try:
+        keypref = f"cr_nudge_group:{ctx.org_id}:{project_id}:"
+        rows = sb.table("ops_kv").select("key,val").ilike("key", keypref + "%").limit(200).execute().data or []
+        return {"items": [{"name": r["key"].split(":")[-1], "val": r.get("val")} for r in rows]}
+    except Exception:
+        return {"items": []}
+
+
+Scheduler enhancement — process cr_nudge_bulk along with other queue items.
+
+server/scheduler.py (extend process_comms_queue()):
+
+# inside for q in qs loop (after fetching qs):
+if q.get("kind") == "cr_nudge_bulk":
+    try:
+        to = q.get("to_email"); det = q.get("details") or {}
+        if not to: 
+            sbs.table("comms_queue").update({"sent_at":"now()"}).eq("id", q["id"]).execute(); 
+            continue
+        # throttle
+        mhb = int(det.get("min_hours_between", 12))
+        last = sbs.table("comms_send_log").select("created_at")\
+               .eq("org_id", q["org_id"]).eq("project_id", q.get("project_id"))\
+               .eq("kind","cr_nudge").eq("to_email", to)\
+               .order("created_at", desc=True).limit(1).execute().data
+        ok_throttle = True
+        if last:
+            import datetime as dt
+            dt_last = dt.datetime.fromisoformat(last[0]["created_at"].replace("Z","+00:00"))
+            ok_throttle = (dt.datetime.now(dt.timezone.utc) - dt_last) >= dt.timedelta(hours=mhb)
+        if ok_throttle:
+            from .email.util import mailgun_send_html, send_guard
+            ok,_ = send_guard(sbs, q["org_id"], q.get("project_id"), "cr_nudge", to)
+            if ok:
+                subj = det.get("subject") or f"[Nudge] CR '{(det.get('title') or '')}'"
+                html = (det.get("html") or "<p>{{TITLE}} — due {{DUE}}</p>").replace("{{TITLE}}", det.get("title") or "")\
+                       .replace("{{DUE}}", det.get("due") or "n/a").replace("{{PRIO}}", det.get("priority") or "n/a")
+                mailgun_send_html([to], subj, html)
+                sbs.table("comms_send_log").insert({
+                    "org_id": q["org_id"], "project_id": q.get("project_id"),
+                    "kind": "cr_nudge", "to_email": to, "details": {"id": det.get("id"), "queued": True}
+                }).execute()
+        sbs.table("comms_queue").update({"sent_at":"now()"}).eq("id", q["id"]).execute()
+    except Exception:
+        sbs.table("comms_queue").update({"sent_at":"now()"}).eq("id", q["id"]).execute()
+    continue
+
+
+Mount (if not already) in server/main.py:
+
+from .routers import changes_nudge_schedule
+app.include_router(changes_nudge_schedule.router)
+
+2) Frontend — ChangeList bulk “Schedule for 9am” + use saved group
+
+Patch client/src/pages/ChangeList.tsx (add below bulk nudge section)
+
+const [groups,setGroups]=useState<any[]>([]);
+useEffect(()=>{ (async()=>{ try{
+  const g = await getJSON(`/api/changes/nudge_groups?project_id=${projectId}`); setGroups(g.items||[]);
+}catch{} })(); },[projectId]);
+
+<div className="mt-2 flex gap-2">
+  <button className="brand-btn text-xs" disabled={!anySel} onClick={async()=>{
+    const ids = Object.keys(sel).filter(k=>sel[k]);
+    await fetch(`/api/changes/schedule_nudge_bulk?project_id=${projectId}`, {
+      method:"POST", credentials:"include", headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ ids, at_local: "09:00" })
+    }); alert("Scheduled for 9am tomorrow");
+  }}>Schedule 9am (selected)</button>
+
+  <select className="border rounded p-1 text-xs" onChange={async e=>{
+    const name = e.target.value; if(!name) return;
+    const grp = groups.find(x=>x.name===name); if(!grp) return;
+    await fetch(`/api/changes/schedule_nudge_bulk?project_id=${projectId}`, {
+      method:"POST", credentials:"include", headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ ids: grp.val?.ids || [], subject: grp.val?.subject, html: grp.val?.html, at_local:"09:00" })
+    }); alert("Scheduled group for 9am");
+  }}>
+    <option value="">Schedule saved group…</option>
+    {groups.map((g:any)=> <option key={g.name} value={g.name}>{g.name}</option>)}
+  </select>
+</div>
+
+
+Kanban quick-edit assignee/due (optional, similar to ChangeList inline edit):
+
+In ChangeKanban.tsx, inside card:
+
+<div className="mt-1 flex gap-1">
+  <input className="border rounded p-1 w-[120px]" defaultValue={i.assignee||""}
+         onBlur={e=> fetch(`/api/changes/update_small?id=${i.id}&project_id=${projectId}&assignee=${encodeURIComponent(e.target.value)}`, {method:"POST",credentials:"include"}) }/>
+  <input type="date" className="border rounded p-1" defaultValue={i.due_date||""}
+         onBlur={e=> fetch(`/api/changes/update_small?id=${i.id}&project_id=${projectId}&due_date=${encodeURIComponent(e.target.value)}`, {method:"POST",credentials:"include"}) }/>
+</div>
+
+v2.15.11 — Owner digest + Releases compare + Ops audit filters
+3) Backend — Owner daily digest of CRs in owned areas
+
+server/routers/owner_digest.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from datetime import datetime, timedelta, timezone
+from ..tenant import TenantCtx
+from ..guards import require_role, member_ctx
+from ..deps import get_user_supabase
+import os
+
+router = APIRouter(prefix="/api/owner", tags=["owner"])
+
+def _areas_for_user(sb, org_id, project_id, user_id):
+    try:
+        a = sb.table("area_admins").select("area,user_id").eq("org_id",org_id).eq("project_id",project_id).eq("user_id",user_id).execute().data or []
+        return [x["area"] for x in a]
+    except Exception: return []
+
+@router.post("/digest_send")
+def digest_send(project_id: str = Query(...), ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    sb = get_user_supabase(ctx); sent=0
+    try:
+        owners = sb.table("area_admins").select("area,user_id").eq("org_id",ctx.org_id).eq("project_id",project_id).execute().data or []
+        people = {}
+        for r in owners: people.setdefault(r["user_id"], set()).add(r["area"])
+        if not people: return {"ok": True, "sent": 0}
+
+        # load changes once
+        crs = sb.table("changes").select("id,title,area,priority,due_date,status,assignee")\
+              .eq("org_id",ctx.org_id).eq("project_id",project_id).execute().data or []
+
+        from ..email.util import mailgun_send_html, send_guard
+        for uid, areas in people.items():
+            # resolve email
+            em = sb.table("users_profile").select("email").eq("user_id",uid).single().execute().data or {}
+            email = em.get("email")
+            if not email: continue
+            body = "<h3>Open CRs in your areas</h3><ul>"
+            owned = [c for c in crs if (c.get("area") or "") in areas and (c.get("status") or "open") not in ("closed","deployed")]
+            if not owned: 
+                body += "<li>None</li></ul>"
+            else:
+                for c in owned[:50]:
+                    body += f"<li>{c.get('title')} — {c.get('area')} • P:{c.get('priority')} • due {c.get('due_date') or 'n/a'} • {c.get('status')}</li>"
+                body += "</ul>"
+            ok,_ = send_guard(sb, ctx.org_id, project_id, "owner_digest", email)
+            if ok:
+                mailgun_send_html([email], "[TEAIM] Daily Owner Digest", body); sent+=1
+        return {"ok": True, "sent": sent}
+    except Exception:
+        return {"ok": False, "sent": sent}
+
+
+Mount in server/main.py:
+
+from .routers import owner_digest
+app.include_router(owner_digest.router)
+
+
+(Optionally call this from a scheduler once per day.)
+
+4) Backend — Releases compare notes + notes HTML (brand header)
+
+server/routers/releases_compare.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import HTMLResponse
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+from ..brand.export_header import export_header_html
+
+router = APIRouter(prefix="/api/releases", tags=["releases"])
+
+@router.get("/compare")
+def compare(project_id: str = Query(...), a: str = Query(...), b: str = Query(...),
+            ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        ra = sb.table("releases").select("cr_ids").eq("org_id",ctx.org_id).eq("project_id",project_id).eq("id",a).single().execute().data or {}
+        rb = sb.table("releases").select("cr_ids").eq("org_id",ctx.org_id).eq("project_id",project_id).eq("id",b).single().execute().data or {}
+        A=set(ra.get("cr_ids") or []); B=set(rb.get("cr_ids") or [])
+        return {"added": list(B-A), "removed": list(A-B)}
+    except Exception:
+        return {"added": [], "removed": []}
+
+@router.get("/notes.html", response_class=HTMLResponse)
+def notes_html(project_id: str = Query(...), id: str = Query(...),
+               ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    org = sb.table("org_branding").select("*").eq("org_id",ctx.org_id).single().execute().data or {}
+    proj = sb.table("projects").select("code").eq("id", project_id).single().execute().data or {}
+    hdr = export_header_html(org, proj.get("code") or project_id)
+    try:
+        r = sb.table("releases").select("name,cr_ids").eq("org_id",ctx.org_id).eq("project_id",project_id).eq("id",id).single().execute().data or {}
+        crids = r.get("cr_ids") or []
+        if crids:
+            cr = sb.table("changes").select("id,title,area,status").eq("org_id",ctx.org_id).eq("project_id",project_id).in_("id",crids).execute().data or []
+        else:
+            cr=[]
+    except Exception:
+        cr=[]
+    lis = "".join([f"<li>{c.get('title')} — {c.get('area')} • {c.get('status')}</li>" for c in cr])
+    return HTMLResponse(f"<html><body style='font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:880px;margin:auto'>{hdr}<h2>Release Notes</h2><ul>{lis or '<li>No CRs</li>'}</ul></body></html>")
+
+
+Mount in server/main.py:
+
+from .routers import releases_compare
+app.include_router(releases_compare.router)
+
+
+UI snippet (in Releases.tsx under calendar), add two selects + buttons to compare:
+
+const [ra,setRa]=useState(""); const [rb,setRb]=useState("");
+<div className="brand-card p-3 mb-2">
+  <div className="text-xs font-medium mb-1">Compare Releases</div>
+  <div className="flex items-center gap-2">
+    <select className="border rounded p-1 text-xs" value={ra} onChange={e=>setRa(e.target.value)}>
+      <option value="">Release A…</option>{items.map(r=><option key={r.id} value={r.id}>{r.name}</option>)}
+    </select>
+    <select className="border rounded p-1 text-xs" value={rb} onChange={e=>setRb(e.target.value)}>
+      <option value="">Release B…</option>{items.map(r=><option key={r.id} value={r.id}>{r.name}</option>)}
+    </select>
+    <button className="brand-btn text-xs" onClick={async()=>{
+      if(!ra || !rb) return;
+      const d = await (await fetch(`/api/releases/compare?project_id=${projectId}&a=${ra}&b=${rb}`, {credentials:"include"})).json();
+      alert(`Added: ${d.added.length} • Removed: ${d.removed.length}`);
+    }}>Diff</button>
+    <a className="brand-btn text-xs" target="_blank" rel="noreferrer" href={`/api/releases/notes.html?project_id=${projectId}&id=${ra || rb || (items[0]?.id||'')}`}>Open Notes HTML</a>
+  </div>
+</div>
+
+5) Ops — Audit feed widget (search + date)
+
+Backend server/routers/ops_audit_feed.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from datetime import datetime, timedelta, timezone
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/ops", tags=["ops"])
+
+@router.get("/audit_feed")
+def audit_feed(project_id: str = Query(...), q: str|None=None, days:int=7,
+               ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    sb = get_user_supabase(ctx)
+    start = (datetime.now(timezone.utc)-timedelta(days=max(1,days))).isoformat()
+    try:
+        rows = sb.table("audit_events").select("created_at,kind,details")\
+               .eq("org_id",ctx.org_id).eq("project_id",project_id).gte("created_at",start)\
+               .order("created_at",desc=True).limit(500).execute().data or []
+    except Exception:
+        rows=[]
+    if q:
+        ql = q.lower()
+        rows = [r for r in rows if ql in (r.get("kind") or "").lower() or ql in str(r.get("details") or "").lower()]
+    return {"items": rows}
+
+
+Mount in server/main.py:
+
+from .routers import ops_audit_feed
+app.include_router(ops_audit_feed.router)
+
+
+Frontend card anywhere (Area page or Ops):
+
+const [q,setQ]=useState(""); const [days,setDays]=useState(7); const [feed,setFeed]=useState<any[]>([]);
+useEffect(()=>{ (async()=>{ const d=await getJSON(`/api/ops/audit_feed?project_id=${projectId}&q=${encodeURIComponent(q)}&days=${days}`); setFeed(d.items||[]); })(); },[projectId,q,days]);
+
+<div className="brand-card p-3">
+  <div className="flex items-center gap-2 text-xs">
+    <input className="border rounded p-1" placeholder="search…" value={q} onChange={e=>setQ(e.target.value)}/>
+    <select className="border rounded p-1" value={days} onChange={e=>setDays(parseInt(e.target.value))}>
+      {[1,3,7,14,30].map(d=><option key={d} value={d}>Last {d}d</option>)}
+    </select>
+  </div>
+  <div className="text-xs max-h-[32vh] overflow-auto mt-2">
+    {feed.map((f,i)=><div key={i} className="border-b py-1">{new Date(f.created_at).toLocaleString()} • {f.kind}</div>)}
+    {!feed.length && <div className="text-muted-foreground">No events.</div>}
+  </div>
+</div>
+
+2-Minute Validation
+
+CRs: bulk schedule nudges for 9am next morning, save groups; inline due/assignee edits on both List & Kanban
+
+Owner: daily digest of open CRs in owned areas; owner dashboard shows owned areas + CRs
+
+Releases: compare two releases; open Notes HTML with brand header; download ICS for the month
+
+Area audit: filter by kinds & export CSV; Ops audit feed has search/date range; header update dots persist server-side

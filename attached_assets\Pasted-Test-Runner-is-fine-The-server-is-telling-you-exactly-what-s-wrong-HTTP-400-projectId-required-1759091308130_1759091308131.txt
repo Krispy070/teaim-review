@@ -1,0 +1,140 @@
+Test Runner is fine. The server is telling you exactly what’s wrong:
+
+HTTP 400 – “projectId required.”
+Your Seed call isn’t sending a projectId, or the server only accepts project_id.
+
+Let’s fix both sides so it always works.
+
+Quick fix (client) — always resolve and pass projectId
+
+Copy-paste into client/src/pages/TestRunner.tsx (top of file):
+
+import { useLocation } from "react-router-dom";
+
+function useResolvedProjectId(currentProject?: { id?: string }) {
+  const loc = useLocation();
+  // 1) try current project state
+  if (currentProject?.id) return currentProject.id;
+  // 2) try URL: /projects/:projectId/...
+  const m = loc.pathname.match(/\/projects\/([0-9a-f-]{36})\b/i);
+  if (m) return m[1];
+  // 3) try global injected var (optional)
+  // @ts-ignore
+  if (window.__PID) return window.__PID as string;
+  return "";
+}
+
+
+Then in the component:
+
+const projectId = useResolvedProjectId(currentProject);
+// guard UI
+const canSeed = Boolean(projectId);
+
+
+Update the Seed call to always send it (and never throw):
+
+async function seed() {
+  setBusy(true); setErr(null);
+
+  if (!projectId) {
+    setErr("Pick a project first — no projectId resolved.");
+    setBusy(false);
+    return;
+  }
+
+  try {
+    const res = await fetch("/admin/test/seed-v2", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId }) // <-- important
+    });
+
+    const raw = await res.text();
+    let d: any;
+    try { d = raw ? JSON.parse(raw) : {}; } catch (e:any) { d = { ok:false, parseError:String(e), raw, status:res.status }; }
+
+    setSeedLog(JSON.stringify(d, null, 2));
+
+    if (!res.ok || d?.ok === false) {
+      setErr(`Seed endpoint error (HTTP ${res.status}). ${d?.error ?? d?.parseError ?? ""}`);
+      return;
+    }
+    await runAllTests(projectId);
+  } catch (e:any) {
+    setErr(`Seed call failed: ${String(e)}`);
+  } finally {
+    setBusy(false);
+  }
+}
+
+
+(Optional) Disable the button if no project detected:
+
+<button className="k-btn k-btn--primary" onClick={seed} disabled={!canSeed || busy}>
+  {busy ? "Seeding…" : "Seed & Run"}
+</button>
+{!canSeed && <div className="mt-2 text-[13px] text-amber-300">No project detected in URL or context.</div>}
+
+Safety net (server) — accept both camel & snake
+
+In server/admin/test/index.py (or your FastAPI seed router):
+
+from fastapi import APIRouter, Body
+router = APIRouter()
+
+@router.post("/seed-v2")
+def seed_v2(body: dict = Body(...)):
+    # accept both names + query fallback if you also support GET
+    pid = body.get("projectId") or body.get("project_id")
+    if not pid:
+        return {"ok": False, "error": "projectId required"}
+    try:
+        out = seedMinimal(pid, body.get("userId"))
+        return {"seeder":"v2", "ok": True, **out}
+    except Exception as e:
+        return {"seeder":"v2", "ok": False, "error": str(e)}
+
+
+Mount under /admin/test as you already do.
+
+If the button still shows 400 after the patch
+
+Run these three smokes in the browser console (with the project UUID you see in the URL bar):
+
+const PID = "e1ec6ad0-a4e8-45dd-87b0-e123776ffe6e";
+
+fetch("/admin/test/seed-v2", {
+  method:"POST", headers:{ "Content-Type":"application/json" },
+  body: JSON.stringify({ projectId: PID })
+}).then(r=>r.json()).then(console.log);
+
+
+If you still see {ok:false,"error":"projectId required"}, the server handler isn’t the one being hit (wrong path). Check your mounts; the route must be /admin/test/seed-v2.
+
+Quick route sanity at server boot:
+
+print("Routes:", [r.path for r in app.router.routes if "seed" in r.path])
+
+Bonus: make project selection explicit (if needed)
+
+Add a mini picker at the top of the Test Runner page:
+
+const [manualPid, setManualPid] = useState("");
+const effectivePid = manualPid || projectId;
+
+<input className="k-input w-[360px]" placeholder="Project ID"
+  value={manualPid} onChange={e=>setManualPid(e.target.value)} />
+
+
+Then use effectivePid in the seed call.
+
+TL;DR
+
+The UI was throwing on any non-OK response; we now show the error and keep working.
+
+The UI now always passes a projectId (resolved from state/URL).
+
+The server accepts both projectId and project_id.
+
+Do just that, hit Seed & Run, and you should see either a successful seed JSON or a useful message (not a hard crash). If the seed JSON comes back OK, we’ll immediately tackle those last 3 runner checks.

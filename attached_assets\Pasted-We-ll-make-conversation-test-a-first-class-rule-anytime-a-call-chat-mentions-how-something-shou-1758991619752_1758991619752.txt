@@ -1,0 +1,172 @@
+We’ll make “conversation → test” a first-class rule: anytime a call/chat mentions how something should work, a change, or a process step, we capture it as a test candidate, draft scripts, and route to PM for approval.
+
+Here’s the next build—tight, copy-paste ready.
+
+1) LLM extraction (add “tests” everywhere)
+Tool/Function schema (ChatGPT call)
+{
+  "type": "object",
+  "properties": {
+    "tests": {
+      "type": "array",
+      "items": {
+        "type":"object",
+        "properties": {
+          "title": {"type":"string"},                     // short intent
+          "gherkin": {"type":"string"},                   // Given/When/Then
+          "steps": {"type":"array","items":{"type":"string"}}, // click-by-click
+          "areaKey": {"type":"string"},                   // HCM|FIN|... (best guess)
+          "bpCode": {"type":"string"},                    // optional: HIRE_EMPLOYEE etc.
+          "priority": {"type":"string","enum":["P0","P1","P2","P3"]},
+          "type": {"type":"string","enum":["happy","edge","negative","regression"]},
+          "ownerHint": {"type":"string"},
+          "tags": {"type":"array","items":{"type":"string"}},
+          "trace": {"type":"array","items":{"type":"string"}}, // transcript quotes
+          "confidence": {"type":"number"},
+          "dedupeKey": {"type":"string"}                  // hash of normalized title+bp+area
+        },
+        "required":["title","gherkin","steps","confidence","dedupeKey"]
+      }
+    }
+  },
+  "required": ["tests"]
+}
+
+
+Prompt rule: “If you detect process, capability, how it should work, change, or risk → produce at least one test.”
+
+2) Staging tables (Drizzle/SQL—minimal)
+-- tests captured from transcripts, pending PM review
+create table if not exists staging_tests (
+  id uuid primary key,
+  project_id uuid not null,
+  transcript_id uuid not null,
+  dedupe_key varchar(160) not null,
+  title varchar(240) not null,
+  gherkin text not null,
+  steps jsonb not null default '[]',
+  area_key varchar(24),
+  bp_code varchar(80),
+  priority varchar(4) default 'P2',
+  type varchar(16) default 'happy',
+  owner_hint varchar(120),
+  tags jsonb default '[]',
+  trace jsonb not null,                 -- array of transcript spans/quotes
+  confidence numeric not null,
+  created_at timestamp default now()
+);
+create unique index if not exists uq_staging_tests_dedupe
+  on staging_tests(project_id, dedupe_key);
+
+-- approved library
+create table if not exists tests_library (
+  id uuid primary key,
+  project_id uuid not null,
+  area_key varchar(24),
+  bp_code varchar(80),
+  title varchar(240) not null,
+  version int not null default 1,
+  gherkin text not null,
+  steps jsonb not null,
+  priority varchar(4) not null,
+  type varchar(16) not null,
+  tags jsonb not null default '[]',
+  source_transcript_id uuid,
+  created_by uuid,
+  created_at timestamp default now()
+);
+
+create table if not exists tests_history (
+  id uuid primary key,
+  test_id uuid not null,
+  version int not null,
+  diff jsonb not null,                  -- structured before/after
+  committed_at timestamp default now(),
+  committed_by uuid
+);
+
+3) API endpoints
+GET  /admin/review/tests?projectId=...            # list staged tests
+POST /admin/review/tests/commit                   # approve/edit/reject batch
+BODY: {
+  "projectId":"...",
+  "approved":[{"id":"...", "overrides": { "areaKey":"HCM","priority":"P1", ... }}],
+  "rejected":["id","id2"],
+  "edited":[{"id":"...","title":"...", "gherkin":"...", "steps":[...] }]
+}
+
+
+Commit logic
+
+For each approved item:
+
+Upsert into tests_library by (project_id, dedupe_key)
+
+if exists: version = version + 1, write tests_history diff
+
+else: create v1
+
+Link source_transcript_id
+
+Delete from staging_tests
+
+4) Review UI (line-by-line)
+
+Add “Tests” section on the transcript review page:
+
+Row shows: title • area • bp • priority • type • confidence
+
+Buttons: Approve, Edit, Reject
+
+Edit drawer fields: title, area, bp, priority (P0–P3), type, tags, gherkin (textarea), steps (list editor)
+
+Bulk: “Approve all ≥0.85” (still shows diff before commit)
+
+5) Gherkin scaffolding (LLM post-format)
+
+When we store, normalize into a clean template:
+
+Feature: {AreaKey} — {Title}
+
+Background:
+  Given I am an authenticated {role} in {tenant}
+
+Scenario: {Type} — {Title}
+{GWT block}
+
+
+If gherkin missing pieces, auto-generate from steps (LLM fallback) but keep both fields.
+
+6) Auto-capture rule (everywhere)
+
+Hook this into any call/chat/meeting ingest:
+
+Run extraction with above schema.
+
+Insert every test into staging_tests (dedupe on key).
+
+Drop a PM notification: “New test candidates from Transcript #123 (6 items)”.
+
+7) Corrections & traceability
+
+When PM marks a prior test wrong, create a new library version and write to tests_history with:
+
+reason: "transcript_correction", source_transcript_id, and strikethrough in diff viewer.
+
+8) Seed + smoke
+
+Seeder: add 2 staged tests (HCM happy + FIN negative) so UI isn’t empty.
+
+Smokes (DevTools):
+
+fetch(`/admin/review/tests?projectId=${pid}`).then(r=>r.json()).then(console.log)
+fetch(`/admin/review/tests/commit`, {method:"POST",headers:{"Content-Type":"application/json"},
+  body: JSON.stringify({projectId:pid, approved:[{id:"...",overrides:{priority:"P1"}}]})})
+
+9) Guardrails you’ll like
+
+Idempotent: dedupe_key prevents spam; re-ingest updates the same staged row.
+
+Human-in-the-loop: nothing hits tests_library without PM approval.
+
+Audit-ready: diffs + transcript links + who approved.

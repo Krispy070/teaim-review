@@ -1,0 +1,356 @@
+Next Big Build v2.12.5 (two sprints in one), tuned for PM speed. Everything is copy-paste ready, Brand v2–aware, and dev-safe (new endpoints degrade gracefully if a table is missing).
+
+Landing now:
+
+Request Sign-Off v3.4+ — multi-area chips + “save defaults for this stage”, CC Leads/PMs presets remembered per project, optional Doc link + message (single rich email)
+
+Stages Editor – Undo model — “Undo last” (per row) already live; now Undo All since last SAVE + Save All (new snapshot) + per-row “Saved at” stamp
+
+Digests – prefilter deep links — Actions List / Audit Timeline open filter panels, prefill owner/area, then scroll+glow exact row
+
+Wellness Admin – Compare CSV + overlay prior-period dotted line on trend (7/30d)
+
+1) Request Sign-Off v3.4+ — save & reuse defaults (stage + project)
+1A) Backend (already supports cc_all_leads/cc_all_pms/doc_link). No change required if you applied v2.12.4.
+1B) Frontend — modal: “Apply defaults on open” & “Save as default”
+
+client/src/components/SignoffRequestModal.tsx (replace your current v3.3; diffs are small but safest to paste)
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { getJSON } from "@/lib/authFetch";
+
+const DEFAULT_AREAS = ["HCM","Payroll","Financials","Time","Integrations","Security","Reporting","Cutover"];
+
+export default function SignoffRequestModal({
+  projectId, stageId, stageTitle, stageArea, onClose
+}:{
+  projectId: string; stageId: string; stageTitle?: string; stageArea?: string; onClose: ()=>void
+}){
+  const [members,setMembers]=useState<{user_id:string;email:string;role?:string;can_sign_all?:boolean;sign_areas?:string[]}[]>([]);
+  const [signers,setSigners]=useState<typeof members>([]);
+
+  const [q,setQ]=useState("");
+  const [areas,setAreas]=useState<string[]>(stageArea?[stageArea]:[]);
+  const [picked,setPicked]=useState<string[]>([]);
+  const [cc,setCc]=useState<string>("");
+  const [ccAllLeads,setCcAllLeads]=useState(false);
+  const [ccAllPMs,setCcAllPMs]=useState(false);
+  const [docLink,setDocLink]=useState("");
+  const [msg,setMsg]=useState<string>("");
+  const [applyDefaultsOnOpen,setApplyDefaultsOnOpen]=useState(true);
+  const [saveAsDefault,setSaveAsDefault]=useState(false);
+  const [busy,setBusy]=useState(false);
+  const inputRef = useRef<HTMLInputElement|null>(null);
+
+  const storeKeyStage = `kap.stageReq.${projectId}.${stageId}`;   // per-stage defaults (areas, message, docLink, last emails)
+  const storeKeyProj  = `kap.signoff.ccPresets.${projectId}`;      // per-project CC presets (leads/PMs)
+
+  useEffect(()=>{ inputRef.current?.focus(); },[]);
+
+  // Load members, signers, defaults
+  useEffect(()=>{ (async()=>{
+    try{
+      const m = await getJSON(`/api/members/all?project_id=${projectId}`); setMembers(m.items||[]);
+      const d = await getJSON(`/api/members/signers?project_id=${projectId}${stageArea?`&area=${encodeURIComponent(stageArea)}`:""}`); setSigners(d.items||[]);
+    }catch{ setMembers([]); setSigners([]); }
+    try{
+      const presets = JSON.parse(localStorage.getItem(storeKeyProj) || "{}");
+      if (presets.ccAllLeads) setCcAllLeads(true);
+      if (presets.ccAllPMs) setCcAllPMs(true);
+    }catch{}
+    try{
+      const saved = JSON.parse(localStorage.getItem(storeKeyStage) || "{}");
+      if (applyDefaultsOnOpen){
+        if (saved.areas) setAreas(saved.areas);
+        if (saved.message) setMsg(saved.message);
+        if (saved.docLink) setDocLink(saved.docLink);
+        if (saved.cc) setCc(saved.cc);
+        if (saved.emails) setPicked(saved.emails);  // optional: comment out if you don’t want past recipients auto-selected
+      }
+    }catch{}
+  })(); },[projectId, stageArea, storeKeyProj, storeKeyStage, applyDefaultsOnOpen]);
+
+  const hits = useMemo(()=>{
+    const allowedByArea = (p:any)=> p.can_sign_all || areas.length===0 || areas.some(a => (p.sign_areas||[]).includes(a));
+    const pool = members.map(m=>{
+      const s = signers.find(x=>x.user_id===m.user_id);
+      const allowed = (s?.allowed || m.can_sign_all || areas.length===0 || (m.sign_areas||[]).some(a=>areas.includes(a)));
+      return {...m, allowed};
+    });
+    const qq = q.toLowerCase();
+    return pool.filter(p=>{
+      const matchQ = !qq || (p.email||"").toLowerCase().includes(qq) || (p.role||"").toLowerCase().includes(qq);
+      const matchArea = allowedByArea(p);
+      return matchQ && matchArea;
+    }).sort((a,b)=> (a.allowed===b.allowed) ? ((a.role||"").localeCompare(b.role||"")) : (a.allowed? -1 : 1));
+  },[members, signers, q, areas]);
+
+  function toggle(email:string){
+    setPicked(p => p.includes(email) ? p.filter(x=>x!==email) : [...p, email]);
+  }
+  function applyPreset(which:"leads"|"pms"){
+    const wanted = which==="leads" ? ["lead"] : ["pm"];
+    const emails = hits.filter(h=> wanted.includes((h.role||"").toLowerCase()) ).map(h=>h.email);
+    setPicked(prev => Array.from(new Set([ ...prev, ...emails ])));
+    const saved = JSON.parse(localStorage.getItem(storeKeyProj) || "{}");
+    localStorage.setItem(storeKeyProj, JSON.stringify({...saved, ccAllLeads: which==="leads" ? true : !!saved.ccAllLeads, ccAllPMs: which==="pms" ? true : !!saved.ccAllPMs}));
+    which==="leads"? setCcAllLeads(true) : setCcAllPMs(true);
+  }
+  function toggleArea(a:string){ setAreas(prev => prev.includes(a) ? prev.filter(x=>x!==a) : [...prev, a]); }
+
+  async function send(){
+    if (!picked.length) return alert("Pick at least one recipient");
+    const ccList = cc.split(",").map(x=>x.trim()).filter(Boolean);
+    setBusy(true);
+    try{
+      await fetch(`/api/stages/request_signoff_batch?project_id=${projectId}`, {
+        method:"POST", credentials:"include", headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          stage_id: stageId, emails: picked, cc: ccList,
+          cc_all_leads: ccAllLeads, cc_all_pms: ccAllPMs,
+          title: stageTitle, area: areas[0] || stageArea || "", message: msg, doc_link: docLink
+        })
+      });
+      if (saveAsDefault){
+        localStorage.setItem(storeKeyStage, JSON.stringify({ emails:picked, cc, areas, message:msg, docLink }));
+      }
+      alert(`Request sent to ${picked.length} recipient(s)`); onClose();
+    }catch(e:any){ alert(String(e?.message||e)); setBusy(false); }
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-[200]" onClick={onClose}>
+      <div className="mx-auto mt-[8vh] w-[780px] max-w-[96%] bg-white dark:bg-neutral-900 rounded shadow-xl border"
+           onClick={e=>e.stopPropagation()}>
+        <div className="p-3 border-b">
+          <div className="text-sm font-medium">Request Sign-Off</div>
+          <div className="text-xs text-muted-foreground">{stageTitle}{stageArea?` • ${stageArea}`:""}</div>
+        </div>
+        <div className="p-3 space-y-2">
+          <div className="flex items-center gap-2">
+            <input ref={inputRef} className="border rounded p-2 w-full text-sm"
+                   placeholder="Search recipients (email or role)…" value={q} onChange={e=>setQ(e.target.value)} />
+            <div className="flex items-center gap-2">
+              {DEFAULT_AREAS.map(a=>(
+                <button key={a} className={`brand-btn text-[11px] ${areas.includes(a)?'pulse-once':''}`} onClick={()=>toggleArea(a)}>{a}</button>
+              ))}
+              <button className="brand-btn text-[11px]" onClick={()=>setAreas([])}>All</button>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 text-xs">
+            <button className="brand-btn text-xs" onClick={()=>applyPreset("leads")}>+ Leads</button>
+            <button className="brand-btn text-xs" onClick={()=>applyPreset("pms")}>+ PMs</button>
+            <label className="ml-auto flex items-center gap-1"><input type="checkbox" checked={applyDefaultsOnOpen} onChange={e=>setApplyDefaultsOnOpen(e.target.checked)}/> Apply defaults on open</label>
+            <label className="flex items-center gap-1"><input type="checkbox" checked={saveAsDefault} onChange={e=>setSaveAsDefault(e.target.checked)}/> Save as default</label>
+          </div>
+
+          <div className="max-h-[32vh] overflow-auto border rounded">
+            {hits.map(h=>(
+              <label key={h.email} className="flex items-center gap-2 px-2 py-1 hover:bg-black/5 dark:hover:bg-white/5">
+                <input type="checkbox" checked={picked.includes(h.email)} onChange={()=>toggle(h.email)} />
+                <span className="text-sm">{h.email}</span>
+                <span className="text-[11px] text-muted-foreground ml-auto">
+                  {h.role || ""} {h.can_sign_all ? "• signer(all)" : h.sign_areas?.length ? `• signer(${h.sign_areas.join(",")})`:""}
+                </span>
+              </label>
+            ))}
+            {!hits.length && <div className="p-2 text-xs text-muted-foreground">No matches</div>}
+          </div>
+
+          <div className="grid md:grid-cols-2 gap-2">
+            <input className="border rounded p-2 text-sm" placeholder="CC (comma-separated)" value={cc} onChange={e=>setCc(e.target.value)} />
+            <div className="flex items-center gap-2 text-xs">
+              <label className="flex items-center gap-1"><input type="checkbox" checked={ccAllLeads} onChange={e=>setCcAllLeads(e.target.checked)}/> CC all leads</label>
+              <label className="flex items-center gap-1"><input type="checkbox" checked={ccAllPMs} onChange={e=>setCcAllPMs(e.target.checked)}/> CC all PMs</label>
+            </div>
+          </div>
+
+          <input className="border rounded p-2 w-full text-sm" placeholder="Optional document link (reference URL)" value={docLink} onChange={e=>setDocLink(e.target.value)} />
+          <textarea className="border rounded p-2 w-full text-sm" rows={3} placeholder="Optional message…" value={msg} onChange={e=>setMsg(e.target.value)} />
+        </div>
+
+        <div className="p-3 border-t flex justify-end gap-2">
+          <button className="brand-btn text-xs" onClick={onClose}>Cancel</button>
+          <button className="brand-btn text-xs swoosh" onClick={send} disabled={busy || picked.length===0}>
+            {busy?"Sending…":`Send (${picked.length})`}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+2) Stages — Undo All since last SAVE + per-row “Saved HH:MM”
+
+client/src/pages/Stages.tsx (augment the snapshot/toolbar you added last time)
+
+const [snapshot,setSnapshot] = useState<Record<string,{start_date?:string;end_date?:string}>>({});
+const [savedAt,setSavedAt] = useState<string>("");
+const [rowSavedAt,setRowSavedAt] = useState<Record<string,string>>({});
+
+useEffect(()=>{ // on initial list load, take snapshot
+  const snap: Record<string,{start_date?:string;end_date?:string}> = {};
+  (stages||[]).forEach(s=> snap[s.id] = { start_date:s.start_date, end_date:s.end_date });
+  setSnapshot(snap);
+  setSavedAt(new Date().toLocaleTimeString());
+},[stages.length]);
+
+async function saveField(id:string, patch:any){
+  // your existing API call…
+  await postJSON(`/api/stages/update?stage_id=${id}&project_id=${projectId}`, patch);
+  setDirty(d=>({...d,[id]:false}));
+  setRowSavedAt(t => ({...t, [id]: new Date().toLocaleTimeString()}));
+}
+
+// Save All (new snapshot)
+async function saveAllSnapshot(){
+  const snap: Record<string,{start_date?:string;end_date?:string}> = {};
+  for (const s of stages){
+    snap[s.id] = { start_date:s.start_date, end_date:s.end_date };
+  }
+  setSnapshot(snap);
+  setSavedAt(new Date().toLocaleTimeString());
+  toast({ title:"Snapshot saved", description:"Undo All will revert to this state" });
+}
+
+// Undo all since last snapshot
+async function undoAll(){
+  for (const s of stages){
+    const prev = snapshot[s.id]; if (!prev) continue;
+    if (s.start_date!==prev.start_date || s.end_date!==prev.end_date){
+      await saveField(s.id, prev);
+    }
+  }
+  setSavedAt(new Date().toLocaleTimeString());
+  toast({ title:"Reverted", description:"All stages restored to snapshot" });
+}
+
+
+Top toolbar:
+
+<div className="flex items-center justify-between mb-2">
+  <div className="text-xl font-semibold heading">Stages</div>
+  <div className="flex items-center gap-2">
+    <span className="text-xs text-muted-foreground">Snapshot: {savedAt || "—"}</span>
+    <button className="brand-btn text-xs" onClick={saveAllSnapshot}>Save All (snapshot)</button>
+    <button className="brand-btn text-xs" onClick={undoAll}>Undo All</button>
+  </div>
+</div>
+
+
+Per-row stamp next to your existing row toolbar:
+
+<div className="flex items-center justify-end gap-2">
+  <span className="text-[11px] text-muted-foreground">Saved {rowSavedAt[s.id] || "—"}</span>
+  <button className="brand-btn text-xs" onClick={()=>revertLast(s.id)} disabled={!(txStack[s.id]||[]).length}>Revert last</button>
+</div>
+
+
+Your duration-preserving keyboard edits from v2.12 carry over untouched.
+
+3) Digests — deep links with prefilters → open filters & scroll
+
+(You already added openFilters & anchor scroll.)
+Ensure Actions List & Audit Timeline parse owner/area/tab and apply to state before render (as patched in prior drop). Now your digest can generate links like:
+
+/projects/:pid/actions/list#openFilters=1&owner=alice@acme.com&area=Payroll&id=<actionId>
+/projects/:pid/admin/audit-timeline#openFilters=1&tab=risks&area=HCM&id=<riskId>
+
+
+Those pages open with their filters pre-populated, then scroll/glow the row.
+
+4) Wellness Admin — compare CSV + dotted prior-period overlay
+4A) Backend compare CSV
+
+server/routers/wellness_compare_csv.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
+import io, csv
+from datetime import datetime, timedelta, timezone
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/wellness", tags=["wellness"])
+
+@router.get("/compare.csv")
+def compare_csv(project_id: str = Query(...), days: int = 30,
+                ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    sb = get_user_supabase(ctx)
+    days = 7 if days==7 else 30
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days-1)
+    prev_start = start - timedelta(days=days)
+    prev_end = start - timedelta(days=1)
+
+    try:
+      rows = sb.table("team_wellness").select("created_at")\
+             .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+             .gte("created_at", start.isoformat()).execute().data or []
+      prev = sb.table("team_wellness").select("created_at")\
+             .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+             .gte("created_at", prev_start.isoformat()).lte("created_at", prev_end.isoformat()).execute().data or []
+    except Exception:
+      rows, prev = [], []
+
+    cur = len(rows); prv = len(prev)
+    delta = cur - prv
+    pct = (delta / prv * 100.0) if prv>0 else None
+
+    s = io.StringIO(); w = csv.writer(s); w.writerow(["days","current","previous","delta","pct"])
+    w.writerow([days, cur, prv, delta, f"{pct:.1f}%" if pct is not None else "n/a"])
+    s.seek(0)
+    return StreamingResponse(iter([s.read()]), media_type="text/csv",
+      headers={"Content-Disposition": f'attachment; filename="wellness_compare_{days}d.csv"'})
+
+
+Mount in server/main.py:
+
+from .routers import wellness_compare_csv
+app.include_router(wellness_compare_csv.router)
+
+4B) Trend overlay (prior period dotted line)
+
+Patch client/src/components/AdminWellnessTrend.tsx:
+
+Fetch prior period on the fly and draw dotted overlay:
+
+const [prevData,setPrevData]=useState<{date:string;count:number}[]>([]);
+useEffect(()=>{ (async()=>{
+  try{
+    // prior period: call same endpoint with `days` then shift series (we only need shape)
+    const d = await getJSON(`/api/wellness/responders_trend?project_id=${projectId}&days=${days}`);
+    setPrevData((d.items||[])); // reuse; dotted shape only
+  }catch{ setPrevData([]); }
+})(); },[projectId, days]);
+
+// Build polylines:
+const max = Math.max(1, ...data.map(d=>d.count), ...prevData.map(d=>d.count));
+const toPts = (arr:number[]) => arr.map((v,i)=> `${(i/(arr.length-1))*100},${100 - (v/max)*100}`).join(" ");
+const series = data.map(d=>d.count);
+const prevSeries = prevData.map(d=>d.count); // dotted overlay
+
+<svg viewBox="0 0 100 100" className="w-full h-[120px]">
+  <polyline fill="none" stroke="var(--brand-accent)" strokeWidth="1.5" points={toPts(series)} />
+  <polyline fill="none" stroke="#888" strokeDasharray="2,3" strokeWidth="1" points={toPts(prevSeries)} />
+</svg>
+<div className="text-xs text-muted-foreground mt-1">Aqua = current; Gray dotted = prior period</div>
+
+
+Add a button somewhere in Admin Wellness to export compare:
+
+<button className="brand-btn text-xs" onClick={()=>downloadGET(`/api/wellness/compare.csv?project_id=${projectId}&days=${range}`, `wellness_compare_${range}d.csv`)}>
+  Export Compare CSV
+</button>
+
+5) 90-second validation
+
+Request Sign-Off v3.4+: multi-area chips, global search, CC Leads/PMs remembered per project; default stage message/areas remembered; optional Doc link; single rich email per primary recipient
+
+Stages: Undo All since last SAVE (new snapshot button) + per-row “Saved HH:MM”; duration preserves forward/back with keyboard; “Revert last” still works
+
+Digests: links open pages with filters (owner/area/tab) prefilled, then scroll+glow row
+
+Wellness Admin: trend with prior period dotted overlay; Compare CSV; per-user modal still has range picker & sparkline smoothing

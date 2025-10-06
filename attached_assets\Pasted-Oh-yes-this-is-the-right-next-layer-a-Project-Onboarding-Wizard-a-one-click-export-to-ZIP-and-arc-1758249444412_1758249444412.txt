@@ -1,0 +1,414 @@
+Oh yes—this is the right next layer: a Project Onboarding Wizard, a one-click export to ZIP, and archive (view-only) projects with an Admin Projects page to manage open/closed. Below is a tight, paste-ready plan with SQL, server endpoints, UI stubs, and test scripts.
+
+1) Schema additions (projects lifecycle + exports)
+
+Run in Supabase → SQL:
+
+-- Project lifecycle + housekeeping
+alter table projects
+  add column if not exists status text check (status in ('active','archiving','archived')) default 'active',
+  add column if not exists code text,            -- e.g., WD-ACME (unique per org)
+  add column if not exists archived_at timestamptz,
+  add column if not exists storage_class text default 'hot',  -- 'hot' | 'cold'
+  add column if not exists export_zip_path text,              -- last generated zip path
+  add column if not exists export_started_at timestamptz,
+  add column if not exists export_completed_at timestamptz;
+
+-- Optional: lightweight metrics
+alter table projects
+  add column if not exists bytes_used bigint default 0;
+
+-- For export job audit (optional)
+create table if not exists project_exports (
+  id bigserial primary key,
+  org_id uuid not null,
+  project_id uuid not null,
+  job_status text check (job_status in ('queued','running','done','failed')) default 'queued',
+  zip_path text,
+  error text,
+  created_at timestamptz default now(),
+  finished_at timestamptz
+);
+
+
+If REST 404’s, re-run grants and notify pgrst, 'reload schema';.
+
+2) Server: onboarding wizard, export, archive (FastAPI)
+A) Onboarding Wizard (create + seed project)
+# /server/onboarding_wizard.py
+from fastapi import APIRouter, Body
+from .supabase_client import sb
+from .team_api import STEP_KEYS
+from .sow_bootstrap import parse_sow  # already added earlier if you used it
+import datetime as dt
+
+router = APIRouter()
+
+DEFAULT_WS = ["HCM","Payroll","Finance","Integrations","Security","Reporting","Cutover"]
+
+@router.post("/projects/create")
+def create_project(org_id: str = Body(...), name: str = Body(...), code: str = Body(...)):
+    # uniq per org
+    existing = sb.table("projects").select("id").eq("org_id",org_id).eq("code",code).limit(1).execute().data
+    if existing: return {"ok": False, "error": "code already exists"}
+    pr = sb.table("projects").insert({"org_id": org_id, "name": name, "code": code, "status":"active"}).execute().data[0]
+    # seed workstreams with a simple default; wizard can replace on next step
+    for i,n in enumerate(DEFAULT_WS):
+        try:
+            sb.table("workstreams").insert({
+              "org_id": org_id, "project_id": pr["id"],
+              "name": n, "sort_order": i, "is_active": True
+            }).execute()
+        except Exception: pass
+    return {"ok": True, "project": pr}
+
+@router.post("/projects/onboarding/seed")
+def onboarding_seed(org_id: str = Body(...), project_id: str = Body(...),
+                    contacts: list[dict] = Body(default=[]),
+                    sow_text: str | None = Body(default=None)):
+    # add contacts
+    for c in contacts:
+        try:
+            sb.table("project_contacts").insert({
+              "org_id":org_id, "project_id":project_id,
+              "name":c.get("name"), "email":c.get("email"), "role":c.get("role"), "workstream":c.get("workstream","")
+            }).execute()
+        except Exception: pass
+
+    # if SOW given, bootstrap areas/integrations/roles
+    if sow_text:
+        payload = parse_sow(sow_text)
+        ws = [{"name": w["name"], "description": w.get("description","")} for w in payload.get("workstreams",[])][:30]
+        try:
+            sb.table("workstreams").update({"is_active": False}).eq("org_id",org_id).eq("project_id",project_id).execute()
+            for i,it in enumerate(ws):
+                sb.table("workstreams").insert({ "org_id": org_id, "project_id": project_id,
+                  "name": it["name"], "description": it["description"], "sort_order": i, "is_active": True
+                }).execute()
+        except Exception: pass
+    return {"ok": True}
+
+
+Mount in main.py:
+
+from .onboarding_wizard import router as wizard_router
+app.include_router(wizard_router, prefix="")
+
+B) Export as ZIP (artifacts → zip → store in bucket /exports/)
+# /server/export_api.py
+import io, os, time, zipfile, requests
+from fastapi import APIRouter, Body
+from .supabase_client import sb
+from uuid import uuid4
+
+router = APIRouter()
+BUCKET = os.getenv("BUCKET","project-artifacts")
+
+def list_artifacts(org_id, project_id):
+    return sb.table("artifacts").select("id,title,path,mime_type,created_at")\
+             .eq("org_id",org_id).eq("project_id",project_id)\
+             .order("created_at", desc=True).limit(20000).execute().data or []
+
+def signed(path):
+    try:
+        r = sb.storage.from_(BUCKET).create_signed_url(path, 3600)
+        return r.get("signedURL") or r.get("signed_url")
+    except Exception:
+        return None
+
+@router.post("/projects/export/start")
+def export_start(org_id: str = Body(...), project_id: str = Body(...)):
+    # mark project export start
+    now = time.strftime("%Y%m%d-%H%M%S")
+    safe_name = f"{project_id}-{now}.zip"
+    sb.table("projects").update({"export_started_at": time.strftime("%Y-%m-%d %H:%M:%S")})\
+        .eq("id",project_id).execute()
+
+    arts = list_artifacts(org_id, project_id)
+    # build zip in-memory (for sizes > 200-300MB, stream to tmp file)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        manifest = []
+        for a in arts:
+            url = signed(a["path"])
+            if not url: continue
+            try:
+                r = requests.get(url, timeout=60)
+                if r.status_code == 200:
+                    filename = a["title"] or a["path"].split("/")[-1]
+                    z.writestr(filename, r.content)
+                    manifest.append({"title":filename, "path": a["path"]})
+            except Exception:
+                pass
+        # include manifest.json
+        z.writestr("manifest.json", str(manifest).encode("utf-8"))
+    buf.seek(0)
+    export_key = f"exports/{project_id}/{safe_name}"
+    sb.storage.from_(BUCKET).upload(path=export_key, file=buf.read(),
+                                    file_options={"content-type":"application/zip"}, upsert=True)
+    sb.table("projects").update({"export_zip_path": export_key,
+                                 "export_completed_at": time.strftime("%Y-%m-%d %H:%M:%S")})\
+        .eq("id",project_id).execute()
+    return {"ok": True, "zip": export_key}
+
+@router.get("/projects/export/download")
+def export_download(org_id: str, project_id: str):
+    proj = sb.table("projects").select("export_zip_path").eq("id",project_id).limit(1).execute().data
+    if not proj or not proj[0].get("export_zip_path"): return {"ok": False, "error":"no export"}
+    url = signed(proj[0]["export_zip_path"])
+    return {"ok": True, "url": url}
+
+C) Archive / Unarchive & storage minimization
+
+Approach: archive = set status='archived', stop write paths, optionally purge derived tables (embeddings/mem chunks) to minimize storage, keep artifacts + summaries for viewing.
+
+# /server/archive_api.py
+from fastapi import APIRouter, Body
+from .supabase_client import sb
+from .db import get_conn
+import time
+
+router = APIRouter()
+
+@router.post("/projects/archive")
+def archive_project(org_id: str = Body(...), project_id: str = Body(...), purge_vectors: bool = Body(True)):
+    # stop write activity on frontend by status check (you should gate UI buttons by status)
+    sb.table("projects").update({"status":"archiving"}).eq("id",project_id).execute()
+
+    if purge_vectors:
+        with get_conn() as conn, conn.cursor() as cur:
+            # These are re-generatable; keep artifacts & summaries
+            cur.execute("delete from artifact_chunks where project_id=%s", (project_id,))
+            cur.execute("""
+                delete from mem_chunks where mem_id in (
+                    select id from mem_entries where project_id=%s
+                )
+            """, (project_id,))
+
+    sb.table("projects").update({"status":"archived","archived_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                 "storage_class":"cold"}).eq("id",project_id).execute()
+    return {"ok": True, "status":"archived"}
+
+@router.post("/projects/reopen")
+def reopen_project(org_id: str = Body(...), project_id: str = Body(...)):
+    sb.table("projects").update({"status":"active","storage_class":"hot","archived_at": None}).eq("id",project_id).execute()
+    return {"ok": True, "status":"active"}
+
+
+Mount both in main.py:
+
+from .export_api import router as export_router
+from .archive_api import router as archive_router
+app.include_router(export_router, prefix="")
+app.include_router(archive_router, prefix="")
+
+3) Frontend: Admin Projects page + Wizard (minimal)
+A) Admin Projects list (open/archived + actions)
+
+Create /web/src/pages/ProjectsAdmin.jsx:
+
+import React, { useEffect, useState } from "react"
+
+export default function ProjectsAdmin({ orgId }) {
+  const [items, setItems] = useState([])
+  const [msg, setMsg] = useState("")
+  async function load(){
+    if(!orgId) return
+    const r = await fetch(`/api/projects/list?org_id=${orgId}`)  // add a tiny list endpoint or reuse your existing
+    const js = await r.json()
+    setItems(js.items || [])
+  }
+  useEffect(()=>{ load() }, [orgId])
+
+  async function archive(project_id){
+    setMsg("Archiving…")
+    await fetch("/api/projects/archive", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({org_id:orgId, project_id, purge_vectors:true})
+    })
+    load(); setMsg("Archived.")
+  }
+  async function reopen(project_id){
+    setMsg("Reopening…")
+    await fetch("/api/projects/reopen", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({org_id:orgId, project_id})
+    })
+    load(); setMsg("Reopened.")
+  }
+  async function exportZip(project_id){
+    setMsg("Exporting…")
+    const x = await fetch("/api/projects/export/start", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({org_id:orgId, project_id})
+    }).then(r=>r.json())
+    if(x.ok){
+      const d = await fetch(`/api/projects/export/download?org_id=${orgId}&project_id=${project_id}`).then(r=>r.json())
+      setMsg(d.ok ? `Export ready: ${d.url}` : "Export created; download soon.")
+    } else setMsg("Export failed.")
+  }
+
+  return (
+    <div className="space-y-4">
+      <h2 className="text-xl font-semibold">Projects Admin</h2>
+      {msg && <div className="text-sm">{msg}</div>}
+      <div className="overflow-auto">
+        <table className="min-w-full text-sm">
+          <thead><tr><th className="p-2 text-left">Name</th><th className="p-2">Code</th><th className="p-2">Status</th><th className="p-2">Actions</th></tr></thead>
+          <tbody>
+            {items.map(p=>(
+              <tr key={p.id} className="border-t">
+                <td className="p-2 text-left">{p.name}</td>
+                <td className="p-2">{p.code}</td>
+                <td className="p-2">{p.status}</td>
+                <td className="p-2">
+                  {p.status==='active'
+                    ? (<><button className="px-2 py-1 border rounded mr-2" onClick={()=>exportZip(p.id)}>Export</button>
+                        <button className="px-2 py-1 border rounded" onClick={()=>archive(p.id)}>Archive</button></>)
+                    : (<button className="px-2 py-1 border rounded" onClick={()=>reopen(p.id)}>Reopen</button>)
+                  }
+                </td>
+              </tr>
+            ))}
+            {!items.length && <tr><td className="p-2 text-slate-500">No projects</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+
+If you don’t have a /projects/list yet, add a tiny one:
+
+# /server/projects_api.py
+from fastapi import APIRouter, Query
+from .supabase_client import sb
+router = APIRouter()
+@router.get("/projects/list")
+def list_projects(org_id: str):
+    rows = sb.table("projects").select("id,name,code,status,archived_at").eq("org_id",org_id).order("created_at", desc=True).execute().data or []
+    return {"items": rows}
+
+
+Mount it:
+
+from .projects_api import router as projects_router
+app.include_router(projects_router, prefix="")
+
+
+Add routes/links in your App:
+
+import ProjectsAdmin from "./pages/ProjectsAdmin"
+// route:
+<Route path="/admin/projects" element={<ProjectsAdmin orgId={orgId} />} />
+// sidebar:
+{link('/admin/projects','Admin · Projects')}
+
+B) Onboarding Wizard (minimal—3 steps)
+
+Create /web/src/pages/ProjectWizard.jsx:
+
+import React, { useState } from "react"
+
+export default function ProjectWizard({ orgId, onDone }) {
+  const [step,setStep] = useState(1)
+  const [name,setName] = useState("")
+  const [code,setCode] = useState("WD-")
+  const [project,setProject] = useState(null)
+  const [contacts,setContacts] = useState([{name:"Sponsor",email:"sponsor@todo",role:"Sponsor"}])
+  const [sowText,setSowText] = useState("")
+
+  async function create(){
+    const r = await fetch("/api/projects/create", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({org_id:orgId, name, code})
+    })
+    const js = await r.json(); if(js.ok){ setProject(js.project); setStep(2) }
+  }
+  async function seed(){
+    const r = await fetch("/api/projects/onboarding/seed", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({org_id:orgId, project_id:project.id, contacts, sow_text:sowText})
+    })
+    const js = await r.json(); if(js.ok){ setStep(3) }
+  }
+
+  if(step===1) return (
+    <div className="space-y-3">
+      <h2 className="text-xl font-semibold">New Project</h2>
+      <input className="border px-2 py-1 rounded w-full" placeholder="Project name" value={name} onChange={e=>setName(e.target.value)} />
+      <input className="border px-2 py-1 rounded w-full" placeholder="Project code (e.g., WD-ACME)" value={code} onChange={e=>setCode(e.target.value)} />
+      <button className="px-3 py-1.5 border rounded" onClick={create} disabled={!name || !code.startsWith("WD-")}>Create</button>
+    </div>
+  )
+  if(step===2) return (
+    <div className="space-y-3">
+      <h2 className="text-xl font-semibold">Seed Basics</h2>
+      <div className="text-sm text-slate-500">Add key contacts (Sponsor/PM) and paste any SOW text to initialize functional areas.</div>
+      {contacts.map((c,i)=>(
+        <div key={i} className="flex gap-2">
+          <input className="border px-2 py-1 rounded" placeholder="Name" value={c.name} onChange={e=>{const d=[...contacts]; d[i].name=e.target.value; setContacts(d)}} />
+          <input className="border px-2 py-1 rounded" placeholder="Email" value={c.email} onChange={e=>{const d=[...contacts]; d[i].email=e.target.value; setContacts(d)}} />
+          <input className="border px-2 py-1 rounded" placeholder="Role" value={c.role} onChange={e=>{const d=[...contacts]; d[i].role=e.target.value; setContacts(d)}} />
+        </div>
+      ))}
+      <button className="text-xs px-2 py-1 border rounded" onClick={()=>setContacts([...contacts,{name:"PM",email:"pm@todo",role:"PM"}])}>+ Add contact</button>
+      <textarea className="border px-2 py-1 rounded w-full h-32" placeholder="Paste SOW text (optional)" value={sowText} onChange={e=>setSowText(e.target.value)} />
+      <button className="px-3 py-1.5 border rounded" onClick={seed}>Seed</button>
+    </div>
+  )
+  return (
+    <div className="space-y-3">
+      <h2 className="text-xl font-semibold">All set</h2>
+      <div className="text-sm">Project <b>{project.name}</b> ({project.code}) initialized.</div>
+      <button className="px-3 py-1.5 border rounded" onClick={onDone}>Go to Dashboard</button>
+    </div>
+  )
+}
+
+
+Add the Wizard route:
+
+import ProjectWizard from "./pages/ProjectWizard"
+// route:
+<Route path="/admin/projects/new" element={<ProjectWizard orgId={orgId} onDone={()=>navigate('/dashboard')} />} />
+// sidebar quick link (optional)
+{link('/admin/projects/new','New Project')}
+
+4) Test scripts (copy/paste)
+BASE="https://<YOUR-REPLIT-URL>/api"
+ORG="<ORG_UUID>"
+
+# A) Create project
+curl -s -X POST "$BASE/projects/create" -H "Content-Type: application/json" -d \
+'{"org_id":"'$ORG'","name":"MICA Workday","code":"WD-MICA"}' | python3 -m json.tool
+
+# B) Seed with contacts + SOW text (optional)
+curl -s -X POST "$BASE/projects/onboarding/seed" -H "Content-Type: application/json" -d @- <<JSON
+{"org_id":"$ORG","project_id":"<PROJECT_UUID>","contacts":[{"name":"Sponsor","email":"sponsor@mica.org","role":"Sponsor"},{"name":"PM","email":"pm@mica.org","role":"PM"}],
+ "sow_text":"HCM, Payroll, Benefits, Integrations, Reporting, Security, Cutover"}
+JSON
+
+# C) Export zip
+curl -s -X POST "$BASE/projects/export/start" -H "Content-Type: application/json" \
+ -d '{"org_id":"'$ORG'","project_id":"<PROJECT_UUID>"}' | python3 -m json.tool
+
+curl -s "$BASE/projects/export/download?org_id=$ORG&project_id=<PROJECT_UUID>" | python3 -m json.tool
+
+# D) Archive project
+curl -s -X POST "$BASE/projects/archive" -H "Content-Type: application/json" \
+ -d '{"org_id":"'$ORG'","project_id":"<PROJECT_UUID>","purge_vectors":true}' | python3 -m json.tool
+
+5) UX / Policy you’ll want
+
+Status gates: When status='archived', hide/disable Upload, Email intake, Onboarding send, Edit Areas, Save buttons.
+
+Minimal storage: purge artifact_chunks and mem_chunks on archive; keep artifacts (source files) and summaries for view-only.
+
+Reopen simply sets status='active'; embeddings will be re-created on new uploads; you can reclassify older artifacts if needed with the /reclassify/latest helper.
+
+This gives you the whole lifecycle:
+
+Wizard to spin up a project (name/code), seed areas & contacts from SOW/text.
+
+Admin Projects page to Export ZIP and Archive/Reopen.
+
+“Minimal storage” archiving by purging derived rows, leaving view-only.
+
+If you want me to add the Review table UI, or wire the Timeline bars to the stored phases, say the word—I’ll drop it in.

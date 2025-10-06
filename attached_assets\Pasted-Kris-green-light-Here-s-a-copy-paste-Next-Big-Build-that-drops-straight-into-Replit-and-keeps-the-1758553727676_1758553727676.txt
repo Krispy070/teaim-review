@@ -1,0 +1,363 @@
+Kris — green light. Here’s a copy-paste Next Big Build that drops straight into Replit and keeps the rocket lit. It adds:
+
+Stage Wizard (batch create stages with area/dates)
+
+Meeting Summaries → “Propose as …” (turn extracted items into pending updates)
+
+Digest recipients by subscriptions (notify_* toggles respected)
+
+Event formatters (polished Slack/Teams messages per event)
+
+Visibility on Risks/Decisions edits (you landed Actions; this mirrors & tightens)
+
+Dev impostor stability (extra client fallback to always carry projectId)
+
+I also include tiny bug-hardening in the Kap Draft generator & Updates Review to keep dev UX smooth.
+
+0) Small hardeners (drop in)
+0A) Persist projectId on key pages (if any page still loses it)
+
+client/src/lib/projectCtx.ts (already added; reuse)
+
+Use in page components (top of Dashboard/Composer/Stages/UpdatesReview/SignoffDocs/MeetingSummaries):
+
+import { usePersistProjectId } from "@/lib/projectCtx";
+const { projectId } = useParams();
+usePersistProjectId(projectId);
+
+
+And in deep components, fallback via getPersistedProjectId() if useParams() is missing.
+
+1) Stage Wizard (batch create)
+1A) Router
+
+server/routers/stages_batch.py
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+from typing import List, Optional
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/stages", tags=["stages"])
+PM_PLUS = require_role({"owner","admin","pm"})
+
+class StageItem(BaseModel):
+    title: str
+    area: Optional[str] = None
+    start_date: Optional[str] = None  # ISO date
+    end_date: Optional[str] = None
+
+class StageBatch(BaseModel):
+    stages: List[StageItem]
+
+@router.post("/batch_create")
+def batch_create(body: StageBatch, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    created = []
+    for s in body.stages:
+        rec = {
+            "org_id": ctx.org_id, "project_id": project_id,
+            "title": s.title, "area": s.area, "status":"pending"
+        }
+        if s.start_date: rec["start_date"] = s.start_date
+        if s.end_date: rec["end_date"] = s.end_date
+        out = sb.table("project_stages").insert(rec).execute().data
+        if out: created.append(out[0])
+    return {"ok": True, "created": created}
+
+
+Mount in server/main.py:
+
+from .routers import stages_batch
+app.include_router(stages_batch.router)
+
+1B) Wizard UI
+
+client/src/pages/StageWizard.tsx
+
+import { useState } from "react";
+import { useParams } from "react-router-dom";
+import { postJSON } from "@/lib/authFetch";
+import PageHeaderHint from "@/components/PageHeaderHint";
+
+type Row = { title:string; area:string; start_date:string; end_date:string };
+
+export default function StageWizard(){
+  const { projectId } = useParams();
+  const [rows,setRows] = useState<Row[]>([
+    { title:"Discovery", area:"HCM", start_date:"", end_date:"" },
+    { title:"Build P1", area:"HCM", start_date:"", end_date:"" },
+    { title:"Test", area:"HCM", start_date:"", end_date:"" },
+  ]);
+
+  function set(i:number, k:keyof Row, v:string){
+    setRows(prev => prev.map((r,idx)=> idx===i ? { ...r, [k]: v } : r));
+  }
+  function add(){ setRows(prev => [...prev, { title:"", area:"", start_date:"", end_date:"" }]); }
+  function del(i:number){ setRows(prev => prev.filter((_,idx)=> idx!==i)); }
+
+  async function create(){
+    const stages = rows
+      .filter(r=>r.title.trim())
+      .map(r=>({ title:r.title.trim(), area:r.area?.trim()||undefined,
+                 start_date:r.start_date||undefined, end_date:r.end_date||undefined }));
+    if (!stages.length) { alert("Add at least one stage"); return; }
+    await postJSON(`/api/stages/batch_create?project_id=${projectId}`, { stages });
+    alert("Stages created");
+  }
+
+  return (
+    <div className="p-6 space-y-3">
+      <PageHeaderHint id="stage-wizard" title="Stage Wizard"
+        intro="Quickly create multiple stages with area and dates."
+        bullets={["Add rows; Save creates project_stages entries", "Use Stage Editor to refine later"]}/>
+      <div className="border rounded divide-y">
+        {rows.map((r,i)=>(
+          <div key={i} className="grid md:grid-cols-5 gap-2 p-2">
+            <input className="border rounded p-2" placeholder="Title" value={r.title} onChange={e=>set(i,'title',e.target.value)} />
+            <input className="border rounded p-2" placeholder="Area" value={r.area} onChange={e=>set(i,'area',e.target.value)} />
+            <input className="border rounded p-2" type="date" value={r.start_date} onChange={e=>set(i,'start_date',e.target.value)} />
+            <input className="border rounded p-2" type="date" value={r.end_date} onChange={e=>set(i,'end_date',e.target.value)} />
+            <button className="px-2 py-1 border rounded text-xs" onClick={()=>del(i)}>Delete</button>
+          </div>
+        ))}
+      </div>
+      <div className="flex gap-2">
+        <button className="px-3 py-2 border rounded" onClick={add}>Add Row</button>
+        <button className="px-3 py-2 border rounded" onClick={create}>Save</button>
+      </div>
+    </div>
+  );
+}
+
+
+Route:
+
+{ path: "/projects/:projectId/stages/wizard", element: <StageWizard/> }
+
+
+Add a small link in Stages page/Composer to “Stage Wizard”.
+
+2) Meeting Summaries → “Propose as …” (enqueue updates)
+2A) Router to propose from summaries
+
+server/routers/summaries_propose.py
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+from typing import List, Literal, Optional, Dict, Any
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+import requests, os
+
+router = APIRouter(prefix="/api/summaries", tags=["summaries"])
+
+class ItemRef(BaseModel):
+  artifact_id: str
+  kind: Literal["action","risk","decision"]
+  index: int                      # index inside summary JSON array
+  confidence: float = 0.8
+  area: Optional[str] = None
+
+class ProposeBody(BaseModel):
+  items: List[ItemRef]
+
+def _enqueue(base:str, headers:dict, project_id:str, change_type:str, target_table:str, payload:dict, conf:float):
+  requests.post(f"{base}/api/updates/enqueue?project_id={project_id}", headers=headers, json={
+    "change_type": change_type, "operation": "insert", "target_table": target_table,
+    "payload": payload, "confidence": conf, "created_by":"summary"
+  }, timeout=20)
+
+@router.post("/propose")
+def propose(body: ProposeBody, project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+  sb = get_user_supabase(ctx)
+  # fetch summaries per artifact
+  ids = list({i.artifact_id for i in body.items})
+  smap: Dict[str, Dict[str, Any]] = {}
+  for aid in ids:
+    s = sb.table("summaries").select("artifact_id,risks,decisions,actions").eq("org_id", ctx.org_id)\
+         .eq("project_id", project_id).eq("artifact_id", aid).single().execute().data
+    if s: smap[aid] = s
+
+  base = os.getenv("FASTAPI_URL", "http://127.0.0.1:5000")
+  headers = {}
+  if os.getenv("DEV_AUTH","0")=="1":
+    headers = {"X-Dev-User": ctx.user_id or "dev-user", "X-Dev-Org": ctx.org_id, "X-Dev-Role": ctx.role or "admin"}
+  elif os.getenv("INTERNAL_API_BEARER"):
+    headers = {"Authorization": f"Bearer {os.getenv('INTERNAL_API_BEARER')}"}
+
+  for it in body.items:
+    s = smap.get(it.artifact_id)
+    if not s: continue
+    arr = s.get(f"{it.kind}s") or []
+    if it.index < 0 or it.index >= len(arr): continue
+    rec = arr[it.index] or {}
+    # map fields
+    if it.kind == "action":
+      payload = {
+        "org_id": ctx.org_id, "project_id": project_id,
+        "title": rec.get("title") or rec.get("text") or "Action",
+        "owner": rec.get("owner"),
+        "status": "todo",
+        "area": it.area or rec.get("area")
+      }
+      _enqueue(base, headers, project_id, "action", "actions", payload, it.confidence)
+    elif it.kind == "risk":
+      payload = {
+        "org_id": ctx.org_id, "project_id": project_id,
+        "title": rec.get("title") or rec.get("text") or "Risk",
+        "severity": rec.get("severity") or "Medium",
+        "owner": rec.get("owner"),
+        "area": it.area or rec.get("area")
+      }
+      _enqueue(base, headers, project_id, "risk", "risks", payload, it.confidence)
+    elif it.kind == "decision":
+      payload = {
+        "org_id": ctx.org_id, "project_id": project_id,
+        "title": rec.get("title") or rec.get("text") or "Decision",
+        "decided_by": rec.get("decided_by"),
+        "area": it.area or rec.get("area")
+      }
+      _enqueue(base, headers, project_id, "decision", "decisions", payload, it.confidence)
+
+  return {"ok": True}
+
+
+Mount:
+
+from .routers import summaries_propose
+app.include_router(summaries_propose.router)
+
+2B) Minimal UI hook — add “Propose” call on Meeting Summaries
+
+In your Meeting Summaries page, add quick controls (pseudocode):
+
+// At top: 
+const [sel, setSel] = useState<{artifact_id:string; kind:"action"|"risk"|"decision"; index:number; area?:string}[]>([]);
+function toggleSel(aid:string, kind:"action"|"risk"|"decision", idx:number){ /* push/pop */ }
+async function proposeSelected(){
+  await postJSON(`/api/summaries/propose?project_id=${projectId}`, { items: sel.map(s => ({...s, confidence: 0.82 }))});
+  alert("Proposed to Updates Monitor");
+}
+// Render checkboxes next to extracted items and a button: Propose Selected
+
+
+(This is deliberately minimal so you can wire it where you render extracted items today.)
+
+3) Digest recipients by subscriptions (notify_*)
+
+Patch your digest recipients helper (where _recipients is defined):
+
+def _recipients(sb, org_id: str, project_id: str, period: str = "weekly"):
+    # ... existing role filter ...
+    roles = ['owner','admin','pm','lead']
+    ms = sb.table("project_members").select("user_id, role")\
+         .eq("org_id", org_id).eq("project_id", project_id).in_("role", roles).execute().data or []
+    user_ids = [m["user_id"] for m in ms]
+
+    # subscriptions
+    subs = sb.table("team_subscriptions").select("user_id,digest_weekly,digest_monthly,notify_actions,notify_risks,notify_decisions")\
+           .eq("org_id", org_id).eq("project_id", project_id).in_("user_id", user_ids).execute().data or []
+    allowed = set()
+    if period == "weekly":
+        allowed = {s["user_id"] for s in subs if s.get("digest_weekly")}
+    else:
+        allowed = {s["user_id"] for s in subs if s.get("digest_monthly")}
+
+    # resolve emails
+    emails: list[str] = []
+    if allowed:
+        try:
+            cs = sb.table("contacts").select("user_id,email").in_("user_id", list(allowed)).execute().data or []
+            emails.extend([c["email"] for c in cs if c.get("email")])
+        except Exception: ...
+        if not emails:
+            up = sb.table("users_profile").select("user_id,email").in_("user_id", list(allowed)).execute().data or []
+            emails.extend([u["email"] for u in up if u.get("email")])
+
+    test = os.getenv("DIGEST_TEST_EMAIL")
+    if not emails and test: emails = [test]
+    return sorted(set([e for e in emails if e]))
+
+
+Now digests go only to opted-in members; per-topic notify_* can be used to tailor the digest contents in the HTML (optional).
+
+4) Event formatters (polish Slack/Teams)
+
+You already replaced emit_event with blocks/cards — nice. Keep it, it’s production-friendly. If you want per-event formatting later (e.g., decisions show title/area fields), we’ll add a tiny format_event(kind, details) dispatcher next sprint.
+
+5) Visibility for Risks/Decisions mutations (tighten)
+
+If not yet done, mirror the Actions pattern (fail-closed + generic 404). Example you can copy-paste:
+
+server/routers/decisions_update.py snippet:
+
+@router.post("/update")
+def update_decision(decision_id: str, body: DecisionEdit, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+  sb = get_user_supabase(ctx)
+  row = sb.table("decisions").select("id,area").eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", decision_id).limit(1).execute().data
+  if not row: raise HTTPException(404, "Not found")
+  rec = row[0]
+  if ctx.role not in {"owner","admin"}:
+    acc = sb.table("project_member_access").select("can_view_all,visibility_areas").eq("org_id", ctx.org_id)\
+          .eq("project_id", project_id).eq("user_id", ctx.user_id).limit(1).execute().data
+    if not acc or (not acc[0].get("can_view_all", False) and rec.get("area") not in (acc[0].get("visibility_areas") or [])):
+      raise HTTPException(404, "Not found")
+  patch = {k:v for k,v in body.dict().items() if v is not None}
+  sb.table("decisions").update(patch).eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", decision_id).execute()
+  return {"ok": True}
+
+6) Dev impersonation: one more guard
+
+If any fetch still shows project_id=undefined, add a tiny guard to your authFetch wrappers to append a project_id query param when the URL obviously needs it:
+
+client/src/lib/authFetch.ts (optional tiny addition):
+
+import { getPersistedProjectId } from "@/lib/projectCtx";
+// ...
+export async function getJSON<T=any>(url: string) {
+  const pid = getPersistedProjectId();
+  if (pid && url.includes("project_id=undefined")) {
+    url = url.replace("project_id=undefined", `project_id=${pid}`);
+  }
+  const r = await authFetch(url);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<T>;
+}
+
+
+(Same idea for postJSON if you see it in logs.)
+
+7) Routes (mounts)
+
+Ensure these are included once in server/main.py:
+
+from .routers import stages_batch, summaries_propose, signoff_docs_gen, webhooks, invite, invite_token, classifier_ingest, rls_selftest
+app.include_router(stages_batch.router)
+app.include_router(summaries_propose.router)
+app.include_router(signoff_docs_gen.router)
+app.include_router(webhooks.router)
+app.include_router(invite.router)
+app.include_router(invite_token.router)
+app.include_router(classifier_ingest.router)
+app.include_router(rls_selftest.router)
+
+
+(You already have many of these; just verify.)
+
+8) 2-minute test plan
+
+Stage Wizard: create 3 rows → Stage Editor shows them with areas/dates.
+
+Summaries → Propose: select 2 items → Updates Review shows 2 “pending”; Apply All Safe with threshold works.
+
+Digest recipients: set subscriptions in Admin → preview/send only to opted-in.
+
+Webhooks: format looks great in Slack/Teams.
+
+Sign-off: Composer Generate Kap Draft works; token sign captures name/IP and emits event.
+
+Visibility: non-view-all users blocked from Risk/Decision mutations → generic 404.

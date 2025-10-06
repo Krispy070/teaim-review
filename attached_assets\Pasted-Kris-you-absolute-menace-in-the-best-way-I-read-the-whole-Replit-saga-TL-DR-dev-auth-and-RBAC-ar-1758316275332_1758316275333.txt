@@ -1,0 +1,116 @@
+Kris, you absolute menace—in the best way. I read the whole Replit saga. TL;DR: dev auth and RBAC are live; the remaining 403s came from (a) non-UUID dev headers and (b) role/constraint drift. You corrected both. Now let’s lock the doors, mark the exits, and ship.
+
+What’s done (and good)
+
+Dev auth: X-Dev-* headers gated by DEV_AUTH=1 on both FE/BE; proxy forwards headers only in dev.
+
+JWT prod path: signature + exp verified; no unsafe fallbacks.
+
+RBAC: owner/admin/pm/lead/member/guest + can_sign flag; guards wired to Stages, Team, Members APIs.
+
+DB: constraint updated to 6-tier roles; RLS patterns applied; PostgREST reload.
+
+Quick hardening passes (paste & go)
+1) Seed yourself as owner (one-time per project)
+insert into project_members (org_id, project_id, user_id, role, can_sign)
+values ('<ORG_UUID>','<PROJ_UUID>','<KRIS_USER_UUID>','owner', true)
+on conflict (org_id, project_id, user_id)
+do update set role=excluded.role, can_sign=excluded.can_sign;
+
+select pg_notify('pgrst','reload schema');
+
+
+In dev, also set VITE_DEV_ROLE=admin (or owner) to avoid surprise 403s while you’re clicking around.
+
+2) Tiny UI gate (hide buttons you can’t use)
+// RoleGate.tsx
+export function RoleGate({ allow, role, children }:{
+  allow: Array<'owner'|'admin'|'pm'|'lead'|'member'|'guest'>; role: string; children: any
+}) {
+  return allow.includes(role as any) ? children : null;
+}
+
+
+Use it anywhere:
+
+<RoleGate allow={['owner','admin','pm','lead']} role={role}>
+  <Button onClick={createStage}>Create Stage</Button>
+</RoleGate>
+
+<RoleGate allow={['owner','admin']} role={role}>
+  <Button onClick={kapApplyFix}>Apply via Kap</Button>
+</RoleGate>
+
+<RoleGate allow={['owner','admin']} role={role}>
+  <Link to="admin/members">Members</Link>
+</RoleGate>
+
+3) “Tenant Leak Sentinel” (self-test route)
+
+Add a diagnostic that intentionally tries to read another project and returns PASS/FAIL (quick sanity during demos):
+
+# server/app/routers/sentinel.py
+from fastapi import APIRouter, Depends, Query, HTTPException
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/sentinel", tags=["sentinel"])
+
+@router.get("/tenant-leak")
+def tenant_leak(target_project_id: str = Query(...),
+                ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    # RLS should block if not a member of target project
+    res = sb.table("project_stages").select("id").eq("project_id", target_project_id).limit(1).execute()
+    leaked = bool(res.data)
+    return {"ok": True, "leak": leaked}  # expect leak=false
+
+
+Mount it and run two calls: same-project (should read), other project (should not).
+
+Role matrix (what each can see/do)
+
+Owner: everything (incl. assign admin/owner), Kap writes, sign stages.
+
+Admin: everything except grant owner/admin; Kap writes, sign stages.
+
+PM: create/edit stages, actions/risks/decisions, request sign-off, exports; no member admin; no Kap writes.
+
+Lead: same writes as PM but not project lifecycle; no member admin.
+
+Member: read-only across project + Ask Kap; cannot mutate.
+
+Guest: read-only minimal (docs/summaries); Ask Kap optional (toggle later).
+
+Signer flag (can_sign): allows stage Approve/Reject regardless of role (plus owner/admin can always sign).
+
+Dev → Prod cutover checklist (5 minutes)
+
+Flip DEV_AUTH=0 & VITE_DEV_AUTH=0; confirm proxy no longer forwards X-Dev-* headers.
+
+Supabase Auth working (login/magic links). FE sends Authorization: Bearer <token> automatically.
+
+Seed project_members for real users (owner/admin/pm/...).
+
+RLS sanity: try a cross-project read → expect 403/empty; run /api/sentinel/tenant-leak.
+
+Kap writes: require AGENT_API_KEY and admin role (test one happy path + one 403).
+
+Email sign-off: approve link opens page → server resolves stage_id → membership/signing enforced.
+
+Storage paths follow org/{org_id}/project/{project_id}/...; verify storage RLS read blocks outsiders.
+
+Logs: audit stage.requested/approved/rejected are written; add alerts on security.denied.
+
+Nice-to-have next (fast wins)
+
+Role Matrix card on Members page (inline edit + legend).
+
+External signer tokens (one-time signed URL, expiring) so customers can sign without full account.
+
+Admin “impersonate” dev tool (dev-only) to preview each role’s UI quickly.
+
+Digest/Overdue: weekly email shows pending sign-offs; dashboard badge if >N days.
+
+If you want, I’ll drop in the Role Matrix card and the Sentinel route now. Or we jump to external signer tokens so you can ship Stage Sign-Off to real customers this week.

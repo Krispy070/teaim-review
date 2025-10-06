@@ -1,0 +1,128 @@
+You’ve got the Drizzle track wired—nice. Now let’s push it over the goal line and kill the last reds.
+
+Green in 5 minutes — do this in order
+
+Bootstrap the dev DB once
+Open DevTools → Console in your app and run:
+
+await fetch("/admin/test/bootstrap-and-seed", {
+  method: "POST",
+  headers: {"Content-Type": "application/json"},
+  body: JSON.stringify({ projectId: "e1ec6ad0-a4e8-45dd-87b0-e123776ffe6e" })
+}).then(r=>r.json())
+
+
+✅ Expected: areas:2, workbooks:2, reports:2, changes:2, comments:2, releases:1, notifications:1, signoffs:1.
+
+Run your normal seed (proves the Runner path is correct)
+
+await fetch("/admin/test/seed-v2", {
+  method:"POST",
+  headers:{"Content-Type":"application/json"},
+  body: JSON.stringify({ projectId: "e1ec6ad0-a4e8-45dd-87b0-e123776ffe6e" })
+}).then(r=>r.json())
+
+
+✅ Expected: seeder:"v2" and the same non-zero counts.
+
+Click Seed & Run in the UI.
+✅ You should see 7/8 green (the “invalid token” negative stays red by design).
+
+If counts are still 0 (or you see the “tables don’t exist” warning)
+
+Add this tiny Drizzle debug endpoint to see exactly where we’re pointing and what exists.
+
+server/admin/test/debug.ts
+import { Router } from "express";
+import { db } from "../../db";
+import { sql } from "drizzle-orm";
+
+export const debugRouter = Router();
+
+debugRouter.get("/debug", async (_req, res) => {
+  try {
+    const meta = await db.execute(sql`
+      select current_database() as db,
+             current_schema()   as schema,
+             current_user       as user,
+             version()          as pg_version
+    `);
+
+    const tables = await db.execute(sql`
+      select table_schema, table_name
+      from information_schema.tables
+      where table_schema = 'public'
+        and table_name in ('areas','workbooks','reports','changes','comments','releases','notifications','signoffs')
+      order by table_name;
+    `);
+
+    const count = async (name: string) => {
+      try {
+        const r = await db.execute(sql`select count(*)::int as c from ${sql.identifier(name)}`);
+        return r.rows?.[0]?.c ?? 0;
+      } catch { return -1; } // -1 means table missing or not visible
+    };
+
+    const counts = Object.fromEntries(
+      await Promise.all(
+        ['areas','workbooks','reports','changes','comments','releases','notifications','signoffs']
+          .map(async t => [t, await count(t)])
+      )
+    );
+
+    res.json({ ok:true, meta: meta.rows?.[0], tables: tables.rows, counts });
+  } catch (e:any) {
+    res.status(500).json({ ok:false, error: e?.message || String(e) });
+  }
+});
+
+
+Mount it:
+
+// server/index.ts
+import { debugRouter } from "./admin/test/debug";
+app.use("/admin/test", debugRouter);
+
+
+Now visit /admin/test/debug. You’ll see:
+
+Which DB/schema you’re on
+
+Which of the 8 tables exist
+
+Counts for each (−1 = table not visible/missing)
+
+Most common gotchas (and quick fixes)
+
+Wrong DATABASE_URL in this Replit shell. Log it on boot:
+
+console.log("[DB]", process.env.DATABASE_URL);
+
+
+search_path not ‘public’ (tables created but not visible). Force it at connect or before queries:
+
+await db.execute(sql`set search_path to public`);
+
+
+Two servers running with different envs (hot reload glitch). Kill/restart the Replit server pane.
+
+Final polish: make the Runner show the real response
+
+In your Test Runner component, make sure you display the v2 JSON (not the old stringified object). For example:
+
+const res = await fetch("/admin/test/seed-v2", { /*...*/ });
+const json = await res.json();
+setSeedLog(JSON.stringify(json, null, 2)); // shows seeder:"v2" + numeric counts
+
+After we’re green
+
+We’ll flip on the Digest preview, Area ZIP, Notifications, and Releases tests automatically because the seed now creates the exact rows those checks need.
+
+Then we lock in the AppShell everywhere so header/nav never drift again, and keep your new brand tokens as the single source of truth.
+
+If you hit any snag, paste me:
+
+the response from /admin/test/bootstrap-and-seed
+
+the JSON from /admin/test/debug
+…and I’ll point exactly at the miswire.

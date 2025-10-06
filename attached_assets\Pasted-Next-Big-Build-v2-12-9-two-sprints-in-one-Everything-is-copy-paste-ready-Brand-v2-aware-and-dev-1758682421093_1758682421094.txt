@@ -1,0 +1,306 @@
+Next Big Build v2.12.9 (two sprints in one). Everything is copy-paste ready, Brand v2–aware, and dev-safe (new endpoints gracefully no-op if a table/column is missing).
+
+What lands now:
+
+Request Sign-Off v3.8 — stage doc attach + Pending table gets Set Expiry (hr), Remind All, Revoke All/One, plus last action timestamp
+
+Stages batch — per-area Set End to date, and Align durations to org template (by title), in addition to Shift Start/End and Set Duration you already have
+
+Digests internal preview helpers — deep links already open filters & scroll; add a tiny helper so in-app clicks compose those links consistently
+
+Wellness Admin — Top Responders printable HTML (brand header) (PDF via browser), alongside CSV
+
+1) Request Sign-Off v3.8 — expiry + remind all + last action
+1A) Backend — tokens admin (set expiry, remind all), and last action per stage
+
+server/routers/signoff_tokens_admin.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from datetime import datetime, timedelta, timezone
+import os
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase, get_service_supabase
+
+router = APIRouter(prefix="/api/signoff", tags=["signoff"])
+
+PM_PLUS = require_role({"owner","admin","pm"})
+
+@router.post("/set_expiry")
+def set_expiry(project_id: str = Query(...), stage_id: str = Query(...), hours: int = 120,
+               ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    try:
+        # find doc
+        d = sb.table("signoff_docs").select("id").eq("org_id", ctx.org_id)\
+             .eq("project_id", project_id).eq("stage_id", stage_id).limit(1).execute().data or []
+        if not d: return {"ok": True, "updated": 0}
+        expires = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+        r = sb.table("signoff_doc_tokens").update({"expires_at": expires})\
+            .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("doc_id", d[0]["id"]).is_("used_at","null").execute()
+        return {"ok": True, "updated": (r.count if hasattr(r,"count") else None)}
+    except Exception:
+        return {"ok": False}
+
+@router.post("/remind_all")
+def remind_all(project_id: str = Query(...), stage_id: str = Query(...),
+               ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx); sbs = get_service_supabase()
+    try:
+        d = sb.table("signoff_docs").select("id").eq("org_id", ctx.org_id)\
+             .eq("project_id", project_id).eq("stage_id", stage_id).limit(1).execute().data or []
+        if not d: return {"ok": True, "sent": 0}
+        tokens = sb.table("signoff_doc_tokens").select("token,signer_email")\
+                 .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("doc_id", d[0]["id"])\
+                 .is_("used_at","null").is_("revoked_at","null").execute().data or []
+        sent = 0
+        base = os.getenv("APP_BASE_URL","").rstrip("/")
+        try:
+            from ..email.util import mailgun_send_html, send_guard
+            for t in tokens:
+                link = f"{base}/signoff/doc/{t['token']}"
+                ok,_ = send_guard(sb, ctx.org_id, project_id, "signoff_reminder", t["signer_email"])
+                if ok:
+                    mailgun_send_html([t["signer_email"]], "[Reminder] Sign-off request pending",
+                                      f"<p>Your sign-off link is still pending:</p><p><a href='{link}'>Open</a></p>")
+                    sent += 1
+        except Exception: ...
+        return {"ok": True, "sent": sent}
+    except Exception:
+        return {"ok": False}
+
+@router.get("/last_action")
+def last_action(project_id: str = Query(...), stage_id: str = Query(...),
+                ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    # best-effort: use audit_events if present
+    try:
+        r = sb.table("audit_events").select("created_at")\
+             .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+             .eq("kind","stage.request_signoff").contains("details", {"stage_id": stage_id})\
+             .order("created_at", desc=True).limit(1).execute().data or []
+        return {"last": r[0]["created_at"] if r else None}
+    except Exception:
+        return {"last": None}
+
+
+Mount in server/main.py:
+
+from .routers import signoff_tokens_admin
+app.include_router(signoff_tokens_admin.router)
+
+1B) Frontend — Sign-Off modal: pending table with Expiry/Remind All/Revoke All
+
+Patch client/src/components/SignoffRequestModal.tsx (in the “Pending requests” block)
+
+Add “Set expiry” and “Remind all” controls:
+
+const [expiry,setExpiry]=useState<number>(120);
+
+{pending.length>0 && (
+  <div className="border rounded p-2">
+    <div className="flex items-center justify-between mb-1">
+      <div className="text-xs font-medium">Pending requests ({pending.length})</div>
+      <div className="flex items-center gap-2">
+        <label className="text-[11px]">Expiry (hr)</label>
+        <input className="border rounded p-1 text-[11px] w-[64px]" type="number" value={expiry} onChange={e=>setExpiry(parseInt(e.target.value||'120',10))}/>
+        <button className="brand-btn text-[11px]" onClick={async()=>{
+          await fetch(`/api/signoff/set_expiry?project_id=${projectId}&stage_id=${stageId}&hours=${expiry}`, {method:"POST",credentials:"include"});
+          alert("Expiry updated");
+        }}>Set expiry</button>
+        <button className="brand-btn text-[11px]" onClick={async()=>{
+          const r = await fetch(`/api/signoff/remind_all?project_id=${projectId}&stage_id=${stageId}`, {method:"POST",credentials:"include"});
+          const d = await r.json().catch(()=>({sent:0}));
+          alert(`Sent ${d.sent||0} reminder(s)`);
+        }}>Remind all</button>
+        <button className="brand-btn text-[11px]" onClick={async()=>{
+          await fetch(`/api/signoff/revoke_all?project_id=${projectId}&stage_id=${stageId}`, {method:"POST",credentials:"include"});
+          setPending([]); alert("All pending tokens revoked");
+        }}>Revoke all</button>
+      </div>
+    </div>
+    <div className="space-y-1">
+      {pending.map(p=>(
+        <div key={p.token} className="flex items-center justify-between text-xs">
+          <span>
+            {p.signer_email} • {new Date(p.created_at).toLocaleString()}
+            {p.expires_at ? ` • exp ${new Date(p.expires_at).toLocaleString()}` : ""}
+          </span>
+          <span className="flex items-center gap-1">
+            <button className="brand-btn text-[11px]" onClick={async()=>{
+              await fetch(`/api/signoff/resend_token?token=${encodeURIComponent(p.token)}`, {method:"POST",credentials:"include"});
+              alert("Resent");
+            }}>Resend</button>
+            <button className="brand-btn text-[11px]" onClick={async()=>{
+              await fetch(`/api/signoff/revoke_token?token=${encodeURIComponent(p.token)}`, {method:"POST",credentials:"include"});
+              setPending(prev=>prev.filter(x=>x.token!==p.token));
+            }}>Revoke</button>
+          </span>
+        </div>
+      ))}
+    </div>
+  </div>
+)}
+
+
+(Stage doc default & presets from v2.12.6 still apply — no change.)
+
+2) Stages — batch Set End to date + Align durations to template
+
+2A) Align durations to template (by stage title)
+
+Backend — (optional; we can do client-side). To keep it simple and dev-safe, apply client-side:
+
+Patch client/src/pages/Stages.tsx (augment group toolbar)
+
+const [endAt,setEndAt] = useState<string>("");
+const [orgTpls,setOrgTpls]=useState<any[]>([]);
+useEffect(()=>{ (async()=>{ try{
+  const d=await getJSON(`/stages/templates/org`); setOrgTpls(d.items||[]);
+}catch{} })(); },[]);
+
+function durationsFromTemplate(key:string){
+  const t = (orgTpls||[]).find((x:any)=>x.key===key); if(!t) return {};
+  const map:Record<string,number> = {};
+  (t.stages||[]).forEach((s:any)=> { if (s.title) map[s.title]= Number(s.days||7); });
+  return map;
+}
+
+async function setAreaEndTo(area:string, dateISO:string){
+  if (!dateISO) return;
+  for (const s of groups[area]||[]){
+    await saveField(s.id, { end_date: dateISO });
+  }
+  toast({ title:"Applied", description:`${area}: end dates set to ${dateISO}` });
+}
+
+async function alignDurationsToTemplate(area:string, tplKey:string){
+  const dmap = durationsFromTemplate(tplKey);
+  if (!Object.keys(dmap).length) return alert("Template has no rows");
+  for (const s of groups[area]||[]){
+    const days = dmap[s.title||""]; if (!days && days!==0) continue;
+    if (!s.start_date) continue;
+    const newEnd = shiftDate(s.start_date, Number(days));
+    await saveField(s.id, { end_date: newEnd });
+  }
+  toast({ title:"Aligned", description:`${area}: durations from ${tplKey}` });
+}
+
+
+Add controls to area toolbar:
+
+{/* SET END TO (DATE) */}
+<div className="flex items-center gap-2">
+  <label className="text-[11px]">End to</label>
+  <input type="date" className="border rounded p-1 text-xs" value={endAt} onChange={e=>setEndAt(e.target.value)} />
+  <button className="brand-btn text-xs" onClick={()=>setAreaEndTo(area, endAt)}>Apply</button>
+</div>
+
+{/* ALIGN DURATIONS */}
+<div className="flex items-center gap-2">
+  <select className="border rounded p-1 text-xs" defaultValue="" onChange={e=> e.target.value && alignDurationsToTemplate(area, e.target.value)}>
+    <option value="">Align durations (template)…</option>
+    {orgTpls.map(t=> <option key={t.key} value={t.key}>{t.label}</option>)}
+  </select>
+</div>
+
+
+This uses your existing org_stage_templates table; it maps stage title → days. Stages without a matching title are skipped.
+
+3) Digests — compact Changes by Area + deep-link pre-filters
+
+You already added owners/area chips and pre-filters. Ensure your email links include the hash params we support:
+
+/projects/:pid/actions/list#openFilters=1&owner=<email>&area=<area>&id=<actionId>
+/projects/:pid/admin/audit-timeline#openFilters=1&tab=risks&area=<area>&id=<riskId>
+
+
+On landing, Actions List / Audit Timeline open filters & scroll/glow the row (we added that logic in the previous two drops).
+
+For in-app preview, you can also add this tiny helper (optional):
+
+client/src/lib/openDigestLink.ts (new)
+
+export function openDigestLink(pathHash: string){
+  // pathHash example: "/projects/abc/actions/list#openFilters=1&owner=x&id=123"
+  if (!pathHash) return;
+  if (pathHash.startsWith("http")) { location.href = pathHash; return; }
+  const base = location.origin;
+  location.href = base + pathHash;
+}
+
+
+You can call openDigestLink from any “Preview” card in the app.
+
+4) Wellness — Top Responders printable HTML (brand header)
+
+server/routers/wellness_top_export_html.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import HTMLResponse
+from datetime import datetime, timedelta, timezone
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+from ..brand.export_header import export_header_html
+
+router = APIRouter(prefix="/api/wellness", tags=["wellness"])
+
+@router.get("/top_responders.html", response_class=HTMLResponse)
+def top_html(project_id: str = Query(...), days: int = 30,
+             ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    sb = get_user_supabase(ctx)
+    days = 7 if days==7 else 30
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days-1)
+    # counts current & previous
+    rows = sb.table("team_wellness").select("user_id,created_at")\
+           .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+           .gte("created_at", start.isoformat()).execute().data or []
+    prev_start = start - timedelta(days=days)
+    prev_end = start - timedelta(days=1)
+    prev = sb.table("team_wellness").select("user_id,created_at")\
+           .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+           .gte("created_at", prev_start.isoformat()).lte("created_at", prev_end.isoformat()).execute().data or []
+    cur = {}; prv={}
+    for r in rows: cur[r["user_id"]] = cur.get(r["user_id"],0) + 1
+    for r in prev: prv[r["user_id"]] = prv.get(r["user_id"],0) + 1
+    items = [{"user_id":u, "checkins":c, "delta": c - prv.get(u,0)} for u,c in cur.items()]
+    items.sort(key=lambda x:(-x["checkins"], -x["delta"]))
+
+    org = sb.table("org_branding").select("*").eq("org_id", ctx.org_id).single().execute().data or {}
+    proj = sb.table("projects").select("code").eq("id", project_id).single().execute().data or {}
+    hdr = export_header_html(org, proj.get("code") or project_id)
+    rows_html = "".join([f"<tr><td>{i['user_id']}</td><td>{i['checkins']}</td><td>{'+' if i['delta']>0 else ''}{i['delta']}</td></tr>" for i in items[:50]])
+    html = f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1" /></head>
+<body style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:880px;margin:auto">
+{hdr}
+<h2>Top Responders — last {days} days</h2>
+<table style="border-collapse:collapse;width:100%"><thead><tr><th>User</th><th>Checkins</th><th>Δ</th></tr></thead>
+<tbody>{rows_html or '<tr><td colspan=3>No data</td></tr>'}</tbody></table>
+</body></html>"""
+    return HTMLResponse(html)
+
+
+Mount in server/main.py:
+
+from .routers import wellness_top_export_html
+app.include_router(wellness_top_export_html.router)
+
+
+UI — add a “Print HTML” button where you export CSV:
+
+<a className="brand-btn text-xs" target="_blank" rel="noreferrer"
+   href={`/api/wellness/top_responders.html?project_id=${projectId}&days=${range}`}>
+  Print Top Responders
+</a>
+
+5) 120-second validation
+
+Sign-Off v3.8: pending table shows expiry; you can Set Expiry, Remind All, Revoke All/One; doc link auto-attaches from stage when available; last action visible (via audit)
+
+Stages: toolbar per area can Set End to date and Align durations to template (by stage title); your existing Shift Start/End + Set Duration + Save/Undo Group + Save/Undo All work together
+
+Digests: compact changes by area + owners chips; links pre-apply owner/area/tab filters and scroll/glow rows
+
+Wellness: Top Responders HTML prints with brand header; CSV & trend overlays remain

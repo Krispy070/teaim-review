@@ -1,0 +1,610 @@
+huge win on the logo upload. Let’s keep the surge going. Here’s Next Big Build v2.6 you can paste straight into Replit. It makes branding truly production-grade (org + project overrides, cached logo proxy, theme color across the app), gives PMs a Stage Template Editor, and plants Method Learner v2 (lateness insights on the dashboard). I kept everything small and modular.
+
+1) Branding: project overrides + cached logo proxy + theme
+1A) DB
+
+Run in Supabase SQL:
+
+-- Per-project override branding (falls back to org_branding if not set)
+create table if not exists public.project_branding (
+  org_id uuid not null,
+  project_id uuid not null,
+  customer_name text,
+  customer_logo_bucket text,
+  customer_logo_path text,
+  vendor_name text,
+  vendor_logo_bucket text,
+  vendor_logo_path text,
+  theme_color text,
+  header_text text,
+  updated_at timestamptz not null default now(),
+  primary key (org_id, project_id)
+);
+alter table public.project_branding enable row level security;
+
+create policy "pbranding_select_member" on public.project_branding
+for select using (org_id = public.current_org() and public.is_member(org_id, project_id));
+create policy "pbranding_admin_upsert" on public.project_branding
+for insert with check (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin']));
+create policy "pbranding_admin_update" on public.project_branding
+for update using (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin']))
+with check (org_id = public.current_org());
+
+-- ETag store (optional lightweight) to help cache logos
+create table if not exists public.branding_etags (
+  org_id uuid not null,
+  kind text not null,  -- 'org:customer','org:vendor','proj:<id>:customer','proj:<id>:vendor'
+  etag text not null,
+  updated_at timestamptz not null default now(),
+  primary key (org_id, kind)
+);
+alter table public.branding_etags enable row level security;
+create policy "betag_read_member" on public.branding_etags
+for select using (org_id = public.current_org());
+create policy "betag_write_admin" on public.branding_etags
+for insert with check (org_id = public.current_org() and public.has_role(org_id, null, array['owner','admin']))
+  , update using (org_id = public.current_org() and public.has_role(org_id, null, array['owner','admin']))
+  with check (org_id = public.current_org());
+
+select pg_notify('pgrst','reload schema');
+
+1B) Backend — extend Branding router
+
+server/routers/branding.py (replace file or apply patches as noted; this version includes: org+project settings; logo proxy with ETag + HEAD; upload endpoints for org + project)
+
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, Request, Response
+from fastapi.responses import StreamingResponse
+from ..tenant import TenantCtx
+from ..guards import require_role, member_ctx
+from ..deps import get_user_supabase, get_service_supabase
+import os, datetime as dt, imghdr, mimetypes, io, hashlib
+
+router = APIRouter(prefix="/branding", tags=["branding"])
+ADMIN = require_role({"owner","admin"})
+
+def _now_iso(): return dt.datetime.now(dt.timezone.utc).isoformat()
+def _bucket(): return os.getenv("BRANDING_BUCKET") or os.getenv("ARTIFACTS_BUCKET") or "artifacts"
+
+def _validate_image(data: bytes, filename: str):
+    typ = imghdr.what(None, h=data)
+    if typ not in ("png","jpeg","jpg","gif","webp"):
+        ext = (filename or "").split(".")[-1].lower()
+        if ext not in ("png","jpg","jpeg","gif","webp"):
+            raise HTTPException(400, "Invalid image file")
+    return mimetypes.guess_type(filename)[0] or "image/png"
+
+def _upload_logo(file: UploadFile, key_prefix: str, ctx: TenantCtx):
+    sbs = get_service_supabase()
+    bucket = _bucket()
+    raw = file.file.read()
+    ctype = _validate_image(raw, file.filename or "logo.png")
+    key = f"org/{ctx.org_id}/branding/{key_prefix}__{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d_%H%M%S')}__{file.filename or 'logo'}"
+    sbs.storage().from_(bucket).upload(key, raw, {"content-type": ctype, "upsert": True})
+    return bucket, key, ctype, raw
+
+# ---------- ORG settings ----------
+@router.get("/settings")
+def get_settings(ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    r = sb.table("org_branding").select("*").eq("org_id", ctx.org_id).single().execute()
+    return r.data or {"org_id": ctx.org_id, "theme_color":"#111111"}
+
+@router.post("/settings")
+def set_settings(body: dict, ctx: TenantCtx = Depends(ADMIN)):
+    sb = get_user_supabase(ctx)
+    body = dict(body or {})
+    body["org_id"] = ctx.org_id
+    body["updated_at"] = _now_iso()
+    sb.table("org_branding").upsert(body, on_conflict="org_id").execute()
+    return {"ok": True}
+
+@router.post("/upload_customer")
+def upload_customer(file: UploadFile = File(...), ctx: TenantCtx = Depends(ADMIN)):
+    bucket, key, ctype, raw = _upload_logo(file, "customer", ctx)
+    sb = get_user_supabase(ctx)
+    sb.table("org_branding").upsert({
+        "org_id": ctx.org_id, "customer_logo_bucket": bucket, "customer_logo_path": key, "updated_at": _now_iso()
+    }, on_conflict="org_id").execute()
+    _upsert_etag(ctx.org_id, f"org:customer", raw)
+    return {"ok": True, "bucket": bucket, "path": key, "content_type": ctype}
+
+@router.post("/upload_vendor")
+def upload_vendor(file: UploadFile = File(...), ctx: TenantCtx = Depends(ADMIN)):
+    bucket, key, ctype, raw = _upload_logo(file, "vendor", ctx)
+    sb = get_user_supabase(ctx)
+    sb.table("org_branding").upsert({
+        "org_id": ctx.org_id, "vendor_logo_bucket": bucket, "vendor_logo_path": key, "updated_at": _now_iso()
+    }, on_conflict="org_id").execute()
+    _upsert_etag(ctx.org_id, f"org:vendor", raw)
+    return {"ok": True, "bucket": bucket, "path": key, "content_type": ctype}
+
+# ---------- PROJECT overrides ----------
+@router.get("/project_settings")
+def get_project_settings(project_id: str, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    p = sb.table("project_branding").select("*").eq("org_id", ctx.org_id).eq("project_id", project_id).single().execute().data
+    o = sb.table("org_branding").select("*").eq("org_id", ctx.org_id).single().execute().data or {}
+    # overlay p on o
+    def pick(k): return (p or {}).get(k) or o.get(k)
+    out = {
+      "org_id": ctx.org_id, "project_id": project_id,
+      "customer_name": pick("customer_name"),
+      "customer_logo_bucket": pick("customer_logo_bucket"),
+      "customer_logo_path": pick("customer_logo_path"),
+      "vendor_name": pick("vendor_name"),
+      "vendor_logo_bucket": pick("vendor_logo_bucket"),
+      "vendor_logo_path": pick("vendor_logo_path"),
+      "theme_color": pick("theme_color") or "#111111",
+      "header_text": pick("header_text"),
+      "source": "project" if p else "org"
+    }
+    return out
+
+@router.post("/project_settings")
+def set_project_settings(project_id: str, body: dict, ctx: TenantCtx = Depends(ADMIN)):
+    sb = get_user_supabase(ctx)
+    body = dict(body or {})
+    body["org_id"] = ctx.org_id
+    body["project_id"] = project_id
+    body["updated_at"] = _now_iso()
+    sb.table("project_branding").upsert(body, on_conflict="org_id,project_id").execute()
+    return {"ok": True}
+
+@router.post("/project_upload_customer")
+def project_upload_customer(project_id: str, file: UploadFile = File(...), ctx: TenantCtx = Depends(ADMIN)):
+    bucket, key, ctype, raw = _upload_logo(file, f"proj_{project_id}_customer", ctx)
+    sb = get_user_supabase(ctx)
+    sb.table("project_branding").upsert({
+        "org_id": ctx.org_id, "project_id": project_id,
+        "customer_logo_bucket": bucket, "customer_logo_path": key, "updated_at": _now_iso()
+    }, on_conflict="org_id,project_id").execute()
+    _upsert_etag(ctx.org_id, f"proj:{project_id}:customer", raw)
+    return {"ok": True, "bucket": bucket, "path": key, "content_type": ctype}
+
+@router.post("/project_upload_vendor")
+def project_upload_vendor(project_id: str, file: UploadFile = File(...), ctx: TenantCtx = Depends(ADMIN)):
+    bucket, key, ctype, raw = _upload_logo(file, f"proj_{project_id}_vendor", ctx)
+    sb = get_user_supabase(ctx)
+    sb.table("project_branding").upsert({
+        "org_id": ctx.org_id, "project_id": project_id,
+        "vendor_logo_bucket": bucket, "vendor_logo_path": key, "updated_at": _now_iso()
+    }, on_conflict="org_id,project_id").execute()
+    _upsert_etag(ctx.org_id, f"proj:{project_id}:vendor", raw)
+    return {"ok": True, "bucket": bucket, "path": key, "content_type": ctype}
+
+# ---------- ETag support + logo HEAD/GET ----------
+def _upsert_etag(org_id: str, kind: str, data: bytes):
+    sbs = get_service_supabase()
+    etag = hashlib.md5(data).hexdigest()
+    try:
+        sbs.table("branding_etags").upsert({
+          "org_id": org_id, "kind": kind, "etag": etag, "updated_at": _now_iso()
+        }, on_conflict="org_id,kind").execute()
+    except Exception: ...
+
+def _lookup_logo(sb, sbs, org_id: str, project_id: str | None, which: str):
+    # project override first
+    bucket = path = None
+    if project_id:
+        p = sb.table("project_branding").select("*").eq("org_id", org_id).eq("project_id", project_id).single().execute().data
+        if p:
+            bucket = p.get(f"{which}_logo_bucket")
+            path = p.get(f"{which}_logo_path")
+    if not bucket or not path:
+        o = sb.table("org_branding").select("*").eq("org_id", org_id).single().execute().data or {}
+        bucket = o.get(f"{which}_logo_bucket")
+        path = o.get(f"{which}_logo_path")
+    if not bucket or not path: return None, None, None
+    try:
+        data = sbs.storage().from_(bucket).download(path)
+    except Exception:
+        return None, None, None
+    ctype = mimetypes.guess_type(path)[0] or "image/png"
+    return data, path, ctype
+
+@router.head("/logo")
+def logo_head(which: str = Query(..., regex="^(customer|vendor)$"),
+              project_id: str | None = None, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx); sbs = get_service_supabase()
+    # ETag lookup
+    key = f"proj:{project_id}:{which}" if project_id else f"org:{which}"
+    et = None
+    try:
+        r = sb.table("branding_etags").select("etag").eq("org_id", ctx.org_id).eq("kind", key).single().execute().data
+        et = r and r.get("etag")
+    except Exception: ...
+    if et:
+        return Response(status_code=200, headers={"ETag": et})
+    # fallback to compute on first call
+    data, path, _ = _lookup_logo(sb, sbs, ctx.org_id, project_id, which)
+    if not data: raise HTTPException(404, "Logo not set")
+    et = hashlib.md5(data).hexdigest()
+    _upsert_etag(ctx.org_id, key, data)
+    return Response(status_code=200, headers={"ETag": et})
+
+@router.get("/logo")
+def logo_get(which: str = Query(..., regex="^(customer|vendor)$"),
+             project_id: str | None = None, request: Request = None, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx); sbs = get_service_supabase()
+    # ETag check
+    key = f"proj:{project_id}:{which}" if project_id else f"org:{which}"
+    inm = request.headers.get("If-None-Match") if request else None
+    et = None
+    try:
+        r = sb.table("branding_etags").select("etag").eq("org_id", ctx.org_id).eq("kind", key).single().execute().data
+        et = r and r.get("etag")
+    except Exception: ...
+    if et and inm and inm.strip('"') == et:
+        return Response(status_code=304)
+
+    data, path, ctype = _lookup_logo(sb, sbs, ctx.org_id, project_id, which)
+    if not data: raise HTTPException(404, "Logo not set")
+    etag = et or hashlib.md5(data).hexdigest()
+    return StreamingResponse(io.BytesIO(data), media_type=ctype,
+                             headers={"ETag": f"\"{etag}\""})
+
+
+What changed:
+
+Project-level settings + uploads
+
+HEAD /branding/logo + GET /branding/logo with ETag/304 support
+
+Upload writes an etag entry so the client caches properly
+
+1C) Frontend — Project-aware branded header + theme
+
+Create client/src/components/BrandTheme.tsx:
+
+import { useEffect } from "react";
+export default function BrandTheme({ color }: { color?: string }){
+  useEffect(()=>{
+    if (!color) return;
+    document.documentElement.style.setProperty('--brand-color', color);
+    return ()=>{ /* optional cleanup */ };
+  },[color]);
+  return null;
+}
+
+
+Patch client/src/components/BrandedHeader.tsx to use project-aware settings + theme:
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import BrandTheme from "@/components/BrandTheme";
+
+export default function BrandedHeader(){
+  const { projectId } = useParams();
+  const [b,setB]=useState<any>(null);
+  useEffect(()=>{ (async()=>{
+    try{
+      const url = projectId ? `/branding/project_settings?project_id=${projectId}` : `/branding/settings`;
+      const r = await fetch(url, { credentials:"include" });
+      if (r.ok) setB(await r.json());
+    }catch{}
+  })(); },[projectId]);
+  if (!b) return null;
+
+  return (
+    <div className="w-full border-b" style={{borderColor:b.theme_color || "#111111"}}>
+      <BrandTheme color={b.theme_color}/>
+      <div className="flex items-center justify-between p-2">
+        <div className="flex items-center gap-2">
+          {b.customer_logo_path &&
+            <img src={`/branding/logo?which=customer${projectId?`&project_id=${projectId}`:""}`} alt="customer" className="h-6" />}
+          {b.customer_name && <div className="text-sm font-medium">{b.customer_name}</div>}
+        </div>
+        {b.header_text && <div className="text-xs text-muted-foreground">{b.header_text}</div>}
+        <div className="flex items-center gap-2">
+          {b.vendor_logo_path &&
+            <img src={`/branding/logo?which=vendor${projectId?`&project_id=${projectId}`:""}`} alt="vendor" className="h-6" />}
+          <div className="text-sm font-semibold" style={{color:b.theme_color || "#111111"}}>TEAIM</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+CSS: anywhere you want to brand components, use var(--brand-color).
+
+2) Stage Template Editor (create/save templates per org)
+2A) DB
+create table if not exists public.org_stage_templates (
+  org_id uuid not null,
+  key text not null,              -- unique key per org
+  label text not null,
+  stages jsonb not null,          -- [{title, area, days}]
+  updated_at timestamptz not null default now(),
+  primary key (org_id, key)
+);
+alter table public.org_stage_templates enable row level security;
+
+create policy "ost_select_member" on public.org_stage_templates
+for select using (org_id = public.current_org());
+create policy "ost_admin_upsert" on public.org_stage_templates
+for insert with check (org_id = public.current_org() and public.has_role(org_id, null, array['owner','admin','pm']))
+  , update using (org_id = public.current_org() and public.has_role(org_id, null, array['owner','admin','pm']))
+  with check (org_id = public.current_org());
+
+2B) Router
+
+server/routers/stages_templates_editor.py
+
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel
+from typing import List, Optional
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/stages/templates", tags=["stages"])
+PM_PLUS = require_role({"owner","admin","pm"})
+
+class StageRow(BaseModel):
+    title: str
+    area: Optional[str] = None
+    days: int = 7
+
+class TemplateBody(BaseModel):
+    key: str
+    label: str
+    stages: List[StageRow]
+
+@router.get("/org")
+def list_org_templates(ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    r = sb.table("org_stage_templates").select("*").eq("org_id", ctx.org_id).order("label", desc=False).execute().data or []
+    return {"items": r}
+
+@router.post("/org/upsert")
+def upsert_org_template(body: TemplateBody, ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    sb.table("org_stage_templates").upsert({
+      "org_id": ctx.org_id, "key": body.key, "label": body.label,
+      "stages": [r.dict() for r in body.stages], "updated_at": dt.datetime.now(dt.timezone.utc).isoformat()
+    }, on_conflict="org_id,key").execute()
+    return {"ok": True}
+
+@router.post("/org/delete")
+def delete_org_template(key: str, ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    sb.table("org_stage_templates").delete().eq("org_id", ctx.org_id).eq("key", key).execute()
+    return {"ok": True}
+
+
+Mount in server/main.py:
+
+from .routers import stages_templates_editor
+app.include_router(stages_templates_editor.router)
+
+2C) UI — Template editor + integrate into Stage Wizard
+
+client/src/pages/StageTemplateEditor.tsx
+
+import { useEffect, useState } from "react";
+import PageHeaderHint from "@/components/PageHeaderHint";
+import { getJSON, postJSON } from "@/lib/authFetch";
+
+type Row = { title:string; area?:string; days:number };
+type Tpl = { key:string; label:string; stages:Row[] };
+
+export default function StageTemplateEditor(){
+  const [items,setItems]=useState<Tpl[]>([]);
+  const [key,setKey]=useState(""); const [label,setLabel]=useState("");
+  const [rows,setRows]=useState<Row[]>([{ title:"Discovery", area:"HCM", days:14 }]);
+
+  async function load(){ const d = await getJSON(`/stages/templates/org`); setItems(d.items||[]); }
+  useEffect(()=>{ load(); },[]);
+
+  function setRow(i:number, k:keyof Row, v:any){ setRows(prev=>prev.map((r,idx)=> idx===i ? {...r,[k]: (k==='days'? Number(v): v)} : r)); }
+  function addRow(){ setRows(prev=>[...prev,{title:"",area:"",days:7}]); }
+  function delRow(i:number){ setRows(prev=>prev.filter((_,idx)=>idx!==i)); }
+
+  async function save(){
+    if (!key.trim() || !label.trim() || !rows.filter(r=>r.title.trim()).length) { alert("Fill key, label, rows"); return; }
+    await postJSON(`/stages/templates/org/upsert`, { key:key.trim(), label:label.trim(), stages: rows });
+    setKey(""); setLabel(""); setRows([{title:"",area:"",days:7}]); load();
+  }
+  async function remove(k:string){ await postJSON(`/stages/templates/org/delete?key=${encodeURIComponent(k)}`,{}); load(); }
+
+  return (
+    <div className="p-6 space-y-3">
+      <PageHeaderHint id="stage-tpl-editor" title="Stage Template Editor"
+        intro="Create reusable stage templates with areas and durations."
+        bullets={["Templates are available in the Stage Wizard","Durations are applied from baseline date"]}/>
+      <div className="border rounded p-3 space-y-2">
+        <div className="grid md:grid-cols-2 gap-2">
+          <input className="border rounded p-2" placeholder="Template key (unique)" value={key} onChange={e=>setKey(e.target.value)}/>
+          <input className="border rounded p-2" placeholder="Label" value={label} onChange={e=>setLabel(e.target.value)}/>
+        </div>
+        <div className="border rounded divide-y">
+          {rows.map((r,i)=>(
+            <div key={i} className="grid md:grid-cols-5 gap-2 p-2">
+              <input className="border rounded p-2" placeholder="Title" value={r.title} onChange={e=>setRow(i,'title',e.target.value)}/>
+              <input className="border rounded p-2" placeholder="Area" value={r.area||""} onChange={e=>setRow(i,'area',e.target.value)}/>
+              <input className="border rounded p-2" type="number" min={1} value={r.days} onChange={e=>setRow(i,'days',e.target.value)}/>
+              <div className="md:col-span-2 flex items-center gap-2">
+                <button className="px-2 py-1 border rounded text-xs" onClick={()=>delRow(i)}>Delete</button>
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="flex gap-2">
+          <button className="px-3 py-2 border rounded" onClick={addRow}>Add Row</button>
+          <button className="px-3 py-2 border rounded" onClick={save}>Save Template</button>
+        </div>
+      </div>
+
+      <div className="border rounded p-3">
+        <div className="text-sm font-medium mb-2">Existing templates</div>
+        {items.map(t=>(
+          <div key={t.key} className="border rounded p-2 mb-2">
+            <div className="flex items-center justify-between">
+              <div className="text-sm font-medium">{t.label} <span className="text-xs text-muted-foreground">({t.key})</span></div>
+              <button className="px-2 py-1 border rounded text-xs" onClick={()=>remove(t.key)}>Delete</button>
+            </div>
+            <div className="text-xs text-muted-foreground">{t.stages.length} rows</div>
+          </div>
+        ))}
+        {!items.length && <div className="text-sm text-muted-foreground">No templates yet.</div>}
+      </div>
+    </div>
+  );
+}
+
+
+Route:
+
+{ path: "/admin/stage-templates", element: <StageTemplateEditor/> }
+
+
+Integrate into Stage Wizard (add a dropdown to load org templates):
+
+// client/src/pages/StageWizard.tsx
+const [orgTpls, setOrgTpls] = useState<any[]>([]);
+useEffect(()=>{ (async()=>{ try{ const d=await getJSON(`/stages/templates/org`); setOrgTpls(d.items||[]);}catch{} })(); },[]);
+
+// near baseline date/template controls
+<select className="border rounded p-2" onChange={e=>{
+  const key = e.target.value; if(!key) return;
+  const t = (orgTpls||[]).find((x:any)=>x.key===key); if(!t) return;
+  if (!baseDate){ alert("Pick baseline start date first"); return; }
+  const start = new Date(baseDate+"T00:00:00"); let cur = new Date(start);
+  const rowsNew = (t.stages||[]).map((s:any)=>{
+    const sdate = new Date(cur); const edate = new Date(cur); edate.setDate(edate.getDate() + Number(s.days||7));
+    cur = new Date(edate); cur.setDate(cur.getDate()+1);
+    return { title:s.title, area:s.area||"", start_date:sdate.toISOString().slice(0,10), end_date:edate.toISOString().slice(0,10) };
+  });
+  setRows(rowsNew);
+}}>
+  <option value="">(apply org template)</option>
+  {orgTpls.map(t=><option key={t.key} value={t.key}>{t.label}</option>)}
+</select>
+
+3) Method Learner v2 — lateness insights on dashboard
+3A) Router: lateness summary
+
+server/routers/method_lateness.py
+
+from fastapi import APIRouter, Depends, Query
+from datetime import datetime
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/method", tags=["method"])
+
+@router.get("/lateness")
+def lateness(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    # Find stages with planned end_date + signed events
+    stages = sb.table("project_stages").select("id,title,area,end_date")\
+              .eq("org_id", ctx.org_id).eq("project_id", project_id).execute().data or []
+    signed = sb.table("method_metrics").select("stage_id,created_at")\
+              .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("kind","stage.signed").execute().data or []
+    sig_by = {}
+    for s in signed:
+        sid = s.get("stage_id")
+        if sid and sid not in sig_by:
+            sig_by[sid] = s.get("created_at")
+
+    out=[]; late=on=0
+    for st in stages:
+        sid = st["id"]; end = st.get("end_date")
+        if not end or sid not in sig_by: continue
+        try:
+            plan = datetime.fromisoformat(end)
+            actual = datetime.fromisoformat(sig_by[sid])
+            delta = (actual - plan).days
+            out.append({"title": st.get("title"), "area": st.get("area"), "days": delta})
+            if delta > 0: late += 1
+            else: on += 1
+        except: pass
+    return {"summary": {"late": late, "on_time_or_early": on}, "details": out[:50]}
+
+
+Mount:
+
+from .routers import method_lateness
+app.include_router(method_lateness.router)
+
+3B) Dashboard tile
+
+client/src/components/DashboardMethodTile.tsx
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+
+export default function DashboardMethodTile(){
+  const { projectId } = useParams();
+  const [d,setD]=useState<any>(null);
+  useEffect(()=>{ (async()=>{ try{
+    const r = await fetch(`/api/method/lateness?project_id=${projectId}`, { credentials:"include" });
+    if (r.ok) setD(await r.json());
+  }catch{} })(); },[projectId]);
+
+  if (!d) return null;
+  const s = d.summary || {};
+  return (
+    <div className="border rounded p-3">
+      <div className="text-sm font-medium mb-1">Method Insights</div>
+      <div className="text-xs text-muted-foreground mb-2">Stage sign-off lateness (planned vs. actual)</div>
+      <div className="flex items-center gap-4 text-sm">
+        <div>Late: <b>{s.late ?? 0}</b></div>
+        <div>On-time/Early: <b>{s.on_time_or_early ?? 0}</b></div>
+      </div>
+      {d.details?.length>0 && (
+        <div className="mt-2 text-xs">
+          {d.details.slice(0,5).map((x:any,i:number)=>(
+            <div key={i} className="flex justify-between">
+              <span>{x.title} {x.area?`• ${x.area}`:""}</span>
+              <span className={x.days>0?"text-red-600":"text-green-600"}>{x.days>0?`+${x.days}`:x.days}d</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+Use it on your Dashboard (right column, under Restore Activity):
+
+import DashboardMethodTile from "@/components/DashboardMethodTile";
+// ...
+<div className="space-y-4">
+  {/* existing tiles */}
+  <DashboardMethodTile />
+</div>
+
+4) Small branding tweaks in sign-off + digest
+
+Where you render logos in emails/public pages, swap raw storage URLs with the proxy:
+
+Emails/public: /branding/logo?which=customer and /branding/logo?which=vendor (and add &project_id=... where appropriate).
+
+5) Mounts / aliases checklist
+
+server/main.py — ensure these are included once:
+
+from .routers import branding, stages_templates_editor, method_metrics, method_lateness
+app.include_router(branding.router)
+app.include_router(stages_templates_editor.router)
+app.include_router(method_metrics.router)
+app.include_router(method_lateness.router)
+
+
+(Branding already uses /branding prefix, so aliasing is optional.)
+
+6) 90-second validation
+
+Branding Admin: Save org settings, upload customer + vendor; refresh; logos show; HEAD /branding/logo?which=customer returns ETag; GET returns 304 when If-None-Match matches.
+
+Project overrides: On a project, call /branding/project_settings?project_id=...; upload a project vendor logo; header reflects override on that project only.
+
+Branded header: visible in app; logos appear on sign-off public page + digest emails.
+
+Stage Template Editor: create a template; open Stage Wizard → “apply org template”; rows fill from baseline date.
+
+Method tile: Sign a doc + (optionally) add stage end dates; tile shows late/ontime summary.

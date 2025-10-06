@@ -1,0 +1,193 @@
+Shipping Next Big Build v2.7.1 — Shell polish: headings + breadcrumbs, timeline→stage deep-link, and tasteful motion. This is copy-paste-ready and Brand v2–aware.
+
+You’ll see immediately:
+
+A uniform page header with breadcrumbs across screens
+
+Clicking a stage on the Timeline jumps to Stages with that stage highlighted
+
+Subtle brand motion (pulse/swoosh) on key CTAs
+
+1) Brand motion (tasteful, restrained)
+
+client/src/brand/micro.css (append)
+
+/* CTA pulse (once when visible) */
+@keyframes pulseOnce {
+  0% { transform: scale(1); box-shadow: 0 0 0 rgba(29,228,255,0); }
+  40% { transform: scale(1.02); box-shadow: 0 0 18px rgba(29,228,255,.35); }
+  100% { transform: scale(1); box-shadow: 0 0 0 rgba(29,228,255,0); }
+}
+.pulse-once { animation: pulseOnce 1s ease-in-out 1; }
+
+/* CTA swoosh underline */
+.swoosh {
+  position: relative;
+}
+.swoosh::after {
+  content: ""; position: absolute; left: 8px; right: 8px; bottom: -2px; height: 2px;
+  background: var(--brand-gradient); border-radius: 2px; opacity: 0; transform: scaleX(.2);
+  transition: opacity .18s ease, transform .18s ease;
+}
+.swoosh:hover::after { opacity: .9; transform: scaleX(1); }
+
+
+Use .pulse-once on first-time CTAs (Request Sign-Off, Export buttons), and .swoosh on primary links/buttons.
+
+2) Page heading with breadcrumbs (uniform top of page)
+
+client/src/components/PageHeading.tsx (new)
+
+import { NavLink } from "react-router-dom";
+
+export default function PageHeading({
+  title, crumbs
+}:{ title:string; crumbs?: { label:string; to?:string }[] }){
+  return (
+    <div className="mb-3">
+      {crumbs && crumbs.length>0 && (
+        <div className="text-xs text-muted-foreground mb-1 flex items-center gap-1">
+          {crumbs.map((c,i)=>(
+            <span key={i} className="flex items-center gap-1">
+              {c.to ? <NavLink to={c.to} className="underline hover-pop">{c.label}</NavLink> : <span>{c.label}</span>}
+              {i<crumbs.length-1 && <span>›</span>}
+            </span>
+          ))}
+        </div>
+      )}
+      <div className="text-xl font-semibold heading">{title}</div>
+    </div>
+  );
+}
+
+Use it on key pages
+
+DashboardV2 (top of return):
+
+import PageHeading from "@/components/PageHeading";
+// ...
+<PageHeading title="Dashboard" crumbs={[{label:"Overview"}]} />
+
+
+TimelinePage (client/src/pages/Timeline.tsx):
+
+import PageHeading from "@/components/PageHeading";
+// ...
+return (
+  <div>
+    <PageHeading title="Timeline" crumbs={[{label:"Overview"},{label:"Timeline"}]} />
+    <ProgramTimeline projectId={projectId!} />
+  </div>
+);
+
+
+(You can drop this header into Documents, Meetings, etc. the same way.)
+
+3) Timeline → Stages deep-link (focus a stage)
+3A) Click on a timeline bar routes to Stages with ?focus=<stageId>
+
+Patch client/src/components/PhaseTimeline.tsx
+
+import { useNavigate } from "react-router-dom";
+// ...
+export default function PhaseTimeline({ projectId }:{ projectId:string }){
+  const navigate = useNavigate();
+// ...
+{stages.map(s=>{
+  // ...existing computations...
+  const gotoStage = ()=> navigate(`/projects/${projectId}/stages/manage?focus=${s.id}`);
+  return (
+    <div key={s.id} className="mb-2">
+      <div className="text-xs flex justify-between mb-1">
+        <span>{s.title} {s.area? `• ${s.area}`:""}</span>
+        <span className="text-muted-foreground">{s.status || ""}</span>
+      </div>
+      <div className="relative h-2 bg-white/10 rounded cursor-pointer" title={tip} onClick={gotoStage}>
+        <div className="absolute h-2 rounded"
+          style={{ left:`${pctStart}%`, width:`${pctW}%`, background: col, boxShadow: glow }} />
+        {signedNow && <div className="absolute -top-4" style={{ left:`calc(${pctStart}% + ${pctW/2}%)`}}>
+          <span style={{fontSize:'10px',color:'var(--brand-good)'}}>✔</span>
+        </div>}
+      </div>
+      <div className="mt-1 flex justify-end">
+        <button className="brand-btn text-[11px] swoosh" onClick={async (e)=>{ e.stopPropagation(); /* existing Request Sign-Off code */ }}>
+          Request Sign-Off
+        </button>
+      </div>
+    </div>
+  );
+})}
+
+3B) Stages page: read ?focus= and highlight/scroll
+
+Patch client/src/pages/Stages.tsx (or your StagesEditor)
+
+At top:
+
+import { useLocation } from "react-router-dom";
+import { useEffect, useRef } from "react";
+// ...
+const refMap = useRef<Record<string, HTMLDivElement|null>>({});
+const loc = useLocation();
+const focusId = new URLSearchParams(loc.search).get("focus") || "";
+
+
+In the row render for each stage, add ref and highlight class:
+
+<div
+  ref={el => { refMap.current[s.id] = el }}
+  className={`grid md:grid-cols-5 gap-2 p-2 rounded ${s.id===focusId ? 'ring-2 ring-[var(--brand-accent)] pulse-once' : ''}`}
+>
+  {/* row inputs */}
+</div>
+
+
+Auto-scroll to focused stage on mount/update:
+
+useEffect(()=>{
+  if (focusId && refMap.current[focusId]) {
+    refMap.current[focusId]!.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+}, [focusId, stages]);
+
+
+Now, clicking a bar on the Timeline drops the PM into Stages with that line glowing & centered.
+
+4) CSV bundle button (place it where it demos best)
+
+Example: Data & Reporting or Documents page:
+
+import { downloadGET } from "@/lib/download";
+// ...
+<button className="brand-btn swoosh text-xs"
+  onClick={()=>downloadGET(`/api/export/csv_bundle.zip?project_id=${projectId}&types=actions,risks,decisions`, "csv_bundle.zip")}
+>
+  Export CSV Bundle
+</button>
+
+5) Add motion lightly on key CTAs
+
+“Export Data Room”, “Compose Sign-Off”, “Request Sign-Off”, “Propose” buttons: add .swoosh
+
+First time each card appears (e.g., after successful data load), add .pulse-once to that CTA or card container
+
+Example (Updates Review “Apply All Safe” already glows; give its parent a tiny pulse the first time list loads):
+
+<div className={`flex items-center gap-2 ml-auto ${items.length && firstLoad ? 'pulse-once' : ''}`}>
+  {/* controls */}
+</div>
+
+
+(Track firstLoad in state and set to false after a timeout.)
+
+6) 45-second validation
+
+Header is sticky; only the sidebar scrolls; main content scrolls independently
+
+Each page opens with a uniform heading + breadcrumbs
+
+Click a bar on Timeline → lands on Stages with that stage focused & glowing
+
+Export CSV Bundle works (if you placed the button)
+
+CTAs have swoosh underline and tasteful one-time pulse

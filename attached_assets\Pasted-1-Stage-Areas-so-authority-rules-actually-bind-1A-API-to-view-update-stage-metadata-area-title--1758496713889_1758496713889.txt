@@ -1,0 +1,182 @@
+1) Stage Areas (so authority rules actually bind)
+1A) API to view/update stage metadata (area/title/dates)
+
+server/routers/stages_manage.py
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+from typing import Optional
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/stages", tags=["stages"])
+PM_PLUS = require_role({"owner","admin","pm"})
+
+class StageUpdate(BaseModel):
+    title: Optional[str] = None
+    area: Optional[str] = None
+    start_date: Optional[str] = None  # ISO date
+    end_date: Optional[str] = None
+
+@router.get("/list")
+def list_stages(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    out = sb.table("project_stages").select("id,title,area,start_date,end_date,status,created_at")\
+          .eq("org_id", ctx.org_id).eq("project_id", project_id).order("created_at", desc=False).execute().data or []
+    return {"items": out}
+
+@router.post("/update")
+def update_stage(stage_id: str, body: StageUpdate, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    patch = {k:v for k,v in body.dict().items() if v is not None}
+    if not patch: return {"ok": True}
+    sb.table("project_stages").update(patch)\
+      .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", stage_id).execute()
+    return {"ok": True}
+
+
+Mount:
+
+from .routers import stages_manage
+app.include_router(stages_manage.router)
+
+1B) Composer: pick an Area
+
+In SignoffComposer.tsx (top controls):
+
+const [stageArea, setStageArea] = useState("");
+<input className="border rounded p-2 w-full" placeholder="Stage area (e.g., HCM, Payroll)" value={stageArea} onChange={e=>setStageArea(e.target.value)} />
+
+
+When creating the stage in your send endpoint, write area: stageArea.
+
+2) Monitor badge (pending updates count)
+2A) API: pending count
+
+server/routers/updates_status.py
+
+from fastapi import APIRouter, Depends, Query
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/updates", tags=["updates"])
+@router.get("/count")
+def count_pending(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    r = sb.table("pending_updates").select("id", count="exact")\
+         .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("status","pending").execute()
+    return {"count": r.count or 0}
+
+
+Mount:
+
+from .routers import updates_status
+app.include_router(updates_status.router)
+
+2B) Sidebar badge
+
+In your sidebar where you render the “Updates” nav item:
+
+import { useEffect, useState } from "react";
+import { getJSON } from "@/lib/authFetch";
+const [uCount, setUCount] = useState(0);
+useEffect(()=>{ 
+  let alive=true; 
+  (async ()=>{ try{ const d=await getJSON(`/api/updates/count?project_id=${projectId}`); if(alive) setUCount(d.count||0);}catch{} })();
+  const t=setInterval(async()=>{ try{ const d=await getJSON(`/api/updates/count?project_id=${projectId}`); if(alive) setUCount(d.count||0);}catch{} }, 15000);
+  return ()=>{alive=false; clearInterval(t)};
+},[projectId]);
+
+/* in the link */
+<span className="ml-auto text-[10px] px-1.5 rounded-full bg-black text-white">{uCount || ""}</span>
+
+3) Auto-Apply Rules (safe defaults + per-org settings)
+3A) SQL
+alter table public.org_comms_settings
+  add column if not exists auto_apply_updates boolean not null default false,
+  add column if not exists auto_apply_min_conf numeric not null default 0.85;
+
+select pg_notify('pgrst','reload schema');
+
+3B) API to read/update
+
+server/routers/updates_rules.py
+
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/updates", tags=["updates"])
+ADMIN = require_role({"owner","admin"})
+
+class RulesBody(BaseModel):
+    auto_apply_updates: bool
+    auto_apply_min_conf: float
+
+@router.get("/rules")
+def get_rules(ctx: TenantCtx = Depends(ADMIN)):
+    sb = get_user_supabase(ctx)
+    s = sb.table("org_comms_settings").select("auto_apply_updates,auto_apply_min_conf")\
+        .eq("org_id", ctx.org_id).single().execute().data or {}
+    return s
+
+@router.post("/rules")
+def set_rules(body: RulesBody, ctx: TenantCtx = Depends(ADMIN)):
+    sb = get_user_supabase(ctx)
+    sb.table("org_comms_settings").upsert({
+        "org_id": ctx.org_id,
+        "auto_apply_updates": body.auto_apply_updates,
+        "auto_apply_min_conf": body.auto_apply_min_conf,
+    }, on_conflict="org_id").execute()
+    return {"ok": True}
+
+
+Mount:
+
+from .routers import updates_rules
+app.include_router(updates_rules.router)
+
+3C) Ingestion hook — enqueue + optional auto-apply
+
+Anywhere you finalize classifier output:
+
+def push_update(host, project_id, headers, change_type, target_table, operation, payload, target_id=None, conf=0.8):
+    import requests, json
+    # 1) enqueue
+    r = requests.post(f"{host}/api/updates/enqueue?project_id={project_id}",
+                      headers=headers, json={
+                        "change_type": change_type, "operation": operation,
+                        "target_table": target_table, "target_id": target_id,
+                        "payload": payload, "confidence": conf, "created_by": "classifier"
+                      }, timeout=20)
+    r.raise_for_status()
+    uid = r.json()["update"]["id"]
+    # 2) check rules
+    rs = requests.get(f"{host}/api/updates/rules", headers=headers, timeout=10)
+    if rs.ok and rs.json().get("auto_apply_updates") and conf >= float(rs.json().get("auto_apply_min_conf", 0.85)):
+        requests.post(f"{host}/api/updates/{uid}/approve?project_id={project_id}", headers=headers, timeout=20)
+
+4) Safer apply — optional concurrency guard
+
+In _apply_change (updates.py) add this before update:
+
+# optimistic concurrency (optional): only apply if updated_at matches payload
+if op=="update" and "updated_at" in pay:
+    cur = sbs.table(table).select("updated_at").eq("org_id", org_id).eq("project_id", project_id).eq("id", tid).single().execute().data
+    if cur and str(cur["updated_at"]) != str(pay["updated_at"]):
+        raise HTTPException(409, "Record changed since propose; refresh and re-approve")
+    pay.pop("updated_at", None)  # let DB set new updated_at
+
+5) First-class Stage Editor (Optional fast UI)
+
+Add a small Stages page to set Areas quickly:
+
+// client/src/pages/Stages.tsx
+// fetch /api/stages/list; inline edit area -> POST /api/stages/update
+
+
+(You already have most patterns in Actions Kanban & TeamAccess.)

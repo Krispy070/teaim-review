@@ -1,0 +1,136 @@
+What I’d tighten next (quick wins)
+
+Hierarchy/Contrast
+
+KPI tiles: dark label, bright value. Right now the label/value contrast is close.
+
+Timeline: lighten rails slightly; make active bars bolder so the eye locks onto progress.
+
+Card headers: increase contrast and tighten vertical padding so cards read “denser, sharper”.
+
+Color system
+
+Use one accent (TEAIM orange) for primary CTAs only. The gold can be secondary emphasis (counts, highlights), not buttons.
+
+Notifications, warnings, success: use tinted pills (transparent backgrounds) so they don’t compete with CTAs.
+
+Spacing & density
+
+Reduce inner card padding from 24 → 20px; header padding from 16 → 12px.
+
+Button group (“Week/Month/Quarter/Export/Share”): tighten to 8px gaps and uniform widths.
+
+Borders & radii
+
+Keep a single radius system: 14px cards, 12px buttons, 10px pills.
+
+Lower border contrast a hair to avoid “outlined everywhere” look.
+
+Typography
+
+Sidebar labels: use 12px/600 for section headers, 14px/500 for items.
+
+KPI values: 20–22px/700, labels 12px/600.
+
+Card titles: 15px/700, body 13.5–14px/500.
+
+Icon legibility
+
+All sidebar and header icons should use var(--text-soft) by default and var(--brand-orange) when active/hover.
+
+Replace emoji buttons in “Team Wellness” with consistent vector icons (still fun, but crisp).
+
+Header
+
+Tighten to a single line with centered customer identity, keep implementor + env pill + bell + avatar on the right.
+
+Consider dropping the “Customer” label word and just show the logo/name—less chrome, more brand.
+
+Drop-in style updates
+1) KPI tiles
+.kpi {
+  background: var(--ui-panel);
+  border: 1px solid color-mix(in oklab, var(--ui-border), #000 10%);
+  border-radius: 14px;
+  padding: 16px 18px;
+}
+.kpi .label { color: var(--text-muted); font-size: 12px; font-weight: 600; letter-spacing:.02em; }
+.kpi .value { color: var(--text-strong); font-size: 22px; font-weight: 700; }
+.kpi--risk .value { color: var(--error); }
+.kpi--actions .value { color: var(--brand-gold); }
+.kpi--signoffs .value { color: var(--text-strong); }
+.kpi--wellness .value { color: var(--success); }
+
+2) Primary/secondary buttons
+.k-btn { 
+  display:inline-flex; align-items:center; gap:.6ch;
+  padding:.55rem .9rem; border-radius:12px;
+  border:1px solid var(--ui-border); background: var(--ui-panel-2); color: var(--text-strong);
+}
+.k-btn:hover { background:#1B1E28; border-color:#3A3E4E; }
+.k-btn--primary { background: var(--brand-orange); border-color:#C65115; color:#0B0B0D; font-weight:700; }
+.k-btn--primary:hover { filter:brightness(1.06); }
+.k-btn--ghost { background: transparent; border-color: var(--ui-border); color: var(--text); }
+
+
+Apply to “Week / Month / Quarter / Export / Share”: primary only on the active period; others ghost.
+
+3) Tags/pills (Overdue, etc.)
+.k-pill {
+  display:inline-flex; align-items:center; gap:.4ch;
+  padding:.25rem .5rem; border-radius:10px; font-size:12px; line-height:1;
+  border:1px solid transparent;
+}
+.k-pill--overdue { background: var(--pill-error); color: var(--error); border-color: rgba(231,76,60,.35); }
+.k-pill--warn    { background: var(--pill-warn);  color: var(--warn);  border-color: rgba(255,193,7,.35); }
+.k-pill--ok      { background: var(--pill-success); color: var(--success); border-color: rgba(46,204,113,.35); }
+
+4) Timeline rails
+.timeline {
+  --rail: #222634; --tick: #2C3140; --fill: var(--brand-orange);
+}
+.timeline .bar-bg { background: var(--rail); height: 8px; border-radius: 8px; }
+.timeline .bar-fill { background: var(--fill); height: 8px; border-radius: 8px; }
+.timeline .tick { background: var(--tick); width:1px; opacity:.6; }
+
+5) Card headers / content
+.card { background: var(--ui-panel); border:1px solid var(--ui-border); border-radius:14px; }
+.card__hd { padding: 12px 16px; border-bottom:1px solid color-mix(in oklab, var(--ui-border), #000 10%); }
+.card__title { color: var(--text-strong); font-size: 15px; font-weight:700; }
+.card__bd { padding: 16px; color: var(--text); }
+
+6) Sidebar polish
+.sidebar { background: color-mix(in oklab, var(--ui-bg), #000 6%); border-right:1px solid var(--ui-border); }
+.sidebar .section { color: var(--text-muted); font-size:12px; font-weight:600; padding: 8px 14px; letter-spacing:.02em; }
+.sidebar .item { color: var(--text-soft); font-size:14px; font-weight:500; padding:8px 14px; border-radius:10px; }
+.sidebar .item:hover { background: rgba(255,255,255,.03); color: var(--text); }
+.sidebar .item.active { background: rgba(242,107,29,.12); color: var(--text-strong); }
+.sidebar .item .icon { color: currentColor; opacity:.9; }
+
+Micro-interactions (feel rich, not noisy)
+
+Add focus outlines for keyboard users:
+
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 10px; }
+
+
+Buttons: 120ms ease for hover/press:
+
+.k-btn, .k-pill { transition: background .12s ease, border-color .12s ease, transform .06s ease; }
+.k-btn:active { transform: translateY(1px); }
+
+Component tweaks (React JSX examples)
+Period switcher
+<div className="flex gap-2">
+  <button className="k-btn k-btn--primary">Week</button>
+  <button className="k-btn k-btn--ghost">Month</button>
+  <button className="k-btn k-btn--ghost">Quarter</button>
+  <button className="k-btn k-btn--ghost">Export</button>
+  <button className="k-btn k-btn--ghost">Share</button>
+</div>
+
+Overdue list items
+<li className="flex items-center justify-between gap-3 py-2 px-3 rounded-xl hover:bg-[#1B1E28]">
+  <span>Map payroll cost centers</span>
+  <span className="k-pill k-pill--overdue">Overdue</span>
+</li>

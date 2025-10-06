@@ -1,0 +1,109 @@
+Kap here. Nice—nav is live, error banners are tamed, and Functional Areas are dynamic. Let’s make the dashboard feel “hot” with real data and a clean demo flow.
+
+What’s next (fast path to a live demo)
+1) Make sure REST can see tables (one-time SQL)
+
+In Supabase → SQL, run:
+
+grant usage on schema public to anon, authenticated, service_role;
+grant select, insert, update, delete on all tables in schema public to service_role;
+grant usage, select on all sequences in schema public to service_role;
+notify pgrst, 'reload schema';
+
+
+(If any 404 persists, do a quick DB restart and re-run the notify line.)
+
+2) Pick a write mode and set IDs
+
+In Replit → Shell:
+
+export DB_WRITE_MODE=rest   # or psycopg
+
+
+Paste your org_id and project_id into the topbar inputs (these propagate to the dashboard/widgets).
+
+3) Seed Functional Areas (15 of them, up to 30)
+BASE="http://localhost:5000/api"
+ORG="d915376c-2bd7-4e79-b9c9-aab9d7fcb5a8"
+PROJ="dced0b98-87b4-46ff-b2a4-2cf8e627e8d2"
+curl -s -X POST "$BASE/workstreams/set" -H "Content-Type: application/json" -d @- <<JSON
+{"org_id":"$ORG","project_id":"$PROJ","items":[
+  {"name":"HCM","description":"Core HR & business processes"},
+  {"name":"Recruiting"},{"name":"Talent"},{"name":"Compensation"},
+  {"name":"Benefits"},{"name":"Time & Absence"},{"name":"Payroll"},
+  {"name":"Finance"},{"name":"Projects"},{"name":"Procurement"},
+  {"name":"Expenses"},{"name":"Security"},{"name":"Integrations"},
+  {"name":"Reporting/Prism"},{"name":"Cutover"}
+]}
+JSON
+
+
+Refresh Dashboard and Workstreams → you should see “Functional Areas 15/30” with editable cards.
+
+4) Ingest 3 realistic docs to light up KPIs
+# Standup minutes (creates actions/risks in summaries)
+cat > /tmp/standup.txt <<'TXT'
+Standup Minutes 2025-09-18
+Decisions:
+- Payroll retro rules will follow policy v2 next sprint (owner: payroll@client.com)
+Risks:
+- SFTP cert for ADP → Workday expires in 5 days (severity: High)
+Actions:
+- sam@client.com deliver new SFTP cert by 2025-09-22
+- jane@client.com circulate retro rules doc by 2025-09-21
+TXT
+curl -s -X POST "$BASE/ingest-sync" -F "org_id=$ORG" -F "project_id=$PROJ" -F "file=@/tmp/standup.txt"
+
+# Integration spec (detects integrations)
+cat > /tmp/integration.txt <<'TXT'
+Integration Mapping
+ADP → Workday: daily SFTP, earnings map in progress
+Workday → GL: weekly API, summary journal posting
+TXT
+curl -s -X POST "$BASE/ingest-sync" -F "org_id=$ORG" -F "project_id=$PROJ" -F "file=@/tmp/integration.txt"
+
+# Steering notes (more decisions)
+cat > /tmp/steer.txt <<'TXT'
+Steering Committee
+Decisions:
+- SIT exit criteria approved (≥80% pass, no Sev1 open)
+- Cutover rehearsal scheduled next month
+TXT
+curl -s -X POST "$BASE/ingest-sync" -F "org_id=$ORG" -F "project_id=$PROJ" -F "file=@/tmp/steer.txt"
+
+5) Verify and demo
+curl -s "$BASE/diag/index-stats?org_id=$ORG&project_id=$PROJ"
+
+
+Expect chunks > 0. Then:
+
+Dashboard KPIs show non-zero values (Artifacts, Decisions 7d, maybe Overdue once dates pass).
+
+Integrations & Tech list shows “ADP → Workday”, “Workday → GL”.
+
+Chat with Kap → “Summarize the latest upload and list exit criteria” → answer with Sources.
+
+Two small upgrades you asked for
+A) Title and capacity for Functional Areas
+
+Your component already shows a count; ensure the title is explicit:
+
+Title: Functional Areas
+
+Count: N/30 on the right (done in the code I gave).
+
+B) SOW-driven auto-fill
+
+When you upload a SOW, the backend now auto-bootstraps areas (up to 30). You can refine the keyword list later or swap to an LLM extraction, but this is enough to wow a client.
+
+The nav is alive—what’s next to wire?
+
+Documents page (Library) is live; keep using it to show signed links.
+
+Actions page: render actions with status filters and “Nudge” button.
+
+Email dropbox: /ingest-email with allowlist + #proj:WD-XXX subject.
+
+Supabase Auth: magic link; hide admin controls unless PM/Admin.
+
+Weekly digest endpoint → one-click PDF/HTML preview.

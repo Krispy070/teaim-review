@@ -1,0 +1,78 @@
+Do this in Supabase → SQL Editor (copy/paste exactly)
+-- A) Sanity: confirm tables are in public
+select table_schema, table_name
+from information_schema.tables
+where table_schema='public'
+  and table_name in ('artifacts','artifact_chunks','summaries','mem_entries','mem_chunks');
+
+-- B) Privileges so service_role (your server key) can see/write
+grant usage on schema public to anon, authenticated, service_role;
+
+grant select, insert, update, delete on all tables in schema public to service_role;
+grant usage, select on all sequences in schema public to service_role;
+
+alter default privileges in schema public
+  grant select, insert, update, delete on tables to service_role;
+alter default privileges in schema public
+  grant usage, select on sequences to service_role;
+
+-- C) Force PostgREST to reload its schema cache
+notify pgrst, 'reload schema';
+
+
+If a 404 persists after this pass: Settings → Database → Restart, then re-run the last notify pgrst line.
+
+Then run our sanity (no jq needed)
+BASE="http://localhost:5000/api"
+ORG="d915376c-2bd7-4e79-b9c9-aab9d7fcb5a8"
+PROJ="dced0b98-87b4-46ff-b2a4-2cf8e627e8d2"
+
+echo "[1] DB diag";       curl -s "$BASE/diag/db"; echo
+echo "[2] Storage diag";  curl -s "$BASE/diag/storage"; echo
+
+echo "[3] Ingest-sync (REST mode)"
+echo "Workday SIT exit criteria and payroll retro rules." > /tmp/teaim-sync.txt
+curl -s -X POST "$BASE/ingest-sync" \
+  -F "org_id=$ORG" -F "project_id=$PROJ" \
+  -F "file=@/tmp/teaim-sync.txt"; echo
+
+echo "[4] Index stats"; curl -s "$BASE/diag/index-stats?org_id=$ORG&project_id=$PROJ"; echo
+
+echo "[5] Ask"; curl -s -X POST "$BASE/ask" \
+  -H "Content-Type: application/json" \
+  -d "{\"org_id\":\"$ORG\",\"project_id\":\"$PROJ\",\"question\":\"Summarize the latest document and list any exit criteria.\",\"k\":3}"; echo
+
+Pass criteria
+
+[1] → {"ok":true}
+
+[2] → {"ok":true,"signed_url":"https://..."}
+
+[3] → {"ok":true,"artifact_id":"...","chunks":1+}
+
+[4] → "chunks": 1+
+
+[5] → Answer + Sources: showing your uploaded filename
+
+If the REST insert still 404s
+
+Prove visibility directly (using your server key in the shell):
+
+curl -s "https://hixirmwsvbjyeecfclgx.supabase.co/rest/v1/artifacts?select=id,title&limit=1" \
+  -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+  -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY"
+
+
+Returns [] or rows → schema visible (try ingest again).
+
+Returns 404 → re-run the SQL grants + notify pgrst, or do the DB restart once.
+
+After green lights
+
+Keep DB_WRITE_MODE=rest for normal ops; flip to psycopg anytime as your permanent fallback.
+
+Your storage is already ironclad with unique keys: {project_id}/{uuid4().hex}_{safe_filename}. No 409s.
+
+You fixed the temp-file parsing path in /ingest-sync—nice. That’s stable.
+
+When you’ve run the SQL and the 5 sanity calls, paste the outputs (no secrets). I’ll verify we’re fully mission-ready and then I’ll drop the email dropbox + Supabase Auth code + matching test scripts so you can demo this to a client immediately.

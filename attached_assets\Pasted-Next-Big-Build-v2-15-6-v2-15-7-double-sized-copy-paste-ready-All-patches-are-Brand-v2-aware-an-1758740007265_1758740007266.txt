@@ -1,0 +1,307 @@
+Next Big Build v2.15.6 + v2.15.7 (double-sized, copy-paste ready)
+
+All patches are Brand v2–aware and dev-safe (new endpoints return safe empties if tables/columns aren’t present).
+
+v2.15.6 — CRs at scale: bulk flows, SLA sort/filter, assignee nudges
+1) Backend — CR bulk transitions + SLA sort/filter + assignee nudge
+
+A. Bulk transitions & filters
+
+server/routers/changes_bulk.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from typing import List, Optional
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+from .changes_sla import _sla_state
+
+router = APIRouter(prefix="/api/changes", tags=["changes"])
+PM_PLUS = require_role({"owner","admin","pm"})
+
+class BulkBody(BaseModel):
+    ids: List[str]
+    to: str  # intake|triage|planned|in_progress|testing|deployed|closed
+
+@router.post("/bulk_transition")
+def bulk_transition(body: BulkBody, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    updated = 0
+    try:
+        for cid in body.ids:
+            try:
+                sb.table("changes").update({"status": body.to})\
+                  .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", cid).execute()
+                updated += 1
+            except Exception: ...
+        return {"ok": True, "updated": updated}
+    except Exception:
+        return {"ok": False, "updated": 0}
+
+@router.get("/list_advanced")
+def list_advanced(project_id: str = Query(...),
+                  area: Optional[str] = None,
+                  status: Optional[str] = None,
+                  priority: Optional[str] = None,
+                  assignee: Optional[str] = None,
+                  sort: Optional[str] = "sla",  # sla|due|priority
+                  ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        q = sb.table("changes").select("*").eq("org_id", ctx.org_id).eq("project_id", project_id)
+        if area: q = q.eq("area", area)
+        if status: q = q.eq("status", status)
+        if priority: q = q.eq("priority", priority)
+        if assignee: q = q.eq("assignee", assignee)
+        rows = q.limit(2000).execute().data or []
+        # compute SLA
+        for r in rows:
+            r["sla"] = _sla_state(r.get("due_date"), r.get("priority"))
+        if sort=="sla":
+            rows.sort(key=lambda r: (r["sla"]["state"]!="overdue", r["sla"]["state"]!="breach_soon", r["sla"]["days_left"] if r["sla"]["days_left"] is not None else 999))
+        elif sort=="due":
+            rows.sort(key=lambda r: (r.get("due_date") or "9999-12-31"))
+        elif sort=="priority":
+            order={"urgent":0,"high":1,"medium":2,"low":3}
+            rows.sort(key=lambda r: order.get((r.get("priority") or "medium").lower(),2))
+        return {"items": rows}
+    except Exception:
+        return {"items": []}
+
+
+Mount in server/main.py:
+
+from .routers import changes_bulk
+app.include_router(changes_bulk.router)
+
+
+B. Nudge assignee (single)
+
+server/routers/changes_nudge.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+from .changes_sla import _sla_state
+
+router = APIRouter(prefix="/api/changes", tags=["changes"])
+PM_PLUS = require_role({"owner","admin","pm"})
+
+@router.post("/nudge_assignee")
+def nudge_assignee(id: str = Query(...), project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    try:
+        r = sb.table("changes").select("title,assignee,priority,due_date").eq("org_id",ctx.org_id).eq("project_id",project_id).eq("id",id).single().execute().data or {}
+        if not r or not r.get("assignee"): return {"ok": True, "sent": 0}
+        s = _sla_state(r.get("due_date"), r.get("priority"))
+        subj = f"[Nudge] CR '{r.get('title')}' — status check ({s['state']})"
+        html = f"<p>CR: <b>{r.get('title')}</b><br/>Due: {r.get('due_date') or 'n/a'}<br/>Priority: {r.get('priority')}</p>"
+        try:
+            from ..email.util import mailgun_send_html, send_guard
+            ok,_ = send_guard(sb, ctx.org_id, project_id, "cr_nudge", r["assignee"])
+            if ok: mailgun_send_html([r["assignee"]], subj, html); return {"ok": True, "sent": 1}
+        except Exception: ...
+        return {"ok": False, "sent": 0}
+    except Exception:
+        return {"ok": False, "sent": 0}
+
+
+Mount in server/main.py:
+
+from .routers import changes_nudge
+app.include_router(changes_nudge.router)
+
+2) Frontend — CR List (bulk transitions, filters/sort, nudges)
+
+client/src/pages/ChangeList.tsx (new)
+
+import { useEffect, useMemo, useState } from "react";
+import { useParams } from "react-router-dom";
+import { getJSON, postJSON } from "@/lib/authFetch";
+import PageHeading from "@/components/PageHeading";
+import { downloadGET } from "@/lib/download";
+
+const COLS = ["intake","triage","planned","in_progress","testing","deployed","closed"];
+
+function SlaBadge({s}:{s:any}){ if(!s) return null;
+  const cls = s.state==="overdue" ? "text-red-500" : s.state==="breach_soon" ? "text-amber-600" : "text-[var(--brand-good)]";
+  const txt = s.state==="ok" ? `${s.days_left}d` : `${s.state} ${s.days_left}d`;
+  return <span className={`ml-1 ${cls}`}>{txt}</span>;
+}
+
+export default function ChangeList(){
+  const { projectId } = useParams();
+  const [rows,setRows]=useState<any[]>([]);
+  const [area,setArea]=useState(""); const [status,setStatus]=useState("");
+  const [priority,setPriority]=useState(""); const [assignee,setAssignee]=useState("");
+  const [sort,setSort]=useState<"sla"|"due"|"priority">("sla");
+  const [sel,setSel]=useState<Record<string,boolean>>({});
+
+  async function load(){
+    const qs = new URLSearchParams({project_id:projectId!, sort});
+    if(area) qs.set("area", area); if(status) qs.set("status",status); if(priority) qs.set("priority",priority); if(assignee) qs.set("assignee",assignee);
+    const d = await getJSON(`/api/changes/list_advanced?${qs.toString()}`); setRows(d.items||[]);
+  }
+  useEffect(()=>{ load(); },[projectId, area, status, priority, assignee, sort]);
+
+  const anySel = useMemo(()=> Object.values(sel).some(Boolean),[sel]);
+  function toggle(id:string){ setSel(s=> ({...s, [id]: !s[id]})); }
+
+  async function bulk(to:string){
+    const ids = Object.keys(sel).filter(k=>sel[k]); if(!ids.length) return;
+    await postJSON(`/api/changes/bulk_transition?project_id=${projectId}`, { ids, to }); setSel({}); load();
+  }
+  async function nudge(id:string){ await fetch(`/api/changes/nudge_assignee?id=${id}&project_id=${projectId}`, {method:"POST", credentials:"include"}); }
+
+  const owners = Array.from(new Set(rows.map(r=>(r.assignee||"").trim()).filter(Boolean))).sort();
+  const areas = Array.from(new Set(rows.map(r=>(r.area||"").trim()).filter(Boolean))).sort();
+
+  return (
+    <div>
+      <PageHeading title="Change Requests — List" crumbs={[{label:"Execution"},{label:"Changes"}]} />
+      <div className="brand-card p-3 space-y-2">
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <select className="border rounded p-1" value={area} onChange={e=>setArea(e.target.value)}>
+            <option value="">Area (all)</option>{areas.map(a=> <option key={a}>{a}</option>)}
+          </select>
+          <select className="border rounded p-1" value={status} onChange={e=>setStatus(e.target.value)}>
+            <option value="">Status (all)</option>{COLS.map(s=> <option key={s} value={s}>{s}</option>)}
+          </select>
+          <select className="border rounded p-1" value={priority} onChange={e=>setPriority(e.target.value)}>
+            <option value="">Priority (all)</option>{["low","medium","high","urgent"].map(p=> <option key={p} value={p}>{p}</option>)}
+          </select>
+          <select className="border rounded p-1" value={assignee} onChange={e=>setAssignee(e.target.value)}>
+            <option value="">Assignee (all)</option>{owners.map(o=> <option key={o} value={o}>{o}</option>)}
+          </select>
+          <select className="border rounded p-1" value={sort} onChange={e=>setSort(e.target.value as any)}>
+            <option value="sla">Sort: SLA</option>
+            <option value="due">Sort: Due</option>
+            <option value="priority">Sort: Priority</option>
+          </select>
+          <button className="brand-btn text-xs ml-auto" onClick={()=>downloadGET(`/api/changes/export.csv?project_id=${projectId}${area?`&area=${encodeURIComponent(area)}`:""}${status?`&status=${encodeURIComponent(status)}`:""}`, "changes.csv")}>Export CSV</button>
+        </div>
+
+        <div className="flex items-center gap-2 text-xs">
+          <button className="brand-btn text-xs" disabled={!anySel} onClick={()=>bulk("triage")}>→ Triage</button>
+          <button className="brand-btn text-xs" disabled={!anySel} onClick={()=>bulk("planned")}>→ Planned</button>
+          <button className="brand-btn text-xs" disabled={!anySel} onClick={()=>bulk("in_progress")}>→ In-Progress</button>
+          <button className="brand-btn text-xs" disabled={!anySel} onClick={()=>bulk("testing")}>→ Testing</button>
+          <button className="brand-btn text-xs" disabled={!anySel} onClick={()=>bulk("deployed")}>→ Deployed</button>
+          <button className="brand-btn text-xs" disabled={!anySel} onClick={()=>bulk("closed")}>→ Closed</button>
+        </div>
+
+        <div className="overflow-auto">
+          <table className="w-full text-sm">
+            <thead><tr>
+              <th className="p-1"><input type="checkbox" onChange={e=> setSel(Object.fromEntries(rows.map(r=> [r.id, e.target.checked]))) } /></th>
+              <th className="text-left p-1">Title</th>
+              <th className="text-left p-1">Area</th>
+              <th className="text-left p-1">Assignee</th>
+              <th className="text-left p-1">Priority</th>
+              <th className="text-left p-1">Due</th>
+              <th className="text-left p-1">SLA</th>
+              <th className="p-1"></th>
+            </tr></thead>
+            <tbody>
+              {rows.map(r=>(
+                <tr key={r.id}>
+                  <td className="p-1"><input type="checkbox" checked={!!sel[r.id]} onChange={()=>toggle(r.id)} /></td>
+                  <td className="p-1">{r.title}</td>
+                  <td className="p-1">{r.area||"—"}</td>
+                  <td className="p-1">{r.assignee||"—"}</td>
+                  <td className="p-1">{r.priority||"—"}</td>
+                  <td className="p-1">{r.due_date||"—"}</td>
+                  <td className="p-1"><SlaBadge s={r.sla}/></td>
+                  <td className="p-1"><button className="text-xs underline" onClick={()=>nudge(r.id)}>Nudge</button></td>
+                </tr>
+              ))}
+              {!rows.length && <tr><td className="p-2 text-xs text-muted-foreground" colSpan={8}>No changes found.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+Route in client/src/App.jsx:
+
+import ChangeList from "@/pages/ChangeList";
+// …
+<Route path="/projects/:projectId/changes/list" element={<ChangeList/>} />
+
+
+Owner filter on Kanban (optional):
+
+In ChangeKanban.tsx add:
+
+const [ownerFilter,setOwnerFilter]=useState("");
+const owners = Array.from(new Set(items.map(i=>(i.assignee||"").trim()).filter(Boolean))).sort();
+{/* filter UI */}
+<div className="flex items-center gap-2 text-xs mb-2">
+  <select className="border rounded p-1" value={ownerFilter} onChange={e=>setOwnerFilter(e.target.value)}>
+    <option value="">Assignee (all)</option>{owners.map(o=><option key={o}>{o}</option>)}
+  </select>
+</div>
+{/* when rendering columns */}
+{items.filter(i=> !ownerFilter || (i.assignee||"")===ownerFilter)
+      .filter(i=>(i.status||"intake")===c)
+      .map(i=>(/* … */))}
+
+v2.15.7 — Releases calendar with CR lanes + Area audit widget + server “seen”
+3) Releases — simple Gantt lane inside the day cell
+
+Patch your ReleaseCard in client/src/pages/Releases.tsx:
+
+// Add a tiny lane for CRs attached to a release (no dates on CRs? show tags)
+<div className="mt-1">
+  <div className="text-[11px] text-muted-foreground">CRs:</div>
+  <div className="flex flex-wrap gap-1">
+    {(rel.cr_ids||sel||[]).slice(0,6).map((id:string)=>(
+      <span key={id} title={id} className="text-[11px] px-1.5 py-[1px] rounded bg-indigo-500/15 text-indigo-600">{id.slice(0,6)}</span>
+    ))}
+    {(rel.cr_ids||[]).length>6 && <span className="text-[11px] text-muted-foreground">+{(rel.cr_ids||[]).length-6} more</span>}
+  </div>
+</div>
+
+
+(If later you store CR start/end dates, we’ll draw proportional bars under the release window.)
+
+4) Area page — audit widget already added (v2.15.3). Hook a CSV button:
+
+In WorkstreamArea.tsx:
+
+<button className="brand-btn text-xs" onClick={()=>downloadGET(`/api/areas/audit7d.csv?project_id=${projectId}&area=${encodeURIComponent(area)}`, `audit_${area}_7d.csv`)}>
+  Export Audit 7d CSV
+</button>
+
+
+Backend CSV for audit:
+
+server/routers/area_audit.py (append)
+
+from fastapi.responses import StreamingResponse
+import io, csv
+
+@router.get("/audit7d.csv")
+def audit7d_csv(project_id: str = Query(...), area: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    d = audit7d(project_id, area, ctx).get("items", [])
+    s = io.StringIO(); w = csv.writer(s); w.writerow(["table","id","title","created_at"])
+    for r in d: w.writerow([r.get("table"), r.get("id"), r.get("title"), r.get("created_at")])
+    s.seek(0)
+    return StreamingResponse(iter([s.read()]), media_type="text/csv",
+      headers={"Content-Disposition": f'attachment; filename=\"audit_{area}_7d.csv\""})
+
+5) Server-side mark seen is already added (v2.14.5). Call it from header “Updates” menu on click (we showed how).
+90-second validation
+
+CR List supports bulk transitions, SLA sort/filter, and assignee nudges; Kanban can filter by owner
+
+Area owners are auto-notified on new area comments; chips appear across Workstreams & Area pages
+
+Releases calendar shows attached CR tags inside day cells
+
+Area hub exports audit CSV; header updates count persists server-side (optional)

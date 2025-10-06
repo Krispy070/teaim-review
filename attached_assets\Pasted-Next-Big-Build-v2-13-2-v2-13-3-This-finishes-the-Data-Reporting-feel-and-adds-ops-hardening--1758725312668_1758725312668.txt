@@ -1,0 +1,317 @@
+Next Big Build v2.13.2 + v2.13.3. This finishes the Data & Reporting “feel” and adds ops hardening. Everything is copy-paste ready, Brand v2–aware, and dev-safe (new endpoints no-op gracefully if tables/columns aren’t present).
+
+v2.13.2 — Data & Reporting polish (2 weeks in one)
+1) Workbooks — Run expander + pipeline chips + “migration package” ZIP
+1A) Backend — runs update/delete + latest runs export (dev-safe)
+
+server/routers/workbooks.py (append)
+
+from fastapi import HTTPException
+
+@router.post("/runs/update")
+def update_run(workbook_id: str = Query(...), run_no: int = Query(...),
+               status: str = Query(...), rows: int | None = None,
+               project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    try:
+        sb.table("workbook_runs").update({"status": status, "rows": rows})\
+          .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+          .eq("workbook_id", workbook_id).eq("run_no", run_no).execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+@router.post("/runs/delete")
+def delete_run(workbook_id: str = Query(...), run_no: int = Query(...),
+               project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    try:
+        sb.table("workbook_runs").delete()\
+          .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+          .eq("workbook_id", workbook_id).eq("run_no", run_no).execute()
+        # recompute iterations_done = max(run_no)
+        try:
+            r = sb.table("workbook_runs").select("run_no")\
+                 .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+                 .eq("workbook_id", workbook_id).order("run_no", desc=True).limit(1).execute().data or []
+            max_no = r[0]["run_no"] if r else 0
+            sb.table("workbooks").update({"iterations_done": max_no})\
+              .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", workbook_id).execute()
+        except Exception: ...
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+
+Latest runs CSV per workbook + ZIP “migration package”
+
+from fastapi.responses import StreamingResponse
+import zipfile, io, csv, json, datetime as dt
+
+@router.get("/export_last_runs.zip")
+def export_last_runs(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    buf = io.BytesIO(); z = zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED)
+    try:
+        wbs = sb.table("workbooks").select("id,name,area,asof_date,due_date,iterations_done,status")\
+              .eq("org_id", ctx.org_id).eq("project_id", project_id).limit(2000).execute().data or []
+    except Exception:
+        wbs = []
+    manifest = {"generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "project_id": project_id, "count": len(wbs)}
+    z.writestr("manifest.json", json.dumps(manifest, indent=2))
+
+    for w in wbs:
+        try:
+            rid = w["id"]
+            last = sb.table("workbook_runs").select("run_no,pulled_on,rows,status")\
+                   .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+                   .eq("workbook_id", rid).order("run_no", desc=True).limit(5).execute().data or []
+            s=io.StringIO(); c=csv.writer(s); c.writerow(["run_no","pulled_on","rows","status"])
+            for r in last: c.writerow([r.get("run_no"), r.get("pulled_on"), r.get("rows"), r.get("status")])
+            z.writestr(f"workbooks/{w.get('name') or rid}_last_runs.csv", s.getvalue())
+        except Exception: ...
+    z.close(); buf.seek(0)
+    return StreamingResponse(iter([buf.getvalue()]), media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename=\"migration_package.zip\"'})
+
+
+If a table is missing, you’ll just get an empty ZIP with a manifest—no crashes.
+
+1B) Frontend — Run expander rows + inline pipeline edits
+
+client/src/components/WorkbookRunsExpander.tsx (new)
+
+import { useEffect, useState } from "react";
+import { getJSON, postJSON } from "@/lib/authFetch";
+
+export default function WorkbookRunsExpander({projectId, workbookId}:{projectId:string; workbookId:string}){
+  const [items,setItems]=useState<any[]>([]);
+  const [sum,setSum]=useState<any>({counts:{pulled:0,validated:0,loaded:0,failed:0}});
+
+  async function load(){
+    try{
+      const r = await getJSON(`/api/workbooks/runs?workbook_id=${workbookId}`);
+      setItems(r.items||[]);
+    }catch{ setItems([]); }
+    try{
+      const s = await getJSON(`/api/workbooks/runs/summary?workbook_id=${workbookId}`);
+      setSum(s||{counts:{pulled:0,validated:0,loaded:0,failed:0}});
+    }catch{}
+  }
+  useEffect(()=>{ load(); },[workbookId]);
+
+  async function upd(run_no:number, status:string, rows?:number){
+    await postJSON(`/api/workbooks/runs/update?project_id=${projectId}&workbook_id=${workbookId}&run_no=${run_no}&status=${encodeURIComponent(status)}${rows!=null?`&rows=${rows}`:""}`, {});
+    load();
+  }
+  async function del(run_no:number){
+    await postJSON(`/api/workbooks/runs/delete?project_id=${projectId}&workbook_id=${workbookId}&run_no=${run_no}`, {});
+    load();
+  }
+
+  return (
+    <div className="border rounded p-2 mt-1">
+      <div className="text-xs text-muted-foreground mb-1">Pipeline: pulled {sum.counts?.pulled} · validated {sum.counts?.validated} · loaded {sum.counts?.loaded} · failed {sum.counts?.failed}</div>
+      <table className="w-full text-xs">
+        <thead><tr><th className="text-left p-1">Run</th><th className="text-left p-1">Pulled on</th><th className="text-left p-1">Rows</th><th className="text-left p-1">Status</th><th></th></tr></thead>
+        <tbody>
+          {(items||[]).map((r:any)=>(
+            <tr key={r.run_no}>
+              <td className="p-1">{r.run_no}</td>
+              <td className="p-1">{r.pulled_on || "—"}</td>
+              <td className="p-1">
+                <input className="border rounded p-1 w-[80px]" defaultValue={r.rows||0}
+                       onBlur={e=>upd(r.run_no, r.status, parseInt(e.target.value||"0",10))}/>
+              </td>
+              <td className="p-1">
+                <select className="border rounded p-1" value={r.status||"pulled"} onChange={e=>upd(r.run_no, e.target.value, r.rows)}>
+                  {["pulled","validated","loaded","failed"].map(s=><option key={s} value={s}>{s}</option>)}
+                </select>
+              </td>
+              <td className="p-1"><button className="underline" onClick={()=>del(r.run_no)}>Delete</button></td>
+            </tr>
+          ))}
+          {!items.length && <tr><td className="p-2 text-muted-foreground" colSpan={5}>No runs yet.</td></tr>}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+
+Hook into Workbooks list:
+
+client/src/pages/Reporting.tsx — inside the Workbooks table row, add expander:
+
+import WorkbookRunsExpander from "@/components/WorkbookRunsExpander";
+const [openId,setOpenId]=useState<string>("");
+
+{/* inside row */}
+<td className="p-1">
+  <button className="text-xs underline" onClick={()=> setOpenId(openId===w.id ? "" : (w.id||""))}>
+    {openId===w.id? "Hide runs":"Show runs"}
+  </button>
+</td>
+
+{/* after the table or as a row beneath */}
+{openId===w.id && <tr><td colSpan={8}><WorkbookRunsExpander projectId={projectId} workbookId={w.id!}/></td></tr>}
+
+
+Add “Export migration package” button near other actions:
+
+<button className="brand-btn text-xs" onClick={()=>downloadGET(`/api/workbooks/export_last_runs.zip?project_id=${projectId}`, "migration_package.zip")}>
+  Export migration package
+</button>
+
+2) Reports — CSV import + Owner/Frequency chips
+
+Add import file input (already shown) and chips in table row:
+
+<td className="p-1">
+  <span className="text-[11px] px-2 py-[1px] rounded bg-slate-500/15 text-slate-600">{r.owner || "—"}</span>
+</td>
+<td className="p-1">
+  <span className="text-[11px] px-2 py-[1px] rounded bg-indigo-500/15 text-indigo-600">{r.frequency || "ad-hoc"}</span>
+</td>
+
+
+Add owner filter chips above the table:
+
+const owners = Array.from(new Set(items.map(r=> (r.owner||"").trim()).filter(Boolean))).sort();
+<div className="flex items-center gap-2 text-xs mb-1">
+  {owners.slice(0,8).map(o=> <button key={o} className="brand-btn text-[11px]" onClick={()=>setOwnerFilter(o)}>{o}</button>)}
+  <button className="brand-btn text-[11px]" onClick={()=>setOwnerFilter("")}>Clear</button>
+</div>
+
+3) Dashboard — Data & Reporting KPI tile (already shown)
+
+You added the tile earlier in this drop.
+
+4) “Request Data Migration Sign-Off” (hooked) — already added in v2.13.1; leave as-is.
+v2.13.3 — Hardening & Finishing (RBAC sweep, Ops, Digest, Wellness)
+1) RBAC sweep helper (pattern)
+
+Quick checklist (no code change required here, just apply):
+
+All GET list → member_ctx
+
+All POST/PUT/PATCH/DELETE → require_role({"owner","admin","pm"}) or stricter
+
+Sign-off tokens admin ops → PM+
+
+Template apply → PM+
+
+CSV import/export → member list is OK to export; import → PM+
+
+(You’ve already followed this for most; apply it to any new write endpoints.)
+
+2) Ops — scheduler health endpoint + card
+
+Backend: server/routers/ops_scheduler.py (new)
+
+from fastapi import APIRouter, Depends
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_service_supabase
+
+router = APIRouter(prefix="/api/ops", tags=["ops"])
+
+@router.get("/scheduler_health")
+def scheduler_health(ctx: TenantCtx = Depends(require_role({"owner","admin"}))):
+    sb = get_service_supabase()
+    out = {"queue": {"due": 0, "total": 0}, "tokens_revoked_today": 0}
+    try:
+        q = sb.table("comms_queue").select("id").is_("sent_at","null").execute().data or []
+        out["queue"]["total"] = len(q)
+        # rough due count
+        import datetime as dt
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        d = sb.table("comms_queue").select("id").lte("not_before", now).is_("sent_at","null").execute().data or []
+        out["queue"]["due"] = len(d)
+    except Exception: ...
+    try:
+        import datetime as dt
+        start = dt.datetime.now(dt.timezone.utc).replace(hour=0,minute=0,second=0,microsecond=0).isoformat()
+        t = sb.table("signoff_doc_tokens").select("id").gte("revoked_at", start).execute().data or []
+        out["tokens_revoked_today"] = len(t or [])
+    except Exception: ...
+    return out
+
+
+Mount in server/main.py:
+
+from .routers import ops_scheduler
+app.include_router(ops_scheduler.router)
+
+
+Frontend card (e.g., Admin Health/Ops):
+
+const [sched,setSched]=useState<any>({});
+useEffect(()=>{ (async()=>{ try{
+  const r = await fetch(`/api/ops/scheduler_health`, {credentials:"include"}); setSched(await r.json());
+}catch{ setSched({}); } })(); },[]);
+<div className="brand-card p-3">
+  <div className="text-xs text-muted-foreground">Scheduler</div>
+  <div className="text-lg font-semibold">Queue: {sched?.queue?.total ?? "—"} (due: {sched?.queue?.due ?? "—"})</div>
+  <div className="text-xs text-muted-foreground">Tokens revoked today: {sched?.tokens_revoked_today ?? "—"}</div>
+</div>
+
+3) Digest Preview — simulate “mute empty sections”
+
+Backend: server/routers/digest_preview.py (tweak preview route)
+
+@router.get("/preview_html", response_class=HTMLResponse)
+def preview_html(project_id: str = Query(...), mute_empty: bool = True, ctx: TenantCtx = Depends(member_ctx)):
+    # ...existing header & counts...
+    def chip(label, n): return f"<span style='border:1px solid #ddd;border-radius:6px;padding:6px 10px;margin-right:6px'>{label}: <b>{n}</b></span>"
+    chips = "".join([chip("Actions", counts["actions"])] if counts["actions"] or not mute_empty else [])
+    chips += "".join([chip("Risks", counts["risks"])] if counts["risks"] or not mute_empty else [])
+    chips += "".join([chip("Decisions", counts["decisions"])] if counts["decisions"] or not mute_empty else [])
+    html = f"<html><body style='font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:880px;margin:auto'>{hdr}<h2>Digest Preview</h2><div>{chips or '<div style=\"color:#666\">(All sections muted)</div>'}</div></body></html>"
+    return HTMLResponse(html)
+
+
+Frontend: client/src/pages/DigestPreview.tsx (add a toggle & reload iframe):
+
+const [mute,setMute]=useState(true);
+useEffect(()=>{ (async()=>{
+  const r = await fetch(`/api/digest/preview_html?project_id=${projectId}&mute_empty=${mute?'1':'0'}`, { credentials:"include" });
+  setHtml(await r.text());
+})() },[projectId, mute]);
+
+<div className="flex items-center justify-between">
+  <div className="text-sm font-medium">Digest Preview</div>
+  <div className="flex items-center gap-2">
+    <label className="text-xs flex items-center gap-1"><input type="checkbox" checked={mute} onChange={e=>setMute(e.target.checked)}/> Mute empty sections</label>
+    <button className="brand-btn text-xs" onClick={sendTest}>Send test to me</button>
+  </div>
+</div>
+
+4) Wellness — per-user print CSS tidy (so PDF looks sharp)
+
+client/src/index.css (append)
+
+@media print {
+  body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .brand-card, .border { border-color: #ccc !important; }
+  a { color: #111 !important; text-decoration: underline; }
+  .no-print { display: none !important; }
+}
+
+
+No JS changes needed; your existing Print HTML links already work → “Save as PDF”.
+
+5) 2-minute validation
+
+Workbooks: CSV import; run expander with pipeline edits; migration ZIP; at-risk/overdue chips; KPIs include at-risk/overdue
+
+Reports: CSV import; pipeline chips; owner filter + chips
+
+Dashboard: KPI tile for Data & Reporting present
+
+Ops: scheduler health card shows queue/due/tokens revoked
+
+Digest Preview: simulate “mute empty” with a toggle; “Send test to me” still works
+
+Wellness: per-user prints are crisp with brand header

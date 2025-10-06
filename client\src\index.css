@@ -1,0 +1,595 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+@import "./styles/theme.css";
+@import "./brand/tokens.css";
+@import "./brand/micro.css";
+@import "./brand/print.css";
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* UI IMPROVEMENTS - DROP-IN STYLES */
+
+/* HEADER STYLING */
+.header{
+  background: color-mix(in oklab, var(--ui-bg), black 5%);
+  border-bottom: 1px solid var(--ui-border);
+  backdrop-filter: saturate(140%) blur(6px);
+}
+
+/* TIMELINE VISIBILITY BOOST */
+.timeline{
+  --rail: #2A2F40;          /* lighter than before */
+  --tick: #364056;
+  --fill: color-mix(in oklab, var(--brand-orange), white 6%); /* subtle brightness bump */
+}
+.timeline .bar-bg{ background: var(--rail); height: 8px; border-radius: 8px; }
+.timeline .bar-fill{ background: var(--fill); height: 8px; border-radius: 8px; }
+.timeline .tick{ background: var(--tick); width: 1px; opacity: .6; }
+
+/* TRANSLUCENT PILLS */
+.k-pill{
+  display:inline-flex; align-items:center; gap:.4ch;
+  padding:.25rem .55rem; border-radius:10px; font-size:12px; line-height:1;
+  border:1px solid transparent;
+}
+.k-pill--overdue{ background: rgba(231,76,60,.18); color: var(--brand-error); border-color: rgba(231,76,60,.35); }
+.k-pill--warn   { background: rgba(255,193,7,.18);  color: var(--brand-warn);  border-color: rgba(255,193,7,.35); }
+.k-pill--ok     { background: rgba(46,204,113,.18); color: var(--brand-success); border-color: rgba(46,204,113,.35); }
+.k-pill--gold   { background: var(--pill-gold); color: var(--brand-gold); border-color: rgba(255,201,51,.35); }
+
+/* SIDEBAR ICON HOVER/ACTIVE STATES */
+.sidebar .item { color: var(--text-soft); font:500 14px/1.2 Inter,system-ui; padding:8px 14px; border-radius:10px; display:flex; align-items:center; gap:10px; }
+.sidebar .item .icon { color: var(--text-soft); transition: color .12s ease; }
+.sidebar .item:hover { background: rgba(255,255,255,.03); color: var(--text); }
+.sidebar .item:hover .icon { color: var(--brand-orange); }
+.sidebar .item.active { background: rgba(242,107,29,.12); color: var(--text-strong); }
+.sidebar .item.active .icon { color: var(--brand-orange); }
+
+/* BUTTON GROUP STYLING */
+.k-btn{
+  display:inline-flex; align-items:center; gap:.6ch;
+  padding:.55rem .9rem; border-radius:12px;
+  border:1px solid var(--ui-border); background: var(--ui-panel-2); color: var(--text-strong);
+  transition: background .12s ease, border-color .12s ease, transform .06s ease;
+}
+.k-btn:hover{ background:#1B1E28; border-color:#3A3E4E; }
+.k-btn--primary{ background: var(--brand-orange); border-color:#C65115; color:#0B0B0D; font-weight:700; }
+.k-btn--ghost{ background: transparent; color: var(--text); }
+
+:root {
+  /* Brand (from TEAIM Brand Book v2) */
+  --brand-charcoal: #1C1C1E;
+  --brand-orange:   #F26B1D; /* AI accent */
+  --brand-gold:     #FFC933;
+  --brand-success:  #2ECC71;
+  --brand-warn:     #FFC107;
+  --brand-error:    #E74C3C;
+  --brand-white:    #FFFFFF;
+  --brand-midgray:  #7D7D7D; /* for light themes / borders only on dark */
+
+  /* Dark UI surfaces (accessible) */
+  --ui-bg:        #0E0F12;             /* main app background (deeper than charcoal for contrast) */
+  --ui-panel:     #14161D;             /* card surface */
+  --ui-panel-2:   #191C26;             /* elevated surface */
+  --ui-border:    #2C2F3A;             /* visible border on dark */
+  --ui-divider:   #252832;
+
+  /* Text (accessible on dark) */
+  --text-strong:  #FFFFFF;             /* primary headings */
+  --text:         #E9ECF1;             /* body text */
+  --text-soft:    #C7CCD7;             /* secondary */
+  --text-muted:   #A7ADBD;             /* tertiary */
+  --text-dim:     #8C93A3;             /* placeholders only */
+
+  /* Action & state */
+  --accent:       var(--brand-orange);  /* primary CTAs, highlights */
+  --accent-2:     var(--brand-gold);    /* secondary highlight */
+  --success:      var(--brand-success);
+  --warn:         var(--brand-warn);
+  --error:        var(--brand-error);
+
+  /* Pills / badges backgrounds (transparent tints for dark) */
+  --pill-accent:  rgba(242,107,29,0.18);
+  --pill-gold:    rgba(255,201,51,0.18);
+  --pill-success: rgba(46,204,113,0.18);
+  --pill-warn:    rgba(255,193,7,0.18);
+  --pill-error:   rgba(231,76,60,0.18);
+
+  /* Focus outline for keyboard nav */
+  --focus:        rgba(255,201,51,0.65);
+
+  /* Legacy mappings for existing code */
+  --background: var(--ui-bg);
+  --foreground: var(--text);
+  --card: var(--ui-panel);
+  --card-foreground: var(--text);
+  --popover: var(--ui-panel-2);
+  --popover-foreground: var(--text);
+  --primary: var(--brand-orange);              /* Primary actions = orange */
+  --primary-foreground: var(--ui-bg);
+  --secondary: var(--ui-panel-2);
+  --secondary-foreground: var(--text);
+  --muted: var(--ui-panel-2);
+  --muted-foreground: var(--text-muted);
+  --accent-foreground: var(--text-strong);
+  --destructive: var(--error);
+  --destructive-foreground: var(--text-strong);
+  --border: var(--ui-border);
+  --input: var(--ui-panel-2);
+  --ring: var(--ui-border);
+  --success: var(--brand-success);             /* Success = green */
+  --chart-1: hsl(220, 70%, 50%);
+  --chart-2: hsl(160, 60%, 45%);
+  --chart-3: hsl(30, 80%, 55%);
+  --chart-4: hsl(280, 65%, 60%);
+  --chart-5: hsl(340, 75%, 55%);
+  --radius: 0.5rem;
+  --font-sans: 'Inter', system-ui, sans-serif;
+  --font-serif: 'Inter', system-ui, sans-serif;
+  --font-mono: 'Inter', system-ui, monospace;
+}
+
+/* TEAIM Brand AI text override */
+.teaim-ai-brand {
+  color: #F26B1D !important;
+  font-weight: inherit !important;
+}
+
+.dark {
+  /* Use same TEAIM brand colors as :root for consistent dark theme */
+  --background: var(--ui-bg);
+  --foreground: var(--text);
+  --card: var(--ui-panel);
+  --card-foreground: var(--text);
+  --popover: var(--ui-panel-2);
+  --popover-foreground: var(--text);
+  --primary: var(--brand-orange);              /* Primary actions = orange */
+  --primary-foreground: var(--ui-bg);
+  --secondary: var(--ui-panel-2);
+  --secondary-foreground: var(--text);
+  --muted: var(--ui-panel-2);
+  --muted-foreground: var(--text-muted);
+  --accent: var(--brand-orange);
+  --accent-foreground: var(--text-strong);
+  --destructive: var(--error);
+  --destructive-foreground: var(--text-strong);
+  --border: var(--ui-border);
+  --input: var(--ui-panel-2);
+  --ring: var(--ui-border);
+  --success: var(--brand-success);             /* Success = green */
+  --chart-1: hsl(220, 70%, 50%);
+  --chart-2: hsl(160, 60%, 45%);
+  --chart-3: hsl(30, 80%, 55%);
+  --chart-4: hsl(280, 65%, 60%);
+  --chart-5: hsl(340, 75%, 55%);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply font-sans antialiased;
+    font-family: var(--font-sans);
+    background: var(--ui-bg);
+    color: var(--text);
+  }
+}
+
+/* TEAIM Brand Book v2 Component Classes */
+
+/* Cards */
+.card { 
+  background: var(--ui-panel); 
+  border: 1px solid var(--ui-border); 
+  border-radius: 14px; 
+}
+.card--elevated { 
+  background: var(--ui-panel-2); 
+}
+.card__hd { 
+  padding: 12px 16px; 
+  border-bottom: 1px solid color-mix(in oklab, var(--ui-border), #000 10%); 
+}
+.card__title { 
+  color: var(--text-strong); 
+  font-size: 15px; 
+  font-weight: 700; 
+}
+.card__bd { 
+  padding: 16px; 
+}
+
+/* KPI tiles */
+.kpi { 
+  background: var(--ui-panel); 
+  border: 1px solid color-mix(in oklab, var(--ui-border), #000 10%); 
+  border-radius: 14px; 
+  padding: 16px 18px; 
+}
+.kpi .label { 
+  color: var(--text-muted); 
+  font: 600 12px/1.2 Inter, system-ui; 
+  letter-spacing: .02em; 
+}
+.kpi .value { 
+  color: var(--text-strong); 
+  font: 700 22px/1 Inter, system-ui; 
+}
+.kpi--risk .value { 
+  color: var(--brand-error); 
+}
+.kpi--actions .value { 
+  color: var(--brand-gold); 
+}
+.kpi--wellness .value { 
+  color: var(--brand-success); 
+}
+
+/* Buttons */
+.k-btn { 
+  display: inline-flex; 
+  align-items: center; 
+  gap: .6ch; 
+  padding: .55rem .9rem; 
+  border-radius: 12px;
+  border: 1px solid var(--ui-border); 
+  background: var(--ui-panel-2); 
+  color: var(--text-strong);
+  transition: background .12s ease, border-color .12s ease, transform .06s ease; 
+}
+.k-btn:hover { 
+  background: #1B1E28; 
+  border-color: #3A3E4E; 
+}
+.k-btn:active { 
+  transform: translateY(1px); 
+}
+.k-btn--primary { 
+  background: var(--brand-orange); 
+  border-color: #C65115; 
+  color: #0B0B0D; 
+  font-weight: 700; 
+}
+.k-btn--primary:hover { 
+  filter: brightness(1.06); 
+}
+.k-btn--ghost { 
+  background: transparent; 
+  border-color: var(--ui-border); 
+  color: var(--text); 
+}
+
+/* Pills & status tags */
+.k-pill { 
+  display: inline-flex; 
+  align-items: center; 
+  gap: .4ch; 
+  padding: .25rem .5rem; 
+  border-radius: 10px; 
+  font-size: 12px; 
+  line-height: 1; 
+  border: 1px solid transparent; 
+}
+.k-pill--overdue { 
+  background: var(--pill-error); 
+  color: var(--brand-error); 
+  border-color: rgba(231,76,60,.35); 
+}
+.k-pill--warn { 
+  background: var(--pill-warn); 
+  color: var(--brand-warn); 
+  border-color: rgba(255,193,7,.35); 
+}
+.k-pill--ok { 
+  background: var(--pill-success); 
+  color: var(--brand-success); 
+  border-color: rgba(46,204,113,.35); 
+}
+
+/* Timeline */
+.timeline { 
+  --rail: #222634; 
+  --tick: #2C3140; 
+  --fill: var(--brand-orange); 
+}
+.timeline .bar-bg { 
+  background: var(--rail); 
+  height: 8px; 
+  border-radius: 8px; 
+}
+.timeline .bar-fill { 
+  background: var(--fill); 
+  height: 8px; 
+  border-radius: 8px; 
+}
+.timeline .tick { 
+  background: var(--tick); 
+  width: 1px; 
+  opacity: .6; 
+}
+
+/* Header */
+.header { 
+  background: color-mix(in oklab, var(--ui-bg), black 5%); 
+  border-bottom: 1px solid var(--ui-border); 
+  backdrop-filter: saturate(140%) blur(6px); 
+}
+.env-pill { 
+  @apply k-pill; 
+  background: var(--pill-gold); 
+  color: var(--brand-gold); 
+  border-color: rgba(255,201,51,.35); 
+}
+
+/* Sidebar */
+.sidebar { 
+  background: color-mix(in oklab, var(--ui-bg), #000 6%); 
+  border-right: 1px solid var(--ui-border); 
+}
+.sidebar .section { 
+  color: var(--text-muted); 
+  font: 600 12px/1.2 Inter, system-ui; 
+  padding: 8px 14px; 
+  letter-spacing: .02em; 
+}
+.sidebar .item { 
+  color: var(--text-soft); 
+  font: 500 14px/1.2 Inter, system-ui; 
+  padding: 8px 14px; 
+  border-radius: 10px; 
+}
+.sidebar .item:hover { 
+  background: rgba(255,255,255,.03); 
+  color: var(--text); 
+}
+.sidebar .item.active { 
+  background: rgba(242,107,29,.12); 
+  color: var(--text-strong); 
+}
+
+/* Icons & focus */
+.icon { 
+  color: var(--text-soft); 
+}
+.icon--active { 
+  color: var(--brand-orange); 
+}
+:focus-visible { 
+  outline: 2px solid var(--focus); 
+  outline-offset: 2px; 
+  border-radius: 10px; 
+}
+
+.kap-highlight {
+  animation: kapPulse 2.2s ease-out 1;
+  box-shadow: 0 0 0 3px rgba(34,197,94,.35);
+}
+@keyframes kapPulse {
+  0%   { box-shadow: 0 0 0 0 rgba(34,197,94,.65); }
+  60%  { box-shadow: 0 0 0 6px rgba(34,197,94,.25); }
+  100% { box-shadow: 0 0 0 0 rgba(34,197,94,.0); }
+}
+
+.chat-dock {
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.chat-dock.collapsed {
+  height: 60px;
+}
+
+.chat-dock.expanded {
+  height: 400px;
+}
+
+.progress-line {
+  background: linear-gradient(90deg, 
+    hsl(var(--accent)) 0%, 
+    hsl(var(--accent)) 65%, 
+    hsl(var(--muted)) 65%, 
+    hsl(var(--muted)) 100%);
+}
+
+.wellness-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 4px;
+}
+
+.wellness-cell {
+  aspect-ratio: 1;
+  border-radius: 2px;
+}
+
+.integration-stage {
+  position: relative;
+  overflow: hidden;
+}
+
+.integration-stage::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: hsl(var(--muted));
+}
+
+.stage-discover::before { 
+  background: hsl(var(--chart-1)); 
+}
+
+.stage-design::before { 
+  background: hsl(var(--chart-2)); 
+}
+
+.stage-config::before { 
+  background: hsl(var(--chart-3)); 
+}
+
+.stage-test::before { 
+  background: hsl(var(--chart-4)); 
+}
+
+.stage-deploy::before { 
+  background: hsl(var(--chart-5)); 
+}
+
+.nav-link.active {
+  @apply bg-primary text-primary-foreground;
+  background-color: hsl(var(--primary) / 0.2);
+}
+
+.nav-link:not(.active) {
+  @apply hover:bg-secondary transition-colors;
+}
+
+html, body, #root { height: 100%; }
+.app-shell { height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+.app-shell-header { position: sticky; top: 0; z-index: 50; flex-shrink: 0; }
+.app-shell-main { flex: 1; display: flex; min-height: 0; overflow: hidden; }
+.app-shell-sidebar { 
+  width: 240px; 
+  border-right: 1px solid rgba(255,255,255,.08); 
+  overflow-y: auto; 
+  overflow-x: hidden;
+  height: 100%;
+  flex-shrink: 0;
+}
+.app-shell-content { 
+  flex: 1; 
+  overflow-y: auto; 
+  overflow-x: hidden;
+  padding: 12px;
+  height: 100%;
+}
+
+/* Brand styling */
+.brand-btn {
+  @apply px-2 py-1 rounded border border-transparent text-xs text-primary transition-colors;
+  background-color: hsl(var(--primary) / 0.05);
+}
+
+.brand-btn:hover {
+  background-color: hsl(var(--primary) / 0.1);
+}
+
+/* Environment and project code chips */
+.brand-chip {
+  @apply px-1.5 py-0.5 rounded-sm text-primary font-medium;
+  background-color: hsl(var(--primary) / 0.1);
+  border: 1px solid hsl(var(--primary) / 0.2);
+}
+
+/* Print Utility Classes */
+@media print {
+  /* Page break utilities (with modern and legacy support) */
+  .print-page-break-before { 
+    page-break-before: always !important; 
+    break-before: always !important; 
+  }
+  .print-page-break-after { 
+    page-break-after: always !important; 
+    break-after: always !important; 
+  }
+  .print-page-break-inside { 
+    page-break-inside: avoid !important; 
+    break-inside: avoid !important; 
+  }
+  .print-no-break { 
+    page-break-inside: avoid !important; 
+    break-inside: avoid !important; 
+  }
+  
+  /* Show/hide utilities for print */
+  .print-show { display: block !important; }
+  .print-hidden { display: none !important; }
+  .print-only { display: block !important; }
+  
+  /* Print-specific styling */
+  .print-section-title {
+    font-size: 14pt !important;
+    font-weight: bold !important;
+    margin-top: 16pt !important;
+    margin-bottom: 8pt !important;
+    page-break-after: avoid !important;
+  }
+  
+  .print-compact {
+    margin: 2pt 0 !important;
+    padding: 2pt !important;
+  }
+  
+  .print-table {
+    width: 100% !important;
+    border-collapse: collapse !important;
+    font-size: 10pt !important;
+  }
+  
+  .print-table th,
+  .print-table td {
+    border: 1pt solid #ddd !important;
+    padding: 4pt 6pt !important;
+    text-align: left !important;
+  }
+  
+  /* Dashboard specific print styles */
+  .dashboard-widget {
+    margin: 8pt 0 !important;
+    padding: 8pt !important;
+    border: 1pt solid #ddd !important;
+    background: white !important;
+  }
+  
+  /* Analytics and KPI cards for print */
+  .analytics-print-grid {
+    display: grid !important;
+    grid-template-columns: repeat(2, 1fr) !important;
+    gap: 8pt !important;
+    margin: 8pt 0 !important;
+  }
+  
+  .kpi-print-item {
+    padding: 8pt !important;
+    border: 1pt solid #ddd !important;
+    background: white !important;
+    text-align: center !important;
+  }
+  
+  /* Print footer class - positioned within @page bottom margin */
+  .print-footer {
+    position: fixed;
+    bottom: 0.2in; /* Within the 1in bottom margin from @page */
+    left: 0.5in;
+    right: 0.5in;
+    font-size: 8pt;
+    color: #666;
+    border-top: 1pt solid #ddd;
+    padding-top: 4pt;
+    text-align: center;
+  }
+}
+
+/* Print-only elements (hidden on screen, shown in print) */
+.print-only {
+  display: none !important;
+}
+
+/* Print fallback text (shown when charts/interactive elements are hidden) */
+.print-fallback {
+  display: none;
+  font-style: italic;
+  color: #666;
+  text-align: center;
+  padding: 8pt;
+  border: 1pt dashed #ccc;
+  margin: 8pt 0;
+}
+
+@media print {
+  .print-only { display: block !important; }
+  .print-fallback { display: block !important; }
+}

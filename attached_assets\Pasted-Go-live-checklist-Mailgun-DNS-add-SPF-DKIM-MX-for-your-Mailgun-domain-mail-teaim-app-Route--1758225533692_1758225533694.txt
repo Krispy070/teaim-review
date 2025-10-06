@@ -1,0 +1,143 @@
+Go-live checklist (Mailgun)
+
+DNS: add SPF/DKIM/MX for your Mailgun domain (mail.teaim.app).
+
+Route: Mailgun → Webhook POST to https://<your-app>/api/email/mailgun.
+
+Secrets (Replit → Secrets):
+
+MAILGUN_SIGNING_KEY
+
+EMAIL_ALLOWLIST=client.com,partner.com
+
+BUCKET=project-artifacts (already set)
+
+Project codes: ensure each project has a unique code (WD-ACME) in projects.
+
+Idempotency: we store Message-Id—dupes get ignored.
+
+Limits: 10MB, types: pdf/docx/txt/eml/vtt/srt (we can add OCR later).
+
+Rate limits: add Nginx/Express rate limit for /api/email/mailgun (e.g., 60/min/ip).
+
+Monitoring: alert on 4xx (security) & 5xx spikes; log signature failures & bad senders.
+
+Dev validation (no Mailgun required)
+
+Inbound-dev: send a JSON payload with base64 attachment to /api/email/inbound-dev (you already have the script).
+
+Signed request (optional): I can give you a tiny Python script to compute Mailgun HMAC if you want to replay signed tests locally.
+
+What the email pipeline does (and where it goes)
+
+Parse: subject #proj:WD-ACME → resolve org_id, project_id.
+
+Store: upload to project-artifacts/{project}/{uuid}_{sanitized_name}.
+
+Extract: text → chunk → embeddings → artifact_chunks.
+
+Summarize: artifact summary; key decisions, risks, actions.
+
+Memories: write semantic / procedural / decision / affect.
+
+Classification → pages:
+
+Actions: owner + verb + date → open items; drive Pending widget & Overdue KPI.
+
+Risks: severity High → Red flags.
+
+Decisions: listed in dashboard and weekly digest.
+
+Integrations: “X → Y” (ADP → Workday, Workday → GL) → Integrations & Tech.
+
+Workstreams: keyword map to Functional Areas tile (HCM, Payroll, etc.).
+
+Reporting asks / Training / Logistics: auto-log as mem entries so those pages fill in.
+
+9-step onboarding (operational flow)
+
+Start: /api/onboarding/start creates instances (metrics, team, logistics) w/ due dates.
+
+Send: /api/onboarding/send renders template + sends via Mailgun; includes secure link.
+
+Respond: /api/onboarding/respond stores answers then normalizes:
+
+Metrics → dashboard header KPIs (Go-live / Accuracy / Adoption).
+
+Team → roster + owners; seed actions (e.g., “Provide access”).
+
+Logistics → cadence & links to Logistics page + digest schedule.
+
+Nudges: 48h reminder; 96h escalate (configurable per project).
+
+Minimal Review Queue (add this next so demos look crisp)
+
+Human-in-the-loop page to approve AI extractions before they hit dashboards.
+
+Endpoint: /review/pending returns items {type: 'action|risk|decision', text, confidence, source_artifact}.
+
+Approve → marks published; Edit → inline update; Discard → drop.
+
+UI: a simple table under Documents or Actions → “Review new items (N)”.
+
+Quick tests to run now (copy/paste)
+
+1) Start onboarding (3 steps)
+
+BASE="http://localhost:5000/api"
+ORG="d915376c-2bd7-4e79-b9c9-aab9d7fcb5a8"
+PROJ="dced0b98-87b4-46ff-b2a4-2cf8e627e8d2"
+
+curl -s -X POST "$BASE/onboarding/start" -H "Content-Type: application/json" \
+  -d '{"org_id":"'$ORG'","project_id":"'$PROJ'"}'
+
+
+2) Simulate email minutes (intake)
+
+cat > /tmp/minutes.txt <<'TXT'
+Payroll WG Minutes: Decision: retro policy v2. Risk: SFTP cert expiry (High).
+Action: Sam to deliver cert by 2025-09-22. ADP → Workday. Workday → GL.
+TXT
+curl -s -X POST "$BASE/email/inbound-dev" -H "Content-Type: application/json" -d @- <<JSON
+{"subject":"WG minutes #proj:WD-ACME","from":"lead@client.com",
+ "attachments":[{"filename":"2025-09-18-minutes.txt","content_type":"text/plain","data_b64":"$(base64 -w0 /tmp/minutes.txt)"}]}
+JSON
+
+
+3) Respond to “metrics” step
+
+curl -s -X POST "$BASE/onboarding/respond" -H "Content-Type: application/json" -d @- <<JSON
+{"org_id":"$ORG","project_id":"$PROJ","step_key":"metrics",
+ "answers":{"kpis":["Go-live 07/01","Payroll accuracy 99.5%","Adoption 90%"]}}
+JSON
+
+
+4) Refresh Dashboard
+
+KPIs now show artifacts, decisions, pending items; Integrations list shows ADP → Workday & Workday → GL; header KPIs reflect metrics response.
+
+Guardrails & observability you’re covered on
+
+HMAC signature, timestamp window (e.g., 5 min), allowlist by domain, idempotent via Message-Id.
+
+File allowlist & size caps.
+
+JSON errors on failures (no proxy hangs).
+
+Logs: signature fail (403), missing #proj: (400), unknown project (404), AV/type (415), internal (500).
+
+Rate limits on /api/email/mailgun.
+
+What I recommend we build next (pick your order)
+
+Review Queue UI (approve/edit/discard extracted actions/risks/decisions).
+
+Actions page with filters (owner, overdue, source) and one-click “Nudge” draft.
+
+Onboarding forms (simple web form with token) so customers can reply via link, not just email.
+
+Weekly digest endpoint (HTML/PDF preview) using current artifacts/decisions/risks/actions.
+
+Auth (Supabase magic link) to hide Admin/PM controls and Wellness aggregates from general members.
+
+If you want me to drop the Review Queue endpoints + a minimal React page now, I’ll hand you paste-ready code so you can demo the full “Email in → Approve → Dashboard updates” loop today.

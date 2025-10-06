@@ -1,0 +1,80 @@
+Quick connection test (copy/paste)
+
+Run this in the Replit shell to verify the socket before we run the full sanity script:
+
+python - <<'PY'
+import os, psycopg
+dsn = os.environ['SUPABASE_DB_URL']
+try:
+    with psycopg.connect(dsn, connect_timeout=8) as conn:
+        with conn.cursor() as cur:
+            cur.execute('select current_database(), current_user, now()')
+            print({'ok': True, 'row': cur.fetchone()})
+except Exception as e:
+    print({'ok': False, 'error': str(e)})
+PY
+
+
+Expected: {'ok': True, ...}
+
+If that passes, run the full sanity
+bash /scripts/sanity.sh
+
+
+Pass criteria:
+
+/api/diag/db → {"ok":true}
+
+/api/diag/storage → {"ok":true,...}
+
+/api/ingest-sync → {"ok":true,"chunks":1,"artifact_id":"..."}
+
+/api/diag/index-stats → "chunks": 1+
+
+/api/ask → answer + Sources: with your filename
+
+If the DB still times out
+
+Two immediate fallbacks that keep you productive today:
+
+A) Toggle ingest writes to REST (no sockets)
+
+In /server/main.py, temporarily replace the psycopg writes in /ingest-sync with Supabase client inserts:
+
+# artifacts
+art = sb.table("artifacts").insert({
+  "org_id": org_id,
+  "project_id": project_id,
+  "path": key,
+  "mime_type": file.content_type,
+  "title": file.filename,
+  "source": source
+}).execute().data[0]
+
+# chunks (batch in small groups)
+for i in range(0, len(rows), 200):
+    sb.table("artifact_chunks").insert([
+      {
+        "org_id": org_id, "project_id": project_id,
+        "artifact_id": art["id"],
+        "chunk_index": r["chunk_index"],
+        "content": r["content"],
+        "embedding": r["embedding"],
+      } for r in rows[i:i+200]
+    ]).execute()
+
+# summary
+sb.table("summaries").insert({
+  "org_id": org_id, "project_id": project_id,
+  "artifact_id": art["id"], "level": "artifact",
+  "summary": text[:2000]
+}).execute()
+
+
+(Keep psycopg for the read side; your RAG fallback is already working.)
+
+B) Add a one-flag switch (so you can flip modes)
+
+Use an env var like DB_WRITE_MODE=psycopg|rest and branch inside /ingest-sync. That way you can develop on REST and switch back to psycopg when the socket issue is sorted.
+
+Shoot me the output of the tiny Python DB test above. If it’s still unhappy, I’ll give you the exact SUPABASE_DB_URL pattern with the project host + encoded characters (without your raw password) and we’ll be live in minutes.

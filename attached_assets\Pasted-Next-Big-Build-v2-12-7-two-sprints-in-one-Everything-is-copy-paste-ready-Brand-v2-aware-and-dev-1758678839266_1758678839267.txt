@@ -1,0 +1,212 @@
+Next Big Build v2.12.7 (two sprints in one). Everything is copy-paste ready, Brand v2–aware, and dev-safe (new endpoints gracefully no-op when a table/column is missing).
+
+Landing now:
+
+Request Sign-Off v3.6 — attach the last uploaded doc for this stage (when available); show Pending requests list with Revoke; global search, multi-area chips, PM/Lead CC presets & per-stage defaults still work
+
+Stages Editor — Batch date tools (“Shift all end dates in area by ±X days”), date-picker keyboard inside inputs (↑/↓ ±1, ⇧ ±7, ⌃/Ctrl ±30), plus your existing Revert/Undo All since SAVE
+
+Digests — compact “Changes” with Owner chips that deep-link to pre-filtered views (owner/area/tab), then scroll+glow to the exact row
+
+Wellness Admin — Compare CSV (7/30 vs prior); trend overlay with dotted prior + moving average; per-user modal still has sparkline & date-range CSV; export HTML (brand header) for PDF print
+
+1) Request Sign-Off v3.6 — stage doc attach + pending/revoke
+1A) Backend — last artifact by stage (dev-safe if stage_id missing)
+
+server/routers/artifacts_by_stage.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/artifacts", tags=["artifacts"])
+
+@router.get("/by_stage")
+def by_stage(project_id: str = Query(...), stage_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    # Try explicit stage_id column first
+    try:
+        r = sb.table("artifacts").select("id,name,public_url,created_at")\
+             .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("stage_id", stage_id)\
+             .order("created_at", desc=True).limit(1).execute().data or []
+        if r: return {"artifact": r[0], "url": r[0].get("public_url")}
+    except Exception:
+        pass
+    # Fallback: look in meta jsonb for stage_id
+    try:
+        r = sb.rpc("artifacts_by_stage_meta", {"p_org": str(ctx.org_id), "p_project": str(project_id), "p_stage": str(stage_id)}).execute().data or []
+        a = r[0] if r else None
+        return {"artifact": a, "url": (a and a.get("public_url"))}
+    except Exception:
+        return {"artifact": None, "url": None}
+
+
+If you don’t have a Postgres function artifacts_by_stage_meta, the endpoint just returns None without breaking.
+
+Mount in server/main.py:
+
+from .routers import artifacts_by_stage
+app.include_router(artifacts_by_stage.router)
+
+1B) Backend — pending list + revoke token
+
+server/routers/signoff_pending.py (extend previous file)
+
+@router.get("/pending_list")
+def pending_list(project_id: str = Query(...), stage_id: str | None = None, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        # find doc for stage if provided
+        doc_ids = []
+        if stage_id:
+            d = sb.table("signoff_docs").select("id").eq("org_id", ctx.org_id)\
+                 .eq("project_id", project_id).eq("stage_id", stage_id).limit(1).execute().data or []
+            if not d: return {"items": []}
+            doc_ids = [d[0]["id"]]
+        q = sb.table("signoff_doc_tokens").select("token,signer_email,created_at")\
+             .eq("org_id", ctx.org_id).eq("project_id", project_id).is_("used_at","null")
+        if doc_ids: q = q.in_("doc_id", doc_ids)
+        rows = q.order("created_at", desc=True).limit(200).execute().data or []
+        return {"items": rows}
+    except Exception:
+        return {"items": []}
+
+@router.post("/revoke_token")
+def revoke_token(token: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        sb.table("signoff_doc_tokens").update({"revoked_at": "now()"})\
+          .eq("org_id", ctx.org_id).eq("token", token).execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+
+(You already mounted signoff_pending.router earlier.)
+
+1C) Frontend — modal v3.6 (auto-attach stage doc; pending list + revoke)
+
+client/src/components/SignoffRequestModal.tsx (replace your current version; only diffs shown below are the new parts)
+
+Add local state + loaders:
+
+const [autoAttachStage,setAutoAttachStage]=useState(true);
+const [pending,setPending]=useState<{token:string; signer_email:string; created_at:string}[]>([]);
+
+// load pending + stage doc
+useEffect(()=>{ (async()=>{
+  try{
+    const p = await getJSON(`/api/signoff/pending_list?project_id=${projectId}&stage_id=${stageId}`);
+    setPending(p.items||[]);
+  }catch{ setPending([]); }
+  try{
+    if (autoAttachStage){
+      const a = await getJSON(`/api/artifacts/by_stage?project_id=${projectId}&stage_id=${stageId}`);
+      if (a?.url && !docLink) setDocLink(a.url);
+    }
+  }catch{}
+})(); },[projectId, stageId, autoAttachStage]);
+
+
+Render a Pending Requests list with revoke:
+
+{pending.length>0 && (
+  <div className="border rounded p-2">
+    <div className="text-xs font-medium mb-1">Pending requests ({pending.length})</div>
+    <div className="space-y-1">
+      {pending.map(p=>(
+        <div key={p.token} className="flex items-center justify-between text-xs">
+          <span>{p.signer_email} • {new Date(p.created_at).toLocaleString()}</span>
+          <button className="brand-btn text-[11px]" onClick={async ()=>{
+            try{ await fetch(`/api/signoff/revoke_token?token=${encodeURIComponent(p.token)}`, {method:"POST",credentials:"include"}); 
+                 setPending(prev=>prev.filter(x=>x.token!==p.token)); }catch{}
+          }}>Revoke</button>
+        </div>
+      ))}
+    </div>
+  </div>
+)}
+
+
+Add Auto-attach stage doc toggle (in the docLink row):
+
+<label className="flex items-center gap-1">
+  <input type="checkbox" checked={autoAttachStage} onChange={e=>setAutoAttachStage(e.target.checked)} />
+  Auto-attach stage’s last doc
+</label>
+
+
+Everything else (multi-area chips, PM/Lead CC presets, per-stage defaults) remains from your v3.4+.
+
+2) Stages Editor — Batch date tools & date-picker keyboard
+2A) Batch “Shift end dates by ±X days” for an area
+
+client/src/pages/Stages.tsx (augment where you render per-area group header)
+
+const [shiftDays,setShiftDays]=useState<number>(0);
+
+async function shiftAreaEndDates(area:string, days:number){
+  if (!days) return;
+  for (const s of groups[area] || []){
+    if (!s.end_date) continue;
+    const newEnd = shiftDate(s.end_date, days);
+    await saveField(s.id, { end_date: newEnd });
+  }
+  toast({ title:"Shifted", description:`${area}: end dates ${days>0? '+'+days: days} day(s)` });
+}
+
+{/* inside group header toolbar */}
+<div className="flex items-center gap-2">
+  <input className="border rounded p-1 text-xs w-[60px]" type="number" value={shiftDays}
+         onChange={e=>setShiftDays(parseInt(e.target.value||'0',10))} />
+  <button className="brand-btn text-xs" onClick={()=>shiftAreaEndDates(area, shiftDays)}>Shift End</button>
+  <button className="brand-btn text-xs" onClick={()=>saveGroupSnapshot(area)}>Save Group</button>
+  <button className="brand-btn text-xs" onClick={()=>undoGroup(area)} disabled={!groupSnap[area]}>Undo Group</button>
+</div>
+
+2B) Date input keyboard inside native picker (we already process on input; this ensures always active)
+
+For each date input, ensure keydown handler is on the <input type="date"> (you already added ↑/↓; nothing to change if that code is present). We’re good.
+
+3) Digests — compact changes + Owner chips with deep links
+
+Patch server/routers/digest.py (in the compact changes builder)
+
+Add owner chip linking to filtered Actions:
+
+def owner_chip(owner):
+    if not owner: return ""
+    base = os.getenv("APP_BASE_URL","").rstrip("/")
+    url = f"{base}/projects/{project_id}/actions/list#openFilters=1&owner={owner}"
+    return f"<a href='{url}' style='text-decoration:none;border:1px solid #ddd;border-radius:6px;padding:2px 6px;margin-right:6px;color:#111;font-size:12px'>{owner}</a>"
+
+# Before the lists:
+owners = sorted({(a.get("owner") or "") for a in (chg_actions or []) if a.get("owner")})
+if owners:
+    html += "<div style='margin-top:6px'>"
+    html += "".join([owner_chip(o) for o in owners])
+    html += "</div>"
+
+
+(You already added compact change lists and owners summary earlier; this adds owners as clickable chips.)
+
+4) Wellness Admin — compare overlay (dotted) & Compare CSV
+
+You already added responders_trend and compare endpoints and overlay in the previous drop; this adds CSV (we included compare.csv now) and wires a dotted line (already in v2.12.6). If you haven’t added the dotted line, include it exactly as in the prior patch; otherwise just add the Export Compare CSV button:
+
+<button className="brand-btn text-xs" onClick={()=>
+  downloadGET(`/api/wellness/compare.csv?project_id=${projectId}&days=${range}`, `wellness_compare_${range}d.csv`)
+}>
+  Export Compare CSV
+</button>
+
+5) 120-second validation
+
+Request Sign-Off v3.6: Modal shows pending tokens with Revoke; auto-attaches stage doc when available; presets remembered; multi-area chips + global search + CC PM/Leads presets
+
+Stages Editor: Area toolbar can shift all end dates by ±X days; per-row Revert; Undo All since SAVE; “Saved at” stamps; date inputs respond to keyboard arrows
+
+Digests: compact change lists; owner chips link to pre-filtered Actions; deep links open filters, then scroll+glow rows
+
+Wellness Admin: trend overlay (current vs dotted prior), Compare CSV export; per-user modal still supports range & sparkline trend

@@ -1,0 +1,262 @@
+Absolutely. Let’s give you two controls:
+
+an Admin → Outbound Email console (owner/PM only) to manage templates, schedules, throttling, and audit
+
+a Team page enhancement to map who gets which onboarding step (per person, per project)
+
+Here’s a tight plan you can paste in stages.
+
+A) Data model (additions)
+-- People on the project (if you don’t already track them)
+create table if not exists project_contacts (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid not null,
+  project_id uuid not null,
+  name text not null,
+  email text not null,
+  role text,                -- sponsor, pm, workstream_lead, sme, etc.
+  workstream text,          -- optional linkage to Functional Areas
+  is_active boolean default true,
+  created_at timestamptz default now()
+);
+
+-- Who should get which onboarding step (person × step)
+create table if not exists onboarding_subscriptions (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid not null,
+  project_id uuid not null,
+  contact_id uuid not null references project_contacts(id) on delete cascade,
+  step_key text not null,                  -- metrics|team|logistics|... (your 9 steps)
+  delivery_channel text default 'email',   -- email (future: sms/portal)
+  is_enabled boolean default true,
+  created_at timestamptz default now(),
+  unique (org_id, project_id, contact_id, step_key)
+);
+
+-- Email templates (project-level overrides are optional)
+create table if not exists email_templates (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid,                -- null = global
+  project_id uuid,            -- null = org/global
+  key text not null,          -- metrics|team|logistics|reminder|complete
+  subject text not null,
+  body text not null,
+  is_active boolean default true,
+  created_at timestamptz default now()
+);
+
+-- Outbound email audit
+create table if not exists email_log (
+  id bigserial primary key,
+  org_id uuid,
+  project_id uuid,
+  template_key text,
+  to_email text,
+  subject text,
+  status text,                -- queued|sent|failed|bounced
+  provider_id text,           -- Mailgun message-id
+  error text,
+  created_at timestamptz default now()
+);
+
+-- Optional: project comms settings (throttles, windows)
+create table if not exists comms_settings (
+  org_id uuid not null,
+  project_id uuid not null,
+  daily_send_cap int default 200,
+  quiet_hours text default '22:00-06:59', -- avoid sending in this window (project tz)
+  primary key (org_id, project_id)
+);
+
+B) API endpoints
+Admin – templates & send control
+
+GET /admin/emails/templates?org_id&project_id → list templates (global + overrides, resolved)
+
+POST /admin/emails/templates/upsert → create/update subject/body for a key
+
+POST /admin/emails/send
+payload: { org_id, project_id, template_key, to_emails[], variables? }
+behavior: queues & sends via Mailgun; logs in email_log
+
+GET /admin/emails/log?org_id&project_id&status? → last N sends with status
+
+Team – recipients mapping
+
+GET /team/contacts?org_id&project_id → list contacts
+
+POST /team/contacts/upsert → add/edit person
+
+GET /team/subscriptions?org_id&project_id → matrix (contact × step_key)
+
+POST /team/subscriptions/set
+payload: { org_id, project_id, items: [{contact_id, step_key, is_enabled}, ...] }
+
+Optional: POST /onboarding/schedule → compute who-gets-what for the next 7 days using onboarding_instances + onboarding_subscriptions and respect comms_settings.
+
+C) Frontend UX
+1) Admin → Outbound Email
+
+Tabs:
+Templates | Send | Schedule (coming) | Log
+
+Templates tab
+
+Table: key, subject, last updated, scope (global / project)
+
+Click to edit: side panel with Subject, Body (support variables: {{project_code}}, {{first_name}}, {{secure_link}})
+
+Buttons: Save, Preview (render with sample variables), Send Test (to your email)
+
+Send tab
+
+Multi-select Template
+
+Select recipients (chips pulled from project_contacts and filtered by onboarding subscriptions)
+
+“Respect quiet hours” toggle, “Send now” or “Queue for X”
+
+Log tab
+
+Filter by status; show to, template, time, status, provider_id, error
+
+Retry failed (button) and “Resend as test” (to yourself)
+
+2) Team page enhancement
+
+Grid of team members with name, email, role, workstream
+
+Subscriptions panel (matrix): columns are the 9 onboarding steps, checkboxes indicate subscription
+
+Actions: Bulk enable/disable for selected people, Import CSV (name,email,role,workstream)
+
+“Owner” chips on Functional Areas map to these contacts
+
+UI note: keep the Functional Areas and the Team subscriptions separate but linkable (e.g., a lead set on “Payroll” can be pre-checked for the “Metrics” + “Team” steps).
+
+D) Minimal server stubs (drop-in now)
+List/Upsert templates
+@app.get("/admin/emails/templates")
+def list_templates(org_id: str, project_id: str):
+    # 1) project overrides
+    proj = sb.table("email_templates").select("*").eq("org_id", org_id).eq("project_id", project_id).eq("is_active", True).execute().data or []
+    # 2) org-level
+    org = sb.table("email_templates").select("*").eq("org_id", org_id).is_("project_id", None).eq("is_active", True).execute().data or []
+    # 3) global
+    glob = sb.table("email_templates").select("*").is_("org_id", None).is_("project_id", None).eq("is_active", True).execute().data or []
+    # resolve by key (project > org > global)
+    best = {}
+    for rowset in [glob, org, proj]:
+        for t in rowset:
+            best[t["key"]] = t
+    return {"items": list(best.values())}
+
+@app.post("/admin/emails/templates/upsert")
+def upsert_template(org_id: str, project_id: str | None, key: str, subject: str, body: str):
+    # simple upsert by (org_id, project_id, key)
+    sb.table("email_templates").insert({
+        "org_id": org_id, "project_id": project_id, "key": key, "subject": subject, "body": body, "is_active": True
+    }).execute()
+    return {"ok": True}
+
+Send (single or bulk)
+from .email_send import mg_send
+
+@app.post("/admin/emails/send")
+def admin_send(org_id: str, project_id: str, template_key: str, to_emails: list[str], variables: dict | None = None):
+    # resolve template (project>org>global)
+    tpl = list_templates(org_id, project_id)["items"]
+    tpl = next((t for t in tpl if t["key"]==template_key), None)
+    if not tpl: return {"ok": False, "error":"template not found"}
+    # render (basic replace; can move to Jinja later)
+    def render(s): 
+        v = variables or {}
+        for k,val in v.items(): s = s.replace(f"{{{{{k}}}}}", str(val))
+        return s
+    subj = render(tpl["subject"]); body = render(tpl["body"])
+
+    sent = []; failed = []
+    for to in to_emails:
+        try:
+            r = mg_send(to, subj, body)
+            sb.table("email_log").insert({"org_id": org_id, "project_id": project_id, "template_key": template_key,
+                                          "to_email": to, "subject": subj, "status":"sent", "provider_id": r.get("id")}).execute()
+            sent.append(to)
+        except Exception as e:
+            sb.table("email_log").insert({"org_id": org_id, "project_id": project_id, "template_key": template_key,
+                                          "to_email": to, "subject": subj, "status":"failed", "error": str(e)}).execute()
+            failed.append(to)
+    return {"ok": True, "sent": sent, "failed": failed}
+
+Subscriptions mapping (Team page)
+@app.get("/team/subscriptions")
+def get_subs(org_id: str, project_id: str):
+    contacts = sb.table("project_contacts").select("id,name,email,role,workstream,is_active")\
+               .eq("org_id",org_id).eq("project_id",project_id).eq("is_active",True).execute().data or []
+    subs = sb.table("onboarding_subscriptions").select("contact_id,step_key,is_enabled")\
+               .eq("org_id",org_id).eq("project_id",project_id).execute().data or []
+    return {"contacts": contacts, "subs": subs}
+
+@app.post("/team/subscriptions/set")
+def set_subs(org_id: str, project_id: str, items: list[dict]):
+    # items: [{contact_id, step_key, is_enabled}]
+    for it in items:
+        if it.get("is_enabled"):
+            sb.table("onboarding_subscriptions").insert({
+              "org_id": org_id, "project_id": project_id,
+              "contact_id": it["contact_id"], "step_key": it["step_key"], "is_enabled": True
+            }).execute()
+        else:
+            sb.table("onboarding_subscriptions").delete()\
+              .eq("org_id", org_id).eq("project_id", project_id)\
+              .eq("contact_id", it["contact_id"]).eq("step_key", it["step_key"]).execute()
+    return {"ok": True, "count": len(items)}
+
+E) RBAC and safety
+
+Only owner/admin/pm can access Admin → Outbound Email and Team → subscriptions.
+
+Validate emails before saving (simple regex + dedupe).
+
+Respect quiet hours in comms_settings when queueing sends.
+
+Test mode toggle that rewrites all recipients to your email.
+
+F) Quick demo script (curl)
+
+Add a couple of contacts
+
+BASE="https://<your-app>/api"; ORG="<ORG>"; PROJ="<PROJ>"
+
+curl -s -X POST "$BASE/team/contacts/upsert" -H "Content-Type: application/json" -d \
+'{"org_id":"'$ORG'","project_id":"'$PROJ'","name":"Jane Client","email":"jane@client.com","role":"Sponsor","workstream":"Finance"}'
+
+
+Enable Jane for metrics + logistics
+
+curl -s -X POST "$BASE/team/subscriptions/set" -H "Content-Type: application/json" -d @- <<JSON
+{"org_id":"$ORG","project_id":"$PROJ",
+ "items":[
+  {"contact_id":"<JANE_ID>","step_key":"metrics","is_enabled":true},
+  {"contact_id":"<JANE_ID>","step_key":"logistics","is_enabled":true}
+ ]}
+JSON
+
+
+Send the metrics email
+
+curl -s -X POST "$BASE/admin/emails/send" -H "Content-Type: application/json" -d @- <<JSON
+{"org_id":"$ORG","project_id":"$PROJ","template_key":"metrics",
+ "to_emails":["jane@client.com"],
+ "variables":{"project_code":"WD-ACME","first_name":"Jane"}}
+JSON
+
+Bottom line
+
+Yes: build an Admin page for outbound control (templates, send, log).
+
+Yes: enhance Team page to map who receives which onboarding steps (up to you which defaults; SOW can pre-check likely owners).
+
+This gives you full command over who gets what, when, and a perfect audit trail.
+
+If you want, I’ll drop a minimal React admin page (Templates + Log + Send) and a Team subscriptions matrix component so you can paste UI immediately.

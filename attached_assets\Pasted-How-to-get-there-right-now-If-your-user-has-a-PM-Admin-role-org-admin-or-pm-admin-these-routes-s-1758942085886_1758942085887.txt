@@ -1,0 +1,114 @@
+How to get there right now
+
+If your user has a PM/Admin role (org_admin or pm_admin), these routes should load:
+
+PM Home: /pm (project-level command center)
+
+Admin Home: /admin (org/project admin: Projects Admin, Members, System Health, etc.)
+
+In your build you also have the Admin menu in the sidebar. Clicking Projects Admin or Members drops you into the admin hub as well:
+…/admin/projects · …/admin/members · …/admin/test
+
+If those URLs 404, your router isn’t mounted under the new AppShell yet—easy fix below.
+
+Make the redirect automatic after login (copy-paste)
+1) Server: include role in the session/JWT (if not already)
+
+When you create the session, include role (and optionally scopes) on the user payload the client reads.
+
+// server/auth/session.ts
+// after verifying credentials…
+const session = {
+  user: { id: user.id, email: user.email, role: user.role }, // e.g. 'org_admin' | 'pm_admin' | 'member'
+  // … other claims
+};
+
+2) Client: role-aware landing
+
+Add a tiny helper to decide the landing path:
+
+// ui/lib/landing.ts
+export function landingFor(role?: string) {
+  switch (role) {
+    case "org_admin":
+    case "pm_admin":
+      return "/pm";       // or "/admin" if you prefer the admin hub as default
+    case "vendor":
+      return "/vendor";
+    default:
+      return "/dashboard";
+  }
+}
+
+
+Use it right after auth:
+
+// ui/pages/AuthCallback.tsx (or wherever sign-in resolves)
+import { landingFor } from "@/lib/landing";
+
+useEffect(() => {
+  async function boot() {
+    const me = await api.me(); // returns { user: { role, … } }
+    const path = landingFor(me?.user?.role);
+    navigate(path, { replace: true });
+  }
+  boot();
+}, []);
+
+3) Route guard (keeps users in their lane)
+// ui/routes/guards.tsx
+import { Navigate, Outlet } from "react-router-dom";
+
+export function RequireRole({ allow }: { allow: string[] }) {
+  const me = useMe(); // from your auth store
+  if (!me) return null; // or spinner
+  return allow.includes(me.role) ? <Outlet /> : <Navigate to="/dashboard" replace />;
+}
+
+
+Mount it:
+
+// ui/routes/index.tsx
+<Route element={<RequireRole allow={["org_admin","pm_admin"]} />}>
+  <Route path="/pm" element={<PMHome />} />
+  <Route path="/admin/*" element={<AdminHome />} />
+</Route>
+<Route path="/dashboard" element={<CustomerHome />} />
+
+4) Sidebar shows the right “home” link per role
+// ui/nav/nav.config.ts
+export const navByRole = {
+  org_admin: [{ label:"PM Home", to:"/pm", icon: HomeIcon }, /* …admin items… */],
+  pm_admin:  [{ label:"PM Home", to:"/pm", icon: HomeIcon }, /* …project ops… */],
+  member:    [{ label:"Dashboard", to:"/dashboard", icon: GaugeIcon }, /* … */],
+};
+
+Quick checks
+
+In the DB, verify your user’s role (I saw org_admin in your earlier table dump). If needed:
+
+update users set role = 'org_admin' where username = 'admin';
+
+Visit /pm and /admin. If they load, the pages are there.
+
+Sign out → sign in. You should land on /pm (or /admin) automatically.
+
+If /pm or /admin still 404
+
+Mount the pages under your AppShell:
+
+// ui/shell/AppShell.tsx is already wrapping <Outlet/>
+// just ensure routes exist:
+<Route element={<AppShell brand={brand} project={project} env={env} />}>
+  <Route path="/pm" element={<PMHome />} />
+  <Route path="/admin/*" element={<AdminHome />} />
+  <Route path="/dashboard" element={<CustomerHome />} />
+</Route>
+
+TL;DR
+
+Go now: /pm for PM/Admin, /admin for org admin.
+
+Make it automatic: add the landingFor(role) redirect post-login and the RequireRole guard.
+
+Set your user role to org_admin or pm_admin to see the PM/Admin home by default.

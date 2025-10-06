@@ -1,0 +1,201 @@
+I read your comparison. You’re right: SidebarV2 trimmed a lot and folks will miss key routes. This push restores the full nav (with role gating and safe fallbacks) so the new UI feels complete.
+
+Here’s Next Big Build v2.6.7 – Navigation Stability & Completeness — copy/paste ready:
+
+ProjectGuard (already shipped) + resolver used everywhere (no /projects/undefined)
+
+SidebarV2: all legacy links restored, grouped with clear IA
+
+Timeline page wrapper (so “Timeline” works now)
+
+Role gating on Admin/Advanced links (owner/admin/pm)
+
+Uses safe fallback to /projects/select if projectId is missing
+
+1) ProjectId resolver (you already have this)
+
+If you didn’t add it yet, here’s the helper again:
+
+client/src/lib/projectId.ts
+
+import { getPersistedProjectId } from "@/lib/projectCtx";
+export function resolveProjectId(paramsPid?: string, ctxPid?: string): string | null {
+  if (paramsPid && paramsPid !== "undefined" && paramsPid !== ":projectId") return paramsPid;
+  if (ctxPid && ctxPid !== "undefined") return ctxPid;
+  const stored = getPersistedProjectId();
+  return stored && stored !== "undefined" ? stored : null;
+}
+
+2) Timeline page wrapper (so the link is live)
+
+client/src/pages/Timeline.tsx (new)
+
+import { useParams } from "react-router-dom";
+import ProgramTimeline from "@/components/ProgramTimeline";
+
+export default function TimelinePage(){
+  const { projectId } = useParams();
+  return (
+    <div className="p-3">
+      <div className="text-sm font-medium mb-2">Project Timeline</div>
+      {/* ProgramTimeline already pulls data by projectId from context/params */}
+      <ProgramTimeline projectId={projectId!} />
+    </div>
+  );
+}
+
+
+Patch client/src/App.jsx — add the route:
+
+import TimelinePage from "@/pages/Timeline";
+// ...
+<Route path="/projects/:projectId/timeline" element={<TimelinePage/>} />
+
+3) SidebarV2 — full nav restored with safe fallbacks
+
+client/src/components/SidebarV2.tsx (replace file)
+
+import { NavLink, useParams } from "react-router-dom";
+import { resolveProjectId } from "@/lib/projectId";
+import { getPersistedProjectId } from "@/lib/projectCtx";
+import {
+  Home, Calendar, FileText, Settings, Users, LineChart, Box, Bell,
+  Workflow, Wrench, ClipboardList, CheckSquare, PenTool, FlaskConical,
+  Bus, Database, HeartPulse, DollarSign, ServerCog, Cog, ShieldCheck,
+  FileCog, Activity, FlaskRound, Rocket, Mail, FolderOpen
+} from "lucide-react";
+import { useContext } from "react";
+import { useOrg } from "@/context/OrgCtx"; // if you have it; else remove gating
+
+function Group({title, children}:{title:string; children:any}){
+  return (
+    <div className="mb-4">
+      <div className="text-[11px] uppercase tracking-wider text-gray-400 mb-1">{title}</div>
+      <div className="space-y-1">{children}</div>
+    </div>
+  );
+}
+function Item({to, icon:Icon, label}:{to:string; icon:any; label:string}){
+  return (
+    <NavLink to={to}
+      className={({isActive})=>`flex items-center gap-2 px-2 py-1 rounded ${isActive?'bg-white/10 text-white':'text-gray-300 hover:bg-white/5'}`}>
+      <Icon size={16} /> <span className="text-sm">{label}</span>
+    </NavLink>
+  );
+}
+
+export default function SidebarV2(){
+  const params = useParams();
+  const pid = resolveProjectId(params.projectId, undefined) || getPersistedProjectId();
+  const p = (path:string) => pid ? `/projects/${pid}/${path}` : "/projects/select";
+
+  // Simple gating (owner/admin/pm). If you don't have useOrg(), set this to true to show Admin group.
+  let canAdmin = true;
+  try {
+    const org = (useOrg && useOrg()) || {} as any;
+    canAdmin = ["owner","admin","pm"].includes(org?.userRole || "admin");
+  } catch { /* show admin by default */ }
+
+  return (
+    <div className="h-full w-[240px] bg-[var(--brand-bg)] text-white p-3 border-r border-white/10 overflow-auto">
+      {/* Overview */}
+      <Group title="Overview">
+        <Item to={p("dashboard")} icon={Home} label="Dashboard" />
+        <Item to={p("timeline")} icon={Calendar} label="Timeline" />
+      </Group>
+
+      {/* Planning */}
+      <Group title="Planning">
+        <Item to={p("stages/manage")} icon={Calendar} label="Stages" />
+        <Item to={p("stages/wizard")} icon={Box} label="Stage Wizard" />
+        <Item to={p("workstreams")} icon={Workflow} label="Workstreams" />
+        <Item to={p("training")} icon={ClipboardList} label="Training" />
+        <Item to={p("testing")} icon={FlaskConical} label="Testing" />
+        <Item to={p("logistics")} icon={Bus} label="Logistics" />
+      </Group>
+
+      {/* Execution */}
+      <Group title="Execution">
+        <Item to={p("documents")} icon={FileText} label="Documents" />
+        <Item to={p("meetings")} icon={Calendar} label="Meeting Summaries" />
+        <Item to={p("actions/list")} icon={CheckSquare} label="Actions" />
+        <Item to={p("actions/kanban")} icon={PenTool} label="Actions Kanban" />
+        <Item to={p("stages")} icon={ShieldCheck} label="Stage Sign-Off" />
+        <Item to={p("signoff/compose")} icon={FileCog} label="Compose Sign-Off Package" />
+        <Item to={p("integrations")} icon={Wrench} label="Integrations & Tech" />
+        <Item to={p("reporting")} icon={Database} label="Data & Reporting" />
+        <Item to={p("wellness") /* or dashboard with query: p("dashboard?panel=wellness")*/} icon={HeartPulse} label="Team Wellness" />
+        <Item to={p("financials")} icon={DollarSign} label="Financials" />
+      </Group>
+
+      {/* Governance */}
+      <Group title="Governance">
+        <Item to={p("signoff/docs")} icon={FileText} label="Sign-Off Docs" />
+        <Item to={p("updates/review")} icon={Bell} label="PM Update Monitor" />
+        <Item to={p("admin/ops")} icon={ServerCog} label="System Health" />
+        <Item to={`/admin/branding`} icon={Settings} label="Branding & Logos" />
+      </Group>
+
+      {/* Insights */}
+      <Group title="Insights">
+        <Item to={p("admin/method")} icon={LineChart} label="Method Insights" />
+        <Item to={p("admin/audit-timeline")} icon={Activity} label="Audit Timeline" />
+      </Group>
+
+      {/* Admin */}
+      {canAdmin && (
+        <Group title="Admin">
+          <Item to={p("admin/projects")} icon={FolderOpen} label="Projects Admin" />
+          <Item to={p("admin/integrations")} icon={Wrench} label="Integrations Tracker" />
+          <Item to={p("admin/members")} icon={Users} label="Members" />
+          <Item to={p("admin/team-access")} icon={Users} label="Team Management" />
+          <Item to={p("admin/invite")} icon={Users} label="Invite" />
+          <Item to={p("admin/backups")} icon={FileText} label="Admin Backups" />
+          <Item to={p("admin/rls-selftest")} icon={ShieldCheck} label="RLS Self-Test" />
+          <Item to={`/admin/schema-doctor`} icon={Cog} label="Schema Doctor" />
+          <Item to={p("admin/qa-tools")} icon={FlaskRound} label="QA Tools" />
+          <Item to={p("admin/smoke-run")} icon={Rocket} label="Smoke Runner" />
+          <Item to={`/projects/new`} icon={FolderOpen} label="New Project" />
+          <Item to={p("admin/comms")} icon={Mail} label="Email Center" />
+        </Group>
+      )}
+    </div>
+  );
+}
+
+
+Notes
+• Links like workstreams, integrations, training, testing, logistics, reporting, wellness, financials, admin/* assume you had these pages before. If any route isn’t wired yet, it simply renders your 404/empty page — but the navigation is now complete.
+• If a route name differs, just tweak the path string p("...") to your actual route.
+
+4) Route guard & select route (ensure they exist)
+
+If you haven’t already, add:
+
+// client/src/App.jsx
+import ProjectGuard from "@/components/ProjectGuard";
+import ProjectSelect from "@/pages/ProjectSelect";
+// ...
+<Route path="/projects/select" element={<ProjectSelect/>} />
+<Route path="/projects/:projectId/*" element={
+  <ProjectGuard>
+    <YourProjectLayoutOrRoutes />
+  </ProjectGuard>
+}/>
+
+
+(If you don’t have a single project layout, wrap each project route’s element with <ProjectGuard>.)
+
+5) Optional backend — projects list
+
+If /api/projects/list doesn’t exist, paste the tiny router from section 5 of my previous message and mount it. Otherwise, the Project Select page will show your projects.
+
+6) 60-second verification
+
+Sidebar shows all links; clicking no longer produces /projects/undefined.
+
+If projectId is missing, routes redirect to Project Select.
+
+Timeline opens and renders via the wrapper.
+
+Admin links appear only when userRole ∈ {owner, admin, pm} (or always, if useOrg isn’t available).

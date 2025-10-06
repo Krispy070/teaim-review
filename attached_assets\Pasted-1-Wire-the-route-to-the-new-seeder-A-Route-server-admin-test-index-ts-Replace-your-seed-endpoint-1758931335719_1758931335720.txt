@@ -1,0 +1,182 @@
+1) Wire the route to the new seeder
+A) Route: server/admin/test/index.ts
+
+Replace your seed endpoint with this (note the loud console logs):
+
+// server/admin/test/index.ts
+import { Router } from "express";
+import { seedMinimal } from "./seedMinimal"; // <-- ensure this path is correct
+
+export const testAdminRouter = Router();
+
+testAdminRouter.post("/seed", async (req, res) => {
+  const projectId = req.body?.projectId;
+  if (!projectId) return res.status(400).json({ ok: false, error: "projectId required" });
+
+  console.log("[TEST/SEED] starting seedMinimal v2 for project:", projectId);
+
+  try {
+    const out = await seedMinimal(projectId);
+    console.log("[TEST/SEED] completed seedMinimal v2:", out);
+    return res.json(out);
+  } catch (e: any) {
+    console.error("[TEST/SEED] ERROR:", e);
+    return res.status(500).json({ ok: false, error: e.message ?? String(e) });
+  }
+});
+
+
+Make sure that router is actually mounted, e.g.:
+
+// server/index.ts (or wherever you wire routes)
+import { testAdminRouter } from "./admin/test";
+app.use("/admin/test", testAdminRouter);
+
+B) UI call (Test Runner page)
+
+Ensure “Seed & Run” calls POST /admin/test/seed with { projectId }.
+
+await fetch("/admin/test/seed", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ projectId }),
+});
+
+
+If the UI is calling something else (e.g., /admin/test/seedSample), update it.
+
+2) Self-verifying, DB-agnostic seeder (no .returning() dependence)
+
+Drop this in server/admin/test/seedMinimal.ts (replace whatever’s there):
+
+// server/admin/test/seedMinimal.ts
+import { v4 as uuid } from "uuid";
+import dayjs from "dayjs";
+import { db } from "../../db"; // adjust to your client
+
+export async function seedMinimal(projectId: string) {
+  const now = dayjs();
+
+  const ids = {
+    areaHcm: uuid(),
+    areaFin: uuid(),
+    wbHcm: uuid(),
+    wbFin: uuid(),
+    rptHcm: uuid(),
+    rptFin: uuid(),
+    change1: uuid(),
+    change2: uuid(),
+    cmt1: uuid(),
+    cmt2: uuid(),
+    rel1: uuid(),
+    notif1: uuid(),
+    sign1: uuid(),
+  };
+
+  // 1) Clean
+  await db.transaction(async (tx: any) => {
+    await tx("notifications").where({ project_id: projectId }).del().catch(() => {});
+    await tx("releases").where({ project_id: projectId }).del().catch(() => {});
+    await tx("comments").where({ project_id: projectId }).del().catch(() => {});
+    await tx("changes").where({ project_id: projectId }).del().catch(() => {});
+    await tx("reports").where({ project_id: projectId }).del().catch(() => {});
+    await tx("workbooks").where({ project_id: projectId }).del().catch(() => {});
+    await tx("areas").where({ project_id: projectId }).del().catch(() => {});
+    await tx("signoffs").where({ project_id: projectId }).del().catch(() => {});
+  });
+
+  // 2) Insert minimal rows (only safe, common columns)
+  await db.transaction(async (tx: any) => {
+    await tx("areas").insert([
+      { id: ids.areaHcm, project_id: projectId, key: "HCM", name: "HCM", status: "active", created_at: now.toISOString() },
+      { id: ids.areaFin, project_id: projectId, key: "FIN", name: "Financials", status: "active", created_at: now.toISOString() },
+    ]);
+
+    await tx("workbooks").insert([
+      { id: ids.wbHcm, project_id: projectId, area_id: ids.areaHcm, title: "HCM Workbook", created_at: now.toISOString() },
+      { id: ids.wbFin, project_id: projectId, area_id: ids.areaFin, title: "FIN Workbook", created_at: now.toISOString() },
+    ]);
+
+    await tx("reports").insert([
+      { id: ids.rptHcm, project_id: projectId, area_id: ids.areaHcm, type: "wb_export_csv", title: "HCM Export", created_at: now.toISOString() },
+      { id: ids.rptFin, project_id: projectId, area_id: ids.areaFin, type: "wb_export_csv", title: "FIN Export", created_at: now.toISOString() },
+    ]);
+
+    await tx("changes").insert([
+      { id: ids.change1, project_id: projectId, area_id: ids.areaHcm, kind: "update", summary: "HCM mapping adjusted", created_at: now.subtract(1, "day").toISOString() },
+      { id: ids.change2, project_id: projectId, area_id: ids.areaFin, kind: "add",    summary: "GL segment added",    created_at: now.subtract(2, "day").toISOString() },
+    ]);
+
+    await tx("comments").insert([
+      { id: ids.cmt1, project_id: projectId, area_id: ids.areaHcm, body: "Review job catalog.", author: "System", created_at: now.toISOString() },
+      { id: ids.cmt2, project_id: projectId, area_id: ids.areaFin, body: "Need sign-off.",     author: "System", created_at: now.toISOString() },
+    ]);
+
+    await tx("releases").insert([
+      { id: ids.rel1, project_id: projectId, kind: "ics", channel: "staging", tag: "v0.1.0-test", created_at: now.toISOString() },
+    ]);
+
+    await tx("notifications").insert([
+      { id: ids.notif1, project_id: projectId, kind: "digest_ready", seen: false, created_at: now.toISOString() },
+    ]);
+
+    await tx("signoffs").insert([
+      { token: ids.sign1, project_id: projectId, status: "issued", expires_at: now.add(7, "day").toISOString(), created_at: now.toISOString() },
+    ]);
+  });
+
+  // 3) Verify (authoritative counts the runner relies on)
+  const q = (tbl: string) => db(tbl).where({ project_id: projectId }).count<{ count: string }>("* as count").first();
+
+  const [areas, workbooks, reports, changes, comments, releases, notifications, signoffs] =
+    await Promise.all([q("areas"), q("workbooks"), q("reports"), q("changes"), q("comments"), q("releases"), q("notifications"), q("signoffs")]);
+
+  const inserted = {
+    areas: Number(areas?.count ?? 0),
+    workbooks: Number(workbooks?.count ?? 0),
+    reports: Number(reports?.count ?? 0),
+    changes: Number(changes?.count ?? 0),
+    comments: Number(comments?.count ?? 0),
+    releases: Number(releases?.count ?? 0),
+    notifications: Number(notifications?.count ?? 0),
+    signoffs: Number(signoffs?.count ?? 0),
+  };
+
+  return { ok: true, inserted, projectId };
+}
+
+
+This version:
+
+Avoids .returning() so it works on any PG/Knex config.
+
+Counts rows after insert so the JSON you see reflects reality.
+
+Uses only safe columns so it won’t collide with JSON/metrics schemas.
+
+3) Sanity checklist (2 minutes)
+
+Search the codebase to confirm only one seed endpoint exists and it’s ours:
+
+In Replit console:
+
+grep -R "admin/test/seed" -n
+grep -R "Seeding sample data" -n
+grep -R "seedMinimal" -n
+
+
+Add a loud log (already in the route): you should see
+
+[TEST/SEED] starting seedMinimal v2 for project: <id>
+[TEST/SEED] completed seedMinimal v2: { ok: true, inserted: ... }
+
+
+in the server console when you click Seed & Run.
+
+Ensure projectId: the UI must send the ID shown in the page header (e1ec6ad0-…).
+
+If after this you still see zeros, it means:
+
+The UI is calling a different endpoint, or
+
+The server mounting path isn’t what the UI hits.

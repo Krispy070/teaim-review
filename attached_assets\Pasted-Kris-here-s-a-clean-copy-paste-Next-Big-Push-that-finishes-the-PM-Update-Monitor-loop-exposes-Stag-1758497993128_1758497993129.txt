@@ -1,0 +1,255 @@
+Kris—here’s a clean, copy-paste Next Big Push that finishes the PM Update Monitor loop, exposes Stage Areas end-to-end, gives you a Reload Schema button in Admin Health, fixes the sign-off audit bug, and makes the “pending updates” count show up reliably in the nav. I’ve kept the patches small and labeled so you can drop them straight into Replit.
+
+0) Critical fix — sign-off audit rows missing org_id
+
+This is the 500 (“org_id required”) you saw on sign-off.
+
+Patch your sign-off file where you insert audit events (e.g., server/routers/signoff_external.py or your stages.py decision path). Make sure org_id and project_id are included.
+
+# after approving/rejecting a stage, replace your audit insert with:
+sb.table("audit_events").insert({
+    "org_id": ctx.org_id,                # <— REQUIRED
+    "project_id": project_id,            # <— REQUIRED
+    "actor_id": ctx.user_id,             # may be None for external token
+    "kind": f"stage.{body.decision}",
+    "details": {
+        "stage_id": body.stage_id,
+        "via": "external_token" if some_external else "pm",
+        "notes": body.notes
+    }
+}).execute()
+
+
+(If your file uses the service client sbs, use that; just include org_id/project_id.)
+
+1) Stage Editor (areas, dates) — PM-friendly page
+1A) Router is already in (you added stages_manage.py). If not, add/mount it:
+# server/routers/stages_manage.py
+# (from the previous push — included here for completeness)
+# ... code unchanged ...
+
+
+Mount in server/main.py:
+
+from .routers import stages_manage
+app.include_router(stages_manage.router)
+
+1B) Page UI — client/src/pages/Stages.tsx
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { getJSON, postJSON } from "@/lib/authFetch";
+import PageHeaderHint from "@/components/PageHeaderHint";
+
+type Stage = { id:string; title:string; area?:string; start_date?:string; end_date?:string; status:string; created_at:string };
+
+export default function StagesPage(){
+  const { projectId } = useParams();
+  const [rows,setRows] = useState<Stage[]>([]);
+  const [edit,setEdit] = useState<Record<string, Partial<Stage>>>({});
+
+  async function load(){
+    const d = await getJSON<{items:Stage[]}>(`/api/stages/list?project_id=${projectId}`);
+    setRows(d.items||[]);
+    setEdit({});
+  }
+  useEffect(()=>{ load(); },[projectId]);
+
+  async function save(id:string){
+    const patch = edit[id]; if (!patch) return;
+    await postJSON(`/api/stages/update?project_id=${projectId}&stage_id=${id}`, {
+      title: patch.title ?? undefined,
+      area: patch.area ?? undefined,
+      start_date: patch.start_date ?? undefined,
+      end_date: patch.end_date ?? undefined
+    });
+    load();
+  }
+
+  function bind(id:string, k:keyof Stage){
+    return (e:any)=> setEdit(prev => ({ ...prev, [id]: { ...(prev[id]||{}), [k]: e.target.value }}));
+  }
+
+  return (
+    <div className="p-6 space-y-4">
+      <PageHeaderHint
+        id="stages"
+        title="Stages"
+        intro="Set per-stage Area and dates to enable area-based sign-off and timeline clarity."
+        bullets={[
+          "Edit Area (e.g., HCM, Payroll, Integrations)",
+          "PMs/admins can set dates and titles",
+          "Stage area is used to enforce sign-off authority"
+        ]}
+      />
+      <div className="border rounded">
+        {rows.map(s=>(
+          <div key={s.id} className="p-3 border-b last:border-0 grid md:grid-cols-5 gap-2 items-center">
+            <input className="border rounded p-2" defaultValue={s.title} onChange={bind(s.id,"title")} placeholder="Title"/>
+            <input className="border rounded p-2" defaultValue={s.area||""} onChange={bind(s.id,"area")} placeholder="Area (HCM, Payroll, ...)"/>
+            <input className="border rounded p-2" type="date" defaultValue={s.start_date||""} onChange={bind(s.id,"start_date")}/>
+            <input className="border rounded p-2" type="date" defaultValue={s.end_date||""} onChange={bind(s.id,"end_date")}/>
+            <div className="flex items-center gap-2">
+              <div className="text-xs text-muted-foreground">{s.status}</div>
+              <button className="px-2 py-1 border rounded text-xs" onClick={()=>save(s.id)}>Save</button>
+            </div>
+          </div>
+        ))}
+        {!rows.length && <div className="p-3 text-sm text-muted-foreground">No stages yet.</div>}
+      </div>
+    </div>
+  );
+}
+
+
+Route (in your router file, e.g., client/src/App.jsx):
+
+{ path: "/projects/:projectId/stages/manage", element: <StagesPage/> }
+
+2) Pending Updates badge in sidebar (15s poll)
+
+Find where you render the “PM Update Monitor” link (you mentioned App.jsx line ~166). Wrap text with the count:
+
+import { useEffect, useState } from "react";
+import { getJSON } from "@/lib/authFetch";
+
+function UpdatesBadge({ projectId }:{ projectId:string }){
+  const [n,setN]=useState(0);
+  useEffect(()=>{ 
+    let live=true;
+    async function tick(){ try{ const d=await getJSON(`/api/updates/count?project_id=${projectId}`); if(live)setN(d.count||0);}catch{} }
+    tick(); const t=setInterval(tick, 15000); return ()=>{ live=false; clearInterval(t); };
+  },[projectId]);
+  if(!n) return null;
+  return <span className="ml-2 inline-flex items-center text-[10px] px-1.5 rounded-full bg-black text-white">{n}</span>;
+}
+
+// Then in the nav item:
+<Link to={`/projects/${projectId}/updates/review`} className="...">
+  PM Update Monitor <UpdatesBadge projectId={projectId} />
+</Link>
+
+3) Admin Health — Reload Schema button (kills PostgREST cache hiccups)
+
+Patch your Admin Health page to add the button:
+
+// client/src/pages/AdminHealth.tsx (after it loads 'data')
+async function reloadSchema(){
+  try{
+    const r = await fetch(`/api/_debug/reload_schema`, { method:"POST", credentials:"include" });
+    if (r.ok) alert("Schema reload signaled.");
+    else alert(await r.text());
+  }catch(e){ alert(String(e)); }
+}
+
+<button className="px-3 py-2 border rounded" onClick={reloadSchema}>Reload Schema</button>
+
+
+(You already mounted _debug/reload_schema; if not, include router as shown earlier.)
+
+4) Updates auto-apply rules UI (Admin → Comms or a small card anywhere admin-only)
+
+Add a mini card to your AdminComms page:
+
+// client/src/pages/AdminComms.tsx — after existing settings
+const [rules,setRules] = useState<{auto_apply_updates?:boolean; auto_apply_min_conf?:number}>({});
+useEffect(()=>{ (async()=>{ try{ const d=await getJSON(`/api/updates/rules`); setRules(d);}catch{} })(); },[]);
+async function saveRules(){
+  await postJSON(`/api/updates/rules`, {
+    auto_apply_updates: !!rules.auto_apply_updates,
+    auto_apply_min_conf: Number(rules.auto_apply_min_conf||0.85)
+  }); alert("Update rules saved.");
+}
+
+<div className="border rounded p-3 space-y-2">
+  <div className="font-medium">Update Automation</div>
+  <label className="text-sm flex items-center gap-2">
+    <input type="checkbox" checked={!!rules.auto_apply_updates}
+           onChange={e=>setRules({...rules, auto_apply_updates: e.target.checked})}/>
+    Auto-apply safe changes
+  </label>
+  <label className="text-sm">Minimum confidence (0.0–1.0)
+    <input type="number" step="0.01" min="0" max="1" className="border rounded p-2 w-full"
+           value={rules.auto_apply_min_conf ?? 0.85}
+           onChange={e=>setRules({...rules, auto_apply_min_conf: parseFloat(e.target.value||"0.85")})}/>
+  </label>
+  <button className="px-3 py-2 border rounded" onClick={saveRules}>Save</button>
+</div>
+
+5) Express proxy sanity (avoid /api stripping)
+
+In your Express proxy (if you still see /api → stripped), ensure you do not rewrite path:
+
+// proxy/index.js
+app.use('/api', createProxyMiddleware({
+  target: API_BASE,
+  changeOrigin: true,
+  xfwd: true,
+  // DO NOT pathRewrite: keep '/api'
+  onProxyReq(proxyReq, req) {
+    // forward dev headers
+    if (process.env.DEV_AUTH === '1') {
+      ['x-dev-user','x-dev-org','x-dev-role'].forEach(h => {
+        if (req.headers[h]) proxyReq.setHeader(h, req.headers[h]);
+      });
+    }
+    if (req.headers['authorization']) proxyReq.setHeader('authorization', req.headers['authorization']);
+  }
+}));
+
+
+If your infra insists on stripping /api, keep the alias trick you used before to expose both /api/foo and /foo.
+
+6) Composer — include Stage Area in outbound bodies
+
+(If you didn’t finish this edit in all paths)
+
+// client/src/pages/SignoffComposer.tsx
+const [stageArea, setStageArea] = useState("");
+
+/* In the preview/send/download payloads */
+const body = {
+  stage_title: stageTitle,
+  artifact_ids: arts.filter(a=>chk[a.id]).map(a=>a.id),
+  include_actions: actions, include_risks: risks, include_decisions: decisions,
+  message,
+  stage_area: stageArea       // <— include this
+};
+
+
+On the backend where you create or lookup the stage, write area: body.stage_area.
+
+7) PM Update Monitor — safer apply (optimistic locking)
+
+If you didn’t add earlier, patch _apply_change (see the previous message) to compare updated_at.
+
+8) Routes mount (final check)
+
+In server/main.py, ensure these are included once:
+
+app.include_router(stages_manage.router)
+app.include_router(updates_status.router)
+app.include_router(updates_rules.router)
+# already included earlier:
+# app.include_router(updates.router)
+# app.include_router(_debug_routes.router)
+
+9) Quick test pack (dev headers)
+# Reload schema (fix cache)
+curl -s -X POST "$APP/api/_debug/reload_schema"
+
+# List stages
+curl -s "$APP/api/stages/list?project_id=$PROJ" -H "X-Dev-User:$USER" -H "X-Dev-Org:$ORG" -H "X-Dev-Role:pm" | jq .
+
+# Update a stage area
+curl -s -X POST "$APP/api/stages/update?project_id=$PROJ&stage_id=$STAGE" \
+  -H "Content-Type: application/json" -H "X-Dev-User:$USER" -H "X-Dev-Org:$ORG" -H "X-Dev-Role:pm" \
+  -d '{"area":"HCM"}' | jq .
+
+# Updates count
+curl -s "$APP/api/updates/count?project_id=$PROJ" -H "X-Dev-User:$USER" -H "X-Dev-Org:$ORG" -H "X-Dev-Role:pm"
+
+# Auto-apply rules
+curl -s "$APP/api/updates/rules" -H "X-Dev-User:$USER" -H "X-Dev-Org:$ORG" -H "X-Dev-Role:owner" | jq .
+curl -s -X POST "$APP/api/updates/rules" \
+  -H "Content-Type: application/json" -H "X-Dev-User:$USER" -H "X-Dev-Org:$ORG" -H "X-Dev-Role:owner" \
+  -d '{"auto_apply_updates":true,"auto_apply_min_conf":0.9}'

@@ -1,0 +1,198 @@
+Got it, Kris — the ZIP download on the Sign-Off Composer is 404’ing. That’s almost always one of these:
+
+the router isn’t mounted (or mounted under a different prefix),
+
+the client is doing a GET when the server expects POST, or
+
+the proxy is rewriting /api/... in a way FastAPI isn’t serving.
+
+I’ll give you a tight fix + a safety shim so it works either way, plus a tiny routes-debug endpoint so you can see exactly what FastAPI is exposing.
+
+1) Server: make sure the ZIP endpoint exists (POST and a GET shim)
+
+A) Verify the router file has both endpoints:
+
+server/routers/signoff_package.py (append/confirm)
+
+# ... existing imports & preview/send ...
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
+import io, zipfile, html, os
+from datetime import datetime, timezone
+# ... other imports ...
+
+router = APIRouter(prefix="/api/signoff/package", tags=["signoff-package"])
+
+# --- existing POST /preview and POST /send here ---
+
+@router.post("/zip")
+def zip_package(body: PackageInput, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    sbs = get_service_supabase()
+    proj = sb.table("projects").select("code").eq("id", project_id).single().execute().data
+    proj_code = (proj and proj.get("code")) or project_id
+
+    arts = []
+    if body.artifact_ids:
+        arts = sb.table("artifacts").select("id,name,storage_bucket,storage_path")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+               .in_("id", body.artifact_ids).execute().data or []
+
+    lists = _fetch_lists(sb, ctx.org_id, project_id, body)
+    html_out = _html_package(proj_code, body.stage_title, body, lists, arts)
+
+    buf = io.BytesIO()
+    zf = zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED)
+    zf.writestr("README.html", html_out)
+    zf.writestr("manifest.json", html_out)  # light manifest; can swap to JSON if you prefer
+    for a in arts:
+        try:
+            b = sbs.storage().from_(a["storage_bucket"]).download(a["storage_path"])
+            zf.writestr(f"documents/{a.get('name') or a['id']}", b)
+        except Exception as e:
+            zf.writestr(f"documents/_missing_{a['id']}.txt", f"Could not download: {e}")
+    zf.close(); buf.seek(0)
+
+    fname = f"signoff_{proj_code}_{body.stage_title.replace(' ','_')}.zip"
+    return StreamingResponse(iter([buf.getvalue()]), media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+# --- GET shim for dev/testing (works if the UI accidentally does GET) ---
+@router.get("/zip")
+def zip_package_get(project_id: str = Query(...),
+                    artifact_ids: str = "", stage_title: str = "Discovery",
+                    include_actions: bool = True, include_risks: bool = True, include_decisions: bool = True,
+                    message: str = "", ctx: TenantCtx = Depends(PM_PLUS)):
+    body = PackageInput(stage_title=stage_title,
+                        artifact_ids=[x for x in artifact_ids.split(",") if x],
+                        include_actions=include_actions, include_risks=include_risks,
+                        include_decisions=include_decisions, message=message)
+    return zip_package(body, project_id, ctx)
+
+
+B) Make sure it’s mounted once:
+
+server/main.py
+
+from .routers import signoff_package
+# ...
+app.include_router(signoff_package.router)
+
+2) Client: ensure ZIP uses POST with auth-safe download
+
+In the Composer, call the POST helper (you already added downloadPOST):
+
+client/src/pages/SignoffComposer.tsx
+
+import { downloadPOST } from "@/lib/download";
+
+async function downloadZip(){
+  const body = {
+    stage_title: stageTitle,
+    artifact_ids: arts.filter(a=>chk[a.id]).map(a=>a.id),
+    include_actions: actions,
+    include_risks: risks,
+    include_decisions: decisions,
+    message
+  };
+  try {
+    setBusy(true);
+    await downloadPOST(`/api/signoff/package/zip?project_id=${projectId}`, body,
+      `signoff_${stageTitle.replace(/\s+/g,'_')}.zip`);
+    toast({ title: "ZIP downloaded" });
+  } catch (e:any) {
+    toast({ title: "ZIP download failed", description: String(e?.message||e), variant: "destructive" });
+  } finally { setBusy(false); }
+}
+
+
+(If you still had an <a href="/api/.../zip">, replace it with the button above.)
+
+3) Proxy: make sure /api/... isn’t being stripped
+
+If you have an Express proxy, it should forward and keep the /api prefix:
+
+proxy/index.js (sanity)
+
+app.use('/api', createProxyMiddleware({
+  target: API_BASE,
+  changeOrigin: true,
+  xfwd: true,
+  // NO pathRewrite removing '/api'
+  onProxyReq(proxyReq, req) {
+    if (req.headers['authorization']) proxyReq.setHeader('authorization', req.headers['authorization']);
+    if (process.env.DEV_AUTH === '1') {
+      ['x-dev-user','x-dev-org','x-dev-role'].forEach(h => {
+        if (req.headers[h]) proxyReq.setHeader(h, req.headers[h]);
+      });
+    }
+  },
+}));
+
+4) Route map debugger (so you can see what FastAPI exposes)
+
+server/routers/_debug_routes.py
+
+from fastapi import APIRouter
+from fastapi.encoders import jsonable_encoder
+from typing import List, Dict
+from ..main import app
+
+router = APIRouter(prefix="/api/_debug", tags=["_debug"])
+
+@router.get("/routes")
+def list_routes() -> List[Dict[str,str]]:
+    out=[]
+    for r in app.routes:
+        try:
+            out.append({"path": r.path, "methods": ",".join(sorted(r.methods or []))})
+        except Exception:
+            pass
+    return jsonable_encoder(out)
+
+
+Mount:
+
+from .routers import _debug_routes
+app.include_router(_debug_routes.router)
+
+
+Quick check (dev headers as needed):
+
+GET /api/_debug/routes
+… look for  /api/signoff/package/zip  with methods GET,POST …
+
+5) One-liner cURL tests (dev headers)
+# Preview (HTML)
+curl -s -X POST "$APP/api/signoff/package/preview?project_id=$PROJ" \
+  -H "X-Dev-User:$USER" -H "X-Dev-Org:$ORG" -H "X-Dev-Role:pm" \
+  -H "Content-Type: application/json" \
+  -d '{"stage_title":"Discovery","artifact_ids":[],"include_actions":true,"include_risks":true,"include_decisions":true}' | jq -r '.html' | head
+
+# ZIP via POST (should return a binary; you’ll see gibberish unless you redirect)
+curl -s -X POST "$APP/api/signoff/package/zip?project_id=$PROJ" \
+  -H "X-Dev-User:$USER" -H "X-Dev-Org:$ORG" -H "X-Dev-Role:pm" \
+  -H "Content-Type: application/json" \
+  -d '{"stage_title":"Discovery","artifact_ids":[],"include_actions":true,"include_risks":true,"include_decisions":true}' \
+  -o /tmp/signoff.zip && ls -lh /tmp/signoff.zip
+
+
+If those pass, the Composer button will, too.
+
+6) (Mini polish) Composer UX: disable button while downloading
+const [busy,setBusy] = useState(false);
+
+<button disabled={busy} className="px-3 py-2 border rounded" onClick={downloadZip}>
+  {busy ? "Building…" : "Download ZIP"}
+</button>
+
+What this fixes right now
+
+404/“not found” on ZIP: you now have both POST (correct) and a GET shim (safety).
+
+Any proxy rewrite issue: route debugger tells you exactly what’s mounted.
+
+No more scary overlay: the boundary keeps the UI alive if any component hiccups.
+
+Ping me the result of /api/_debug/routes if anything still hides — I’ll zero in on it instantly. After this lands, I’ll push the Share Dialog (expiry picker + open/copy) and Overdue SLA chip (turns yellow for items due in ≤3 days) as the next mini build.

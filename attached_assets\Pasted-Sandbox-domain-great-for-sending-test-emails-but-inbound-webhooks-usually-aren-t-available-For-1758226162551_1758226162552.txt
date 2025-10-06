@@ -1,0 +1,199 @@
+Sandbox domain = great for sending test emails (but inbound/webhooks usually aren’t available).
+
+For receiving emails into TEAIM (email dropbox), you need a custom domain (e.g., mail.teaim.app) with DNS set up and a Mailgun Route to your webhook.
+
+0) Secrets to add in Replit (server)
+
+Replit → Secrets:
+
+MAILGUN_API_KEY = <your key>
+
+MAILGUN_DOMAIN = sandbox5137cafd65f140bcbb0df0ba18b06383.mailgun.org (for now)
+
+MAILGUN_BASE_URL = https://api.mailgun.net (US region default)
+
+MAILGUN_SIGNING_KEY = <Signing key from Mailgun Security tab> (needed for inbound verification)
+
+EMAIL_ALLOWLIST = client.com,partner.com
+
+BUCKET = project-artifacts (already using this)
+
+1) OUTBOUND (Send) — works with sandbox
+A) Allow the recipient for sandbox
+
+Mailgun requires “Authorized Recipients” on sandbox:
+
+Mailgun → Sending → Domains → your sandbox… → Authorized Recipients → add/verify krispauly7@gmail.com (and whoever else you’ll test with).
+
+B) Minimal Python helper (FastAPI server)
+
+Create /server/email_send.py:
+
+import os, requests
+
+MAILGUN_API_KEY = os.getenv("MAILGUN_API_KEY")
+MAILGUN_DOMAIN  = os.getenv("MAILGUN_DOMAIN")  # sandbox or your custom
+MAILGUN_BASE    = os.getenv("MAILGUN_BASE_URL", "https://api.mailgun.net")
+
+def mg_send(to_email: str, subject: str, text: str, from_name="TEAIM PMO"):
+    if not all([MAILGUN_API_KEY, MAILGUN_DOMAIN]):
+        raise RuntimeError("Mailgun not configured")
+    url = f"{MAILGUN_BASE}/v3/{MAILGUN_DOMAIN}/messages"
+    data = {
+        "from": f"{from_name} <postmaster@{MAILGUN_DOMAIN}>",
+        "to": to_email,
+        "subject": subject,
+        "text": text,
+    }
+    r = requests.post(url, auth=("api", MAILGUN_API_KEY), data=data, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+Test it quickly in Replit shell:
+
+python - <<'PY'
+import os
+from email_send import mg_send
+print(mg_send("krispauly7@gmail.com","TEAIM test","Mailgun sandbox: it lives."))
+PY
+
+
+If you want HTML or attachments later, we extend data with html and files.
+
+2) INBOUND (Receive) — email dropbox via webhook
+
+Sandbox domains don’t support Routes reliably. Use a custom domain (e.g., mail.teaim.app) for receiving.
+
+A) Add a custom domain (for receiving)
+
+Mailgun → Sending → Add New Domain → mail.teaim.app.
+
+Add the DNS records it gives you:
+
+MX (receiving), TXT SPF, TXT DKIM, CNAME tracking (optional)
+
+Wait for all records to show Verified.
+
+B) Create the Route (webhook)
+
+Mailgun → Receiving → Routes → Create Route:
+
+Filter: match_recipient("ingest@teaim.app")
+
+Actions (in order):
+
+forward("https://<YOUR-APP-URL>/api/email/mailgun")
+
+store()
+
+Priority: 1
+
+Description: TEAIM Dropbox
+
+<YOUR-APP-URL> is your public Replit URL (https). If it changes, update the route.
+
+C) Make sure backend endpoint is mounted
+
+You already added the prod endpoint; confirm it’s mounted in main.py:
+
+from .email_mailgun import router as email_router
+app.include_router(email_router, prefix="")
+
+D) Set signing secret
+
+Mailgun → Sending → Domain → Security → “Signing key” → copy into MAILGUN_SIGNING_KEY secret.
+
+That enables HMAC signature verification in your /api/email/mailgun endpoint.
+
+3) Test Plans
+A) Outbound test (sandbox)
+
+Confirm authorized recipient in sandbox.
+
+Run the Python send test above.
+
+Email should arrive from postmaster@sandbox….
+
+B) Inbound dev test (no Mailgun needed)
+
+Use the dev endpoint you already have:
+
+BASE="https://<YOUR-APP-URL>/api"
+ORG="d915376c-2bd7-4e79-b9c9-aab9d7fcb5a8"
+PROJ="dced0b98-87b4-46ff-b2a4-2cf8e627e8d2"
+
+cat > /tmp/minutes.txt <<'TXT'
+Payroll WG – Decisions: retro v2. Risk: SFTP cert expiry (High).
+Action: Sam to deliver cert by 2025-09-22. ADP → Workday; Workday → GL.
+TXT
+
+curl -s -X POST "$BASE/email/inbound-dev" \
+  -H "Content-Type: application/json" -d @- <<JSON
+{"subject":"WG minutes #proj:WD-ACME","from":"lead@client.com",
+ "attachments":[{"filename":"2025-09-18.txt","content_type":"text/plain","data_b64":"$(base64 -w0 /tmp/minutes.txt)"}]}
+JSON
+
+
+Expected: JSON ok:true, storage key created, dashboard starts lighting up.
+
+C) Inbound Mailgun test (custom domain)
+
+Send an email to ingest@teaim.app with subject containing #proj:WD-ACME and attach the minutes.
+
+Check Mailgun Logs → request → status 200 at webhook
+
+In TEAIM: Documents page shows the artifact; dashboard’s Pending/Red Flags/Integrations update
+
+4) Onboarding: send via Mailgun
+
+When you’re ready to ping the client for Metrics, Team, Logistics:
+
+# /server/onboarding_send.py
+from email_send import mg_send
+
+def send_metrics_request(to_email, project_code, first_name="team"):
+    subj = f"Aligning success metrics for {project_code}"
+    body = f"""Hi {first_name},
+
+To keep {project_code} focused, please share your top 3 measures of success:
+1)
+2)
+3)
+
+Reply to this email (we'll ingest it), or use the secure link we'll send next.
+
+— TEAIM PMO
+"""
+    return mg_send(to_email, subj, body)
+
+
+(For custom links/forms, we’ll add a tokenized URL and a simple web form later. Replies still land via the dropbox.)
+
+5) Troubleshooting Cheatsheet
+
+403 “bad signature”: MAILGUN_SIGNING_KEY missing/incorrect.
+
+404 “table not found”: run the SQL grants and notify pgrst, 'reload schema' (or DB restart).
+
+Sandbox sends but not receives: that’s normal; add a custom domain for routes/webhooks.
+
+Timing out: ensure your Replit URL is reachable via HTTPS and your Express route forwards multipart/form-data to FastAPI (your direct forwarder already solves this).
+
+“Sender not allowed”: add sender domain to EMAIL_ALLOWLIST or clear allowlist for testing.
+
+6) Quick todo checklist for you
+
+ Add MAILGUN_API_KEY, MAILGUN_SIGNING_KEY, MAILGUN_DOMAIN, MAILGUN_BASE_URL secrets
+
+ Verify sandbox recipient(s) for sending tests
+
+ Add custom domain + DNS + Route for receiving
+
+ Point Route to your Replit URL /api/email/mailgun
+
+ Run outbound test, then inbound-dev test, then real inbound test
+
+ Watch dashboard update in real time 🤘
+
+If you want, I can also drop a Mailgun route creation cURL (for their API) and a signed webhook replay script to test signatures locally. Tell me which you prefer, and I’ll paste it.

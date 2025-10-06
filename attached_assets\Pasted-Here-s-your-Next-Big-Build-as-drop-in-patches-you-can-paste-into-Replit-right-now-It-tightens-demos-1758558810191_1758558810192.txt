@@ -1,0 +1,331 @@
+Here’s your Next Big Build as drop-in patches you can paste into Replit right now. It tightens demos and makes operations smoother:
+
+Slack/Teams “rich” event formatting per event type
+
+Digests that honor subscriptions (sections filtered by notify_* + topic param)
+
+New-notification toaster (persistent inbox stays; now PMs get a live heads-up)
+
+Admin Ops panel (queue lengths & scheduler heartbeat)
+
+Sign-off: Resend link button (new token + email)
+
+Route aliases + small guards (survive /api stripping & dev auth quirks)
+
+I kept each piece small and isolated. Paste in, restart, done.
+
+1) Event formatters v2.2 — rich blocks per event
+
+Patch server/utils/events.py (replace only the emit_event body; keep imports):
+
+def _slack_blocks(title: str, fields: list[tuple[str,str]], details: dict):
+    def fld(label, val): return {"type":"mrkdwn","text":f"*{label}:* {val}"}
+    block_fields = [fld(k,v) for k,v in fields]
+    return [
+      {"type":"header","text":{"type":"plain_text","text":title,"emoji":True}},
+      {"type":"section","fields": block_fields[:10]},
+      {"type":"section","text":{"type":"mrkdwn","text":f"```{json.dumps(details, indent=2, ensure_ascii=False)}```"}} if details else {}
+    ]
+
+def _teams_card(title: str, facts: list[tuple[str,str]], details: dict):
+    return {
+      "@type":"MessageCard","@context":"https://schema.org/extensions",
+      "summary":title,"themeColor":"0078D4",
+      "sections":[{"activityTitle":title,"facts":[{"name":k,"value":v} for k,v in facts[:10]],
+                   "text": f"<pre>{json.dumps(details, indent=2)}</pre>"}]
+    }
+
+def emit_event(org_id: str, project_id: str | None, kind: str, details: dict):
+    sbs = get_service_supabase()
+    try:
+        r = sbs.table("org_webhooks").select("*").eq("org_id", org_id).single().execute()
+        cfg = r.data
+    except Exception:
+        cfg = None
+    if not cfg or not cfg.get("enabled"): return
+
+    # Per-event titles & fields
+    title = f"TEAIM: {kind}{(' • '+project_id) if project_id else ''}"
+    fields: list[tuple[str,str]] = []
+    if kind == "review.applied":
+        title = f"TEAIM: Review Applied • {details.get('table') or details.get('target_table')} {details.get('target_id') or ''}"
+        fields = [("Table", details.get("table") or details.get("target_table") or "—"),
+                  ("Target", details.get("target_id") or "—"),
+                  ("Update", details.get("update_id") or "—")]
+    elif kind == "signoff.doc.signed":
+        title = f"TEAIM: Document Signed • {details.get('doc_id')}"
+        fields = [("Doc", details.get("doc_id") or "—"),
+                  ("Signer", details.get("email") or "—"),
+                  ("Name", details.get("name") or "—")]
+    elif kind == "reminder.sent":
+        title = f"TEAIM: Reminder Sent • action {details.get('action_id')}"
+        fields = [("Action", details.get("action_id") or "—")]
+
+    pretty = json.dumps(details, indent=2, ensure_ascii=False)
+    payload = {"org_id": org_id, "project_id": project_id, "kind": kind, "details": details}
+
+    # Slack
+    if cfg.get("slack_url"):
+        blocks = _slack_blocks(title, fields, details)
+        _post(cfg["slack_url"], {"blocks": blocks})
+    # Teams
+    if cfg.get("teams_url"):
+        card = _teams_card(title, fields, details)
+        _post(cfg["teams_url"], card)
+    # Generic
+    if cfg.get("generic_url"):
+        _post(cfg["generic_url"], payload)
+
+2) Digests that honor subscriptions (notify_* + topics)
+2A) Recipients — backward-compatible with your current fields
+
+Patch the recipients helper you use for digests (likely in server/routers/digest.py):
+
+def _recipients(sb, org_id: str, project_id: str, period: str = "weekly"):
+    # roles to consider
+    roles = ['owner','admin','pm','lead']
+    ms = sb.table("project_members").select("user_id, role")\
+         .eq("org_id", org_id).eq("project_id", project_id).in_("role", roles).execute().data or []
+    user_ids = [m["user_id"] for m in ms]
+
+    # subscriptions, support both new and legacy field names
+    subs = sb.table("team_subscriptions").select("user_id,digest_weekly,digest_monthly,notify_actions,notify_risks,notify_decisions")\
+           .eq("org_id", org_id).eq("project_id", project_id).in_("user_id", user_ids).execute().data or []
+    # Some branches may have notify_weekly/notify_monthly; check both
+    if not subs:
+        subs = sb.table("team_subscriptions").select("user_id,notify_weekly,notify_monthly,notify_actions,notify_risks,notify_decisions")\
+               .eq("org_id", org_id).eq("project_id", project_id).in_("user_id", user_ids).execute().data or []
+
+    if period == "weekly":
+        allowed = {s["user_id"] for s in subs if (s.get("digest_weekly") or s.get("notify_weekly"))}
+    else:
+        allowed = {s["user_id"] for s in subs if (s.get("digest_monthly") or s.get("notify_monthly"))}
+
+    # resolve emails
+    emails: list[str] = []
+    if allowed:
+        try:
+            cs = sb.table("contacts").select("user_id,email").in_("user_id", list(allowed)).execute().data or []
+            emails.extend([c["email"] for c in cs if c.get("email")])
+        except Exception: ...
+        if not emails:
+            up = sb.table("users_profile").select("user_id,email").in_("user_id", list(allowed)).execute().data or []
+            emails.extend([u["email"] for u in up if u.get("email")])
+
+    test = os.getenv("DIGEST_TEST_EMAIL")
+    if not emails and test: emails = [test]
+    return sorted(set([e for e in emails if e]))
+
+2B) Preview with topics (already added) — add respect_notify flag
+
+Patch your preview route:
+
+@router.get("/preview")
+def preview(project_id: str = Query(...), topics: str | None = None, respect_notify: bool = True,
+            ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    wanted = set([t.strip() for t in (topics or "actions,risks,decisions").split(",") if t.strip()])
+    # When respect_notify, drop sections that have zero subscribers for that topic
+    subs = sb.table("team_subscriptions").select("notify_actions,notify_risks,notify_decisions")\
+           .eq("org_id", ctx.org_id).eq("project_id", project_id).execute().data or []
+    if respect_notify and subs:
+        mapk = {"actions":"notify_actions","risks":"notify_risks","decisions":"notify_decisions"}
+        for sec, key in mapk.items():
+            if sec in wanted and not any(s.get(key) for s in subs):
+                wanted.discard(sec)
+
+    counts = {}
+    if "actions" in wanted: counts["actions"] = cnt("actions")
+    if "risks"   in wanted: counts["risks"]   = cnt("risks")
+    if "decisions" in wanted: counts["decisions"] = cnt("decisions")
+    html = _digest_html_filtered(proj_code, counts, wanted)  # your filtered renderer
+    return {"html": html, "counts": counts, "topics": list(wanted)}
+
+3) New-notification toaster (on top of persistent inbox)
+
+Create client/src/components/NotificationToaster.tsx:
+
+import { useEffect, useRef, useState } from "react";
+import { useParams } from "react-router-dom";
+
+export default function NotificationToaster(){
+  const { projectId } = useParams();
+  const [toast,setToast]=useState<{title:string; when:number} | null>(null);
+  const lastCount = useRef<number>(0);
+
+  async function poll(){
+    try{
+      const r = await fetch(`/api/notifications/list?project_id=${projectId}`, { credentials:"include" });
+      if (!r.ok) return;
+      const d = await r.json();
+      const unread = (d.items||[]).filter((x:any)=>!x.is_read);
+      if (unread.length > lastCount.current){
+        const latest = unread[0];
+        setToast({ title: latest.title || "New notification", when: Date.now() });
+        setTimeout(()=>setToast(null), 4000);
+      }
+      lastCount.current = unread.length;
+    }catch{}
+  }
+
+  useEffect(()=>{ const t=setInterval(poll, 8000); return ()=>clearInterval(t); },[projectId]);
+
+  if (!toast) return null;
+  return (
+    <div className="fixed bottom-4 right-4 z-[80]">
+      <div className="px-3 py-2 bg-black text-white rounded shadow">{toast.title}</div>
+    </div>
+  );
+}
+
+
+Render it once in your authed layout (near <NotificationBell/>):
+
+<NotificationBell />
+<NotificationToaster />
+
+4) Admin Ops panel — queue lengths & heartbeat
+4A) Router: /api/admin/ops_status
+
+server/routers/ops_status.py
+
+from fastapi import APIRouter, Depends, Query
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+from datetime import datetime, timezone
+
+router = APIRouter(prefix="/api/admin", tags=["admin"])
+ADMIN = require_role({"owner","admin"})
+
+@router.get("/ops_status")
+def ops_status(project_id: str = Query(...), ctx: TenantCtx = Depends(ADMIN)):
+    sb = get_user_supabase(ctx)
+    def count(table, **kw):
+        q = sb.table(table).select("id", count="exact").eq("org_id", ctx.org_id)
+        if "project_id" in kw: q = q.eq("project_id", project_id)
+        r = q.execute()
+        return r.count or 0
+
+    status = {
+      "pending_updates": count("pending_updates", project_id=project_id),
+      "unread_notifications": (sb.table("notifications").select("id", count="exact").eq("org_id", ctx.org_id).eq("project_id", project_id).eq("is_read",False).execute().count or 0),
+      "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+    return {"ok": True, "status": status}
+
+
+Mount:
+
+from .routers import ops_status
+app.include_router(ops_status.router)
+
+4B) Admin Ops page
+
+client/src/pages/AdminOps.tsx
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { getJSON } from "@/lib/authFetch";
+
+export default function AdminOps(){
+  const { projectId } = useParams();
+  const [s,setS]=useState<any>(null);
+  async function load(){ setS(await getJSON(`/api/admin/ops_status?project_id=${projectId}`)); }
+  useEffect(()=>{ load(); const t=setInterval(load,10000); return ()=>clearInterval(t); },[projectId]);
+  if (!s) return <div className="p-6">Loading…</div>;
+  return (
+    <div className="p-6 space-y-3">
+      <h1 className="text-xl font-semibold">Ops Status</h1>
+      <div className="border rounded p-3">
+        <div className="text-sm">Pending Updates: <b>{s.status.pending_updates}</b></div>
+        <div className="text-sm">Unread Notifications: <b>{s.status.unread_notifications}</b></div>
+        <div className="text-xs text-muted-foreground">as of {new Date(s.status.timestamp).toLocaleString()}</div>
+      </div>
+    </div>
+  );
+}
+
+
+Route:
+
+{ path: "/projects/:projectId/admin/ops", element: <AdminOps/> }
+
+5) Sign-off Docs — Resend link
+
+Patch server/routers/signoff_docs.py (add endpoint):
+
+class ResendBody(BaseModel):
+    doc_id: str
+    email_to: str
+    expires_hours: int = 120
+
+@router.post("/resend")
+def resend(body: ResendBody, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sbs = get_service_supabase(); sb = get_user_supabase(ctx)
+    docq = sbs.table("signoff_docs").select("*").eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", body.doc_id).limit(1).execute().data
+    if not docq: raise HTTPException(404, "Doc not found")
+    tok = secrets.token_urlsafe(32)
+    exp = datetime.now(timezone.utc) + timedelta(hours=int(body.expires_hours))
+    sbs.table("signoff_doc_tokens").insert({
+        "org_id": ctx.org_id, "project_id": project_id, "doc_id": body.doc_id,
+        "token": tok, "signer_email": body.email_to, "expires_at": exp.isoformat()
+    }).execute()
+    base = os.getenv("APP_BASE_URL","").rstrip("/")
+    link = f"{base}/signoff/doc/{tok}"
+    ok, _ = send_guard(sb, ctx.org_id, project_id, "signoff", body.email_to)
+    if ok:
+        mailgun_send_html(body.email_to, f"Please review & sign: {docq[0]['name']}",
+                          f"<p><a href='{link}'>Open Document</a></p>")
+        log_send(sb, ctx.org_id, project_id, "signoff", body.email_to)
+    sbs.table("audit_events").insert({
+      "org_id": ctx.org_id, "project_id": project_id, "actor_id": ctx.user_id,
+      "kind": "signoff.doc.resent", "details": {"doc_id": body.doc_id, "email_to": body.email_to}
+    }).execute()
+    return {"ok": True, "token_link": link}
+
+
+UI (SignoffDocs list): add a small button:
+
+async function resend(docId:string){
+  await postJSON(`/api/signoff/docs/resend?project_id=${projectId}`, { doc_id: docId, email_to: emailTo||"" });
+  alert("Link resent");
+}
+{/* next to Request Sign button */}
+<button className="px-2 py-1 border rounded text-xs" onClick={()=>resend(d.id)} disabled={!emailTo}>Resend Link</button>
+
+6) Route aliases (if needed)
+
+Add alias blocks for new routers in server/main.py like you did before:
+
+from fastapi import APIRouter
+from .routers import notifications as notifications_router, export_dataroom as export_router, ops_status as ops_router
+
+notif_alias = APIRouter(prefix="/notifications")
+for r in notifications_router.router.routes:
+    notif_alias.add_api_route(r.path.replace("/api/notifications","") or "/", r.endpoint, methods=r.methods)
+app.include_router(notif_alias)
+
+export_alias = APIRouter(prefix="/export")
+for r in export_router.router.routes:
+    export_alias.add_api_route(r.path.replace("/api/export","") or "/", r.endpoint, methods=r.methods)
+app.include_router(export_alias)
+
+ops_alias = APIRouter(prefix="/admin")
+for r in ops_router.router.routes:
+    ops_alias.add_api_route(r.path.replace("/api/admin","") or "/", r.endpoint, methods=r.methods)
+app.include_router(ops_alias)
+
+7) 2-minute validation
+
+Events → Slack/Teams show sharp titles for review/sign-off/reminders.
+
+Digests → preview with respect_notify=true&topics=actions,risks omits sections no one subscribed to.
+
+Toaster → PM sees toast when a new notification arrives; inbox persists.
+
+Ops → shows pending updates & unread notices; auto-refreshes.
+
+Resend link → generates new token & email; audit “resent” appears.
+
+Aliases → /notifications/list and /api/notifications/list both resolve (dev).

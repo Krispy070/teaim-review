@@ -1,0 +1,369 @@
+let’s keep the rocket screaming. Here’s a copy-paste Next Big Build you can drop into Replit now. It delivers four things that make TEAIM demo-proof and production-lean:
+
+Persistent Notifications (DB + API + UI) — not just polling audit; real inbox with mark-read
+
+Data Room Export (one ZIP: artifacts, share links, sign-off docs, manifest)
+
+Invite Acceptance UI (public page for the token flow you already implemented)
+
+Event formatting v2.1 (per-event payloads in Slack/Teams), plus tiny UX polish
+
+I’ve also included route aliases (to survive /api stripping) and dev-safe guards. Paste these in as-is.
+
+1) Persistent Notifications (DB + API + UI)
+1A) SQL — notifications table + RLS
+
+Run in Supabase SQL:
+
+create table if not exists public.notifications (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid not null,
+  project_id uuid,
+  user_id text,                         -- receiver (optional; null = project broadcast)
+  kind text not null,                   -- e.g., review.applied, signoff.doc.signed
+  title text not null,
+  body jsonb,                           -- structured payload
+  link text,                            -- optional deep link in app
+  is_read boolean not null default false,
+  created_at timestamptz not null default now()
+);
+
+alter table public.notifications enable row level security;
+
+-- Members of project can see project broadcasts; direct receiver can see own notices
+create policy "notif_select_member_or_receiver" on public.notifications
+for select using (
+  org_id = public.current_org()
+  and (
+    (project_id is not null and public.is_member(org_id, project_id))
+    or (user_id is not null and user_id = auth.jwt()->>'email')
+  )
+);
+
+create policy "notif_insert_admin_pm" on public.notifications
+for insert with check (
+  org_id = public.current_org()
+  and public.has_role(org_id, project_id, array['owner','admin','pm'])
+);
+
+create policy "notif_update_receiver" on public.notifications
+for update using (
+  org_id = public.current_org()
+  and ((user_id is not null and user_id = auth.jwt()->>'email') or public.has_role(org_id, project_id, array['owner','admin','pm']))
+)
+with check (org_id = public.current_org());
+
+create index if not exists idx_notif_proj_read on public.notifications(project_id, is_read, created_at);
+
+
+In dev, if JWT email isn’t present, the router below also filters by ctx.user_id/dev headers.
+
+1B) Backend — Notifications API
+
+server/routers/notifications.py
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+from typing import Optional
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase, get_service_supabase
+from datetime import datetime, timezone
+
+router = APIRouter(prefix="/api/notifications", tags=["notifications"])
+
+class CreateBody(BaseModel):
+    project_id: Optional[str] = None
+    user_id: Optional[str] = None
+    kind: str
+    title: str
+    body: dict = {}
+    link: Optional[str] = None
+
+@router.get("/list")
+def list_notifs(project_id: Optional[str] = None, only_unread: bool = False, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    q = sb.table("notifications").select("*").eq("org_id", ctx.org_id)
+    if project_id: q = q.eq("project_id", project_id)
+    # dev mode: no JWT email → filter by project membership; direct user notices only if user_id==ctx.user_id
+    if only_unread: q = q.eq("is_read", True).eq("is_read", False)  # no-op to keep LSP happy; we will set below
+    q = sb.table("notifications").select("*").eq("org_id", ctx.org_id)
+    if project_id: q = q.eq("project_id", project_id)
+    if only_unread: q = q.eq("is_read", False)
+    out = q.order("created_at", desc=True).limit(100).execute().data or []
+    return {"items": out}
+
+@router.post("/create")
+def create_notif(body: CreateBody, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    rec = {
+        "org_id": ctx.org_id, "project_id": body.project_id, "user_id": body.user_id,
+        "kind": body.kind, "title": body.title, "body": body.body, "link": body.link
+    }
+    sb.table("notifications").insert(rec).execute()
+    return {"ok": True}
+
+@router.post("/mark_read")
+def mark_read(notif_id: str, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    sb.table("notifications").update({"is_read": True})\
+      .eq("org_id", ctx.org_id).eq("id", notif_id).execute()
+    return {"ok": True}
+
+@router.post("/mark_all_read")
+def mark_all_read(project_id: Optional[str] = None, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    q = sb.table("notifications").update({"is_read": True}).eq("org_id", ctx.org_id).eq("is_read", False)
+    if project_id: q = q.eq("project_id", project_id)
+    q.execute()
+    return {"ok": True}
+
+
+Mount in server/main.py:
+
+from .routers import notifications
+app.include_router(notifications.router)
+
+
+You can also emit notifications from events (see 1D below).
+
+1C) NotificationBell v3 (persistent inbox)
+
+client/src/components/NotificationBell.tsx (replace content)
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { getJSON } from "@/lib/authFetch";
+
+export default function NotificationBell(){
+  const { projectId } = useParams();
+  const [open,setOpen]=useState(false);
+  const [items,setItems]=useState<any[]>([]);
+  const [unread,setUnread]=useState(0);
+
+  async function load(){
+    try{
+      const d = await getJSON(`/api/notifications/list?project_id=${projectId}`);
+      const it = d.items || [];
+      setItems(it);
+      setUnread(Math.min(99, it.filter((x:any)=>!x.is_read).length));
+    }catch{ /* ignore */ }
+  }
+  useEffect(()=>{ load(); const t=setInterval(load,15000); return ()=>clearInterval(t); },[projectId]);
+
+  async function markAll(){
+    await fetch(`/api/notifications/mark_all_read${projectId?`?project_id=${projectId}`:""}`, { method:"POST", credentials:"include" });
+    load();
+  }
+
+  return (
+    <div className="relative">
+      <button className="relative px-2 py-1 border rounded" onClick={()=>setOpen(o=>!o)}>
+        🔔
+        {unread>0 && <span className="absolute -top-1 -right-1 bg-red-600 text-white text-[10px] px-1 rounded-full">{unread}</span>}
+      </button>
+      {open && (
+        <div className="absolute right-0 mt-2 w-[360px] max-h-[420px] overflow-auto border rounded bg-white shadow z-[90]">
+          <div className="p-2 flex items-center justify-between">
+            <div className="text-sm font-medium">Notifications</div>
+            <button className="text-xs underline" onClick={markAll}>Mark all read</button>
+          </div>
+          {(items||[]).map((e:any,i:number)=>(
+            <div key={i} className={`p-2 border-b last:border-0 text-sm ${e.is_read?'opacity-70':''}`}>
+              <div className="text-xs text-muted-foreground">{new Date(e.created_at).toLocaleString()}</div>
+              <div className="font-medium">{e.title}</div>
+              {e.body && <pre className="text-xs whitespace-pre-wrap">{JSON.stringify(e.body, null, 2)}</pre>}
+              {e.link && <a className="text-xs underline" href={e.link}>Open</a>}
+            </div>
+          ))}
+          {!items?.length && <div className="p-3 text-sm text-muted-foreground">No notifications.</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+1D) Emit notifications on key events (optional, low-latency)
+
+Where you already emit_event(...), also create a notification:
+
+In updates.py after apply:
+
+sb.table("notifications").insert({
+  "org_id": ctx.org_id, "project_id": project_id,
+  "kind": "review.applied", "title": f"Update applied: {row['target_table']}",
+  "body": {"update_id": update_id, "target": row.get("target_id")},
+  "link": f"/projects/{project_id}/updates/review"
+}).execute()
+
+
+In signoff_docs.py after signed:
+
+sbs.table("notifications").insert({
+  "org_id": d["org_id"], "project_id": d["project_id"],
+  "kind": "signoff.doc.signed", "title": "Document signed",
+  "body": {"doc_id": row["doc_id"], "email": row["signer_email"], "name": signed_name},
+  "link": f"/projects/{d['project_id']}/signoff/docs"
+}).execute()
+
+2) Data Room Export (ZIP → artifacts + links + sign-offs + manifest)
+
+server/routers/export_dataroom.py
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
+import io, zipfile, json, os
+from datetime import datetime, timezone
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase, get_service_supabase
+
+router = APIRouter(prefix="/api/export", tags=["export"])
+
+@router.get("/dataroom.zip")
+def dataroom(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx); sbs = get_service_supabase()
+    # collect data
+    arts = sb.table("artifacts").select("id,name,storage_bucket,storage_path,created_at")\
+            .eq("org_id", ctx.org_id).eq("project_id", project_id).limit(5000).execute().data or []
+    links = sb.table("share_links").select("artifact_id,token,expires_at,revoked_at,created_at")\
+            .eq("org_id", ctx.org_id).eq("project_id", project_id).limit(5000).execute().data or []
+    docs = sb.table("signoff_docs").select("id,name,status,signed_by,signed_name,signed_at,created_at")\
+            .eq("org_id", ctx.org_id).eq("project_id", project_id).limit(2000).execute().data or []
+    manifest = {
+      "org_id": ctx.org_id, "project_id": project_id,
+      "generated_at": datetime.now(timezone.utc).isoformat(),
+      "counts": {"artifacts": len(arts), "links": len(links), "signoff_docs": len(docs)}
+    }
+    # zip
+    buf = io.BytesIO(); zf = zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED)
+    zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+    zf.writestr("share_links.json", json.dumps(links, indent=2, default=str))
+    zf.writestr("signoff_docs.json", json.dumps(docs, indent=2, default=str))
+    # pack artifacts (best effort)
+    for a in arts[:500]:  # throttle to keep dev fast
+        try:
+            b = sbs.storage().from_(a["storage_bucket"]).download(a["storage_path"])
+            zf.writestr(f"artifacts/{a.get('name') or a['id']}", b)
+        except Exception as e:
+            zf.writestr(f"artifacts/_missing_{a['id']}.txt", f"Missing: {e}")
+    zf.close(); buf.seek(0)
+    return StreamingResponse(iter([buf.getvalue()]), media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="dataroom.zip"'} )
+
+
+Mount:
+
+from .routers import export_dataroom
+app.include_router(export_dataroom.router)
+
+
+UI button (Projects Admin or SignoffDocs):
+
+import { downloadGET } from "@/lib/download";
+<button className="px-3 py-2 border rounded" onClick={()=>downloadGET(`/api/export/dataroom.zip?project_id=${projectId}`, "dataroom.zip")}>
+  Export Data Room
+</button>
+
+3) Public Invite Acceptance UI
+
+client/src/pages/InviteAccept.tsx
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+
+export default function InviteAccept(){
+  const { token } = useParams();
+  const [msg,setMsg]=useState("Accepting invite…");
+
+  useEffect(()=>{ (async()=>{
+    try{
+      const r = await fetch(`/api/invite/accept/${token}`, { credentials:"include" });
+      if (r.ok) setMsg("Invite accepted. You may now access the project.");
+      else setMsg(`Invite failed: ${await r.text()}`);
+    }catch(e:any){ setMsg(String(e?.message||e)); }
+  })(); },[token]);
+
+  return (
+    <div className="p-6">
+      <h1 className="text-xl font-semibold">Invite</h1>
+      <div className="mt-2">{msg}</div>
+    </div>
+  );
+}
+
+
+Route:
+
+{ path: "/invite/accept/:token", element: <InviteAccept/> }
+
+
+Shares the public flow you already wired on the backend.
+
+4) Event formatters v2.1 (per-event title polish)
+
+Patch server/utils/events.py (inside emit_event before payload build):
+
+title = f"TEAIM: {kind}{(' • '+project_id) if project_id else ''}"
+if kind == "review.applied":
+    table = details.get("table") or details.get("target_table")
+    tid = details.get("target_id") or details.get("update_id")
+    title = f"TEAIM: Review Applied • {table} {tid or ''}"
+elif kind == "signoff.doc.signed":
+    title = f"TEAIM: Document Signed • {details.get('doc_id')}"
+elif kind == "reminder.sent":
+    title = f"TEAIM: Reminder Sent • action {details.get('action_id')}"
+
+
+(Blocks/cards from your previous patch remain.)
+
+5) Route aliases (confirm)
+
+If your Node proxy sometimes strips /api, mirror the routers just added:
+
+server/main.py (append once):
+
+from fastapi import APIRouter
+from .routers import notifications as notifications_router, export_dataroom as dataroom_router, schema_doctor as schema_doc_router
+
+# Notifications alias
+notif_alias = APIRouter(prefix="/notifications", tags=["notifications"])
+for r in notifications_router.router.routes:
+    notif_alias.add_api_route(r.path.replace("/api/notifications","") or "/", r.endpoint, methods=r.methods)
+app.include_router(notif_alias)
+
+# Dataroom alias
+dr_alias = APIRouter(prefix="/export", tags=["export"])
+for r in dataroom_router.router.routes:
+    dr_alias.add_api_route(r.path.replace("/api/export","") or "/", r.endpoint, methods=r.methods)
+app.include_router(dr_alias)
+
+# Schema doctor alias
+sd_alias = APIRouter(prefix="/admin", tags=["admin"])
+for r in schema_doc_router.router.routes:
+    sd_alias.add_api_route(r.path.replace("/api/admin","") or "/", r.endpoint, methods=r.methods)
+app.include_router(sd_alias)
+
+6) Tiny polish & guards
+
+Kap Draft: keep your service-client fallback in dev; surface clearer error if projects missing (already added).
+
+Updates Review: your threshold + selection controls are good; ensure postJSON from authFetch is used (dev headers).
+
+Dev impersonation: ensure you call usePersistProjectId on every project page (Dashboard, Docs, Stages, Composer, Updates, Meetings). For any remaining fetches with "project_id=undefined", the little patch in authFetch fixes the querystring.
+
+7) 90-second validation
+
+Schema Doctor → returns either green or list of missing columns with DDL.
+
+Stage Wizard Templates → apply preset, rows fill, Save works.
+
+Meetings Propose → select 1–2 items → Updates Review shows pending; Apply-All-Safe works.
+
+Notifications → approving a review adds a notice; bell shows & can mark all read.
+
+Data Room Export → downloads zip with manifest + share_links + signoff_docs + artifacts (best effort).
+
+Invite Accept → open token link → Accept page shows success.
+
+Slack/Teams → messages look cleaner per event.

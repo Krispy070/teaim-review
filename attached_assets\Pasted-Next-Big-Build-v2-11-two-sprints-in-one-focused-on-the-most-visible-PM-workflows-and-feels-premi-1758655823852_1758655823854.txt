@@ -1,0 +1,391 @@
+Next Big Build v2.11 — two sprints in one, focused on the most visible PM workflows and “feels-premium” UX:
+
+Request Sign-Off Modal v2 — searchable, multi-select recipients, signer flags respected
+
+Stage Editor date keyboard + undo — ↑/↓ for ±1 day, ⇧ for ±7, ⌃/Ctrl for ±30; undo stack & save toast
+
+Digest change lists link back into the app (deep links to items)
+
+Wellness per-user modal & export — last 10 check-ins + comments, sparkline, CSV per user
+
+(Bonus) Command Palette input always focused on open (fix for click quirk)
+
+All patches are copy-paste ready, Brand v2–aware, and dev-safe (silent fallbacks when a table is missing).
+
+v2.11.1 — Sign-Off Modal v2 + Stage Editor Date Keyboard
+1) Request Sign-Off Modal v2 (searchable, multi select, signer flags)
+1A) Backend — return signer flags & emails for a nicer UI
+
+server/routers/members_signers.py (replace or extend the previous endpoint)
+
+from fastapi import APIRouter, Depends, Query
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/members", tags=["members"])
+
+@router.get("/signers")
+def signers(project_id: str = Query(...), area: str | None = None,
+            ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        acc = sb.table("project_member_access").select("user_id,can_sign_all,sign_areas")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id).execute().data or []
+        # enrich with role/email
+        mem = sb.table("project_members").select("user_id,role").eq("org_id", ctx.org_id)\
+              .eq("project_id", project_id).execute().data or []
+        roles = {m["user_id"]: m.get("role") for m in mem}
+        prof = {}
+        try:
+            p = sb.table("users_profile").select("user_id,email").execute().data or []
+            prof = {x["user_id"]: x.get("email") for x in p}
+        except Exception: ...
+        out=[]
+        for a in acc:
+            uid = a["user_id"]
+            can = a.get("can_sign_all") or False
+            areas = a.get("sign_areas") or []
+            allowed = can or (area and area in areas)
+            out.append({
+                "user_id": uid,
+                "email": prof.get(uid, uid),
+                "role": roles.get(uid),
+                "can_sign_all": can,
+                "sign_areas": areas,
+                "allowed": allowed
+            })
+        # sort: allowed first, then role
+        out.sort(key=lambda x: (not x["allowed"], x.get("role","zz")))
+        return {"items": out}
+    except Exception:
+        return {"items": []}
+
+
+(Already mounted earlier.)
+
+1B) Frontend — modal v2 with searchable multi-select
+
+client/src/components/SignoffRequestModal.tsx (replace with v2)
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { getJSON } from "@/lib/authFetch";
+
+export default function SignoffRequestModal({
+  projectId, stageId, stageTitle, stageArea, onClose
+}:{
+  projectId: string; stageId: string; stageTitle?: string; stageArea?: string; onClose: ()=>void
+}){
+  const [signers,setSigners]=useState<{user_id:string;email:string;role?:string;allowed?:boolean;can_sign_all?:boolean;sign_areas?:string[]}[]>([]);
+  const [q,setQ]=useState("");
+  const [picked,setPicked]=useState<string[]>([]);
+  const [busy,setBusy]=useState(false);
+  const inputRef = useRef<HTMLInputElement|null>(null);
+
+  useEffect(()=>{ inputRef.current?.focus(); },[]);
+
+  useEffect(()=>{ (async()=>{
+    try{
+      const d = await getJSON(`/api/members/signers?project_id=${projectId}${stageArea?`&area=${encodeURIComponent(stageArea)}`:""}`);
+      setSigners(d.items||[]);
+    }catch{ setSigners([]); }
+  })(); },[projectId, stageArea]);
+
+  const hits = useMemo(()=>{
+    if (!q.trim()) return signers;
+    const qq = q.toLowerCase();
+    return signers.filter(s=> (s.email||"").toLowerCase().includes(qq) || (s.role||"").toLowerCase().includes(qq));
+  },[q, signers]);
+
+  function toggle(email:string){
+    setPicked(p => p.includes(email) ? p.filter(x=>x!==email) : [...p, email]);
+  }
+
+  async function send(){
+    if (!picked.length) return alert("Pick at least one recipient");
+    setBusy(true);
+    try{
+      // send one token email per recipient
+      for (const email of picked){
+        await fetch(`/api/stages/request_signoff?project_id=${projectId}`, {
+          method:"POST", credentials:"include", headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ stage_id: stageId, email_to: email, title: stageTitle, area: stageArea })
+        });
+      }
+      onClose(); alert(`Request sent to ${picked.length} recipient(s)`);
+    }catch(e:any){ alert(String(e?.message||e)); setBusy(false); }
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-[200]" onClick={onClose}>
+      <div className="mx-auto mt-[10vh] w-[560px] max-w-[95%] bg-white dark:bg-neutral-900 rounded shadow-xl border"
+           onClick={e=>e.stopPropagation()}>
+        <div className="p-3 border-b">
+          <div className="text-sm font-medium">Request Sign-Off</div>
+          <div className="text-xs text-muted-foreground">{stageTitle}{stageArea?` • ${stageArea}`:""}</div>
+        </div>
+        <div className="p-3 space-y-2">
+          <input ref={inputRef} className="border rounded p-2 w-full text-sm"
+                 placeholder="Search recipients (email or role)…" value={q} onChange={e=>setQ(e.target.value)} />
+          <div className="max-h-[40vh] overflow-auto border rounded">
+            {hits.map(s=>(
+              <label key={s.email} className="flex items-center gap-2 px-2 py-1 hover:bg-black/5 dark:hover:bg-white/5">
+                <input type="checkbox" checked={picked.includes(s.email)} onChange={()=>toggle(s.email)} />
+                <span className="text-sm">{s.email}</span>
+                <span className="text-[11px] text-muted-foreground ml-auto">
+                  {s.role || ""} {s.can_sign_all ? "• signer(all)" : s.sign_areas?.length ? `• signer(${s.sign_areas.join(",")})`:""}
+                </span>
+                {!s.allowed && <span className="text-[11px] text-red-500 ml-1">(area mismatch)</span>}
+              </label>
+            ))}
+            {!hits.length && <div className="p-2 text-xs text-muted-foreground">No matches</div>}
+          </div>
+        </div>
+        <div className="p-3 border-t flex justify-end gap-2">
+          <button className="brand-btn text-xs" onClick={onClose}>Cancel</button>
+          <button className="brand-btn text-xs swoosh" onClick={send} disabled={busy}>{busy?"Sending…":"Send"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+Use it in ProgramTimeline/PhaseTimeline (you already wired a simple modal) — just swap component import for the v2 modal. No further changes required.
+
+2) Stage Editor — date keyboard + undo
+
+Patch client/src/pages/Stages.tsx
+
+Add helpers:
+
+function iso(d:Date){ return d.toISOString().slice(0,10); }
+function adjustDate(isoStr:string, days:number){
+  try{ const d = new Date(isoStr+"T00:00:00"); d.setDate(d.getDate()+days); return iso(d); }
+  catch { return iso(new Date()); }
+}
+
+
+Maintain an undo stack per row:
+
+const [undoStack,setUndoStack] = useState<Record<string, any[]>>({});
+
+function pushUndo(id:string, patch:any){
+  setUndoStack(st => ({...st, [id]: [...(st[id]||[]), patch]}));
+}
+function popUndo(id:string){
+  const arr = undoStack[id]||[]; const last = arr.pop();
+  setUndoStack(st=>({...st, [id]: arr}));
+  return last;
+}
+
+
+In date inputs (start_date, end_date), add keyboard support:
+
+<input
+  type="date"
+  className={`border rounded p-2 ${dirty[s.id] ? 'ring-1 ring-[var(--brand-accent)]' : ''}`}
+  defaultValue={s.start_date || ""}
+  onChange={(e)=>{
+    markDirty(s.id); pushUndo(s.id, { start_date: s.start_date });
+    saveDebounced(s.id, { start_date: e.target.value });
+  }}
+  onKeyDown={(e)=>{
+    const step = e.shiftKey ? 7 : (e.ctrlKey||e.metaKey) ? 30 : 1;
+    if (e.key==="ArrowUp"){ e.preventDefault();
+      const v = adjustDate((e.currentTarget as HTMLInputElement).value || s.start_date || iso(new Date()), step);
+      (e.currentTarget as HTMLInputElement).value = v; markDirty(s.id); saveDebounced(s.id,{start_date:v});
+    }
+    if (e.key==="ArrowDown"){ e.preventDefault();
+      const v = adjustDate((e.currentTarget as HTMLInputElement).value || s.start_date || iso(new Date()), -step);
+      (e.currentTarget as HTMLInputElement).value = v; markDirty(s.id); saveDebounced(s.id,{start_date:v});
+    }
+    if (e.key==="Enter"){ e.preventDefault(); saveField(s.id,{start_date:(e.currentTarget as HTMLInputElement).value}); }
+    if (e.key==="Escape"){ e.preventDefault();
+      const prev = popUndo(s.id); if (prev && prev.start_date){
+        (e.currentTarget as HTMLInputElement).value = prev.start_date; setDirty(d=>({...d,[s.id]:false}));
+      }
+    }
+  }}
+/>
+
+
+Repeat for end_date using prev.end_date. You already have saveField, saveDebounced, and markDirty from the earlier patch.
+
+Add a small save toast (optional, near saveField):
+
+import { useToast } from "@/components/ui/use-toast";
+const { toast } = useToast();
+// inside saveField success:
+toast({ title:"Stage updated", description:`Saved ${Object.keys(patch).join(", ")}` });
+
+v2.11.2 — Digest deep links & Wellness per-user modal/export
+3) Digest change lists → deep links
+
+Patch server/routers/digest.py (where you build change lists)
+
+Add route mapper:
+
+base = os.getenv("APP_BASE_URL","").rstrip("/")
+def link_item(table, r):
+    rid = r.get("id")
+    if table=="actions":
+        return f"{base}/projects/{project_id}/actions/list#id={rid}"
+    if table in ("risks","decisions"):
+        return f"{base}/projects/{project_id}/admin/audit-timeline#id={rid}"
+    return f"{base}/projects/{project_id}/dashboard"
+
+
+Replace list items:
+
+def listify(title, arr, table):
+    if not arr: return ""
+    items = "".join([f"<li><a href='{link_item(table,a)}'>{(a.get('title') or a.get('id'))}</a> <span style='color:#666;font-size:12px'>{a.get('created_at')}</span></li>" for a in arr])
+    return f"<h3>Changes — {title}</h3><ul>{items}</ul>"
+
+html += listify("Actions", chg_actions, "actions")
+html += listify("Risks", chg_risks, "risks")
+html += listify("Decisions", chg_decis, "decisions")
+
+
+Do the same for “Closed since last week” if you added that list.
+
+4) Wellness per-user modal (history + comments + sparkline) + export
+4A) Backend — per-user history & export
+
+server/routers/wellness_user.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
+import io, csv
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/wellness", tags=["wellness"])
+
+@router.get("/user_history")
+def user_history(project_id: str = Query(...), user_id: str = Query(...),
+                 ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        rows = sb.table("team_wellness_comments").select("created_at,score,comment")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("user_id", user_id)\
+               .order("created_at", desc=True).limit(50).execute().data or []
+        return {"items": rows}
+    except Exception:
+        return {"items": []}
+
+@router.get("/user_export.csv")
+def user_export(project_id: str = Query(...), user_id: str = Query(...),
+                ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        rows = sb.table("team_wellness_comments").select("created_at,score,comment")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("user_id", user_id)\
+               .order("created_at", desc=True).limit(1000).execute().data or []
+    except Exception:
+        rows = []
+    s = io.StringIO(); w = csv.writer(s); w.writerow(["created_at","score","comment"])
+    for r in rows: w.writerow([r.get("created_at"), r.get("score"), r.get("comment")])
+    s.seek(0)
+    return StreamingResponse(iter([s.read()]), media_type="text/csv",
+      headers={"Content-Disposition": f'attachment; filename="wellness_{user_id[:8]}.csv"'})
+
+
+Mount in server/main.py:
+
+from .routers import wellness_user
+app.include_router(wellness_user.router)
+
+4B) Frontend — modal
+
+client/src/components/WellnessUserModal.tsx (new)
+
+import { useEffect, useState } from "react";
+import { getJSON } from "@/lib/authFetch";
+import { downloadGET } from "@/lib/download";
+
+export default function WellnessUserModal({
+  projectId, userId, email, onClose
+}:{ projectId:string; userId:string; email:string; onClose:()=>void }){
+  const [items,setItems]=useState<{created_at:string;score:number;comment?:string}[]>([]);
+  useEffect(()=>{ (async()=>{ try{
+    const d = await getJSON(`/api/wellness/user_history?project_id=${projectId}&user_id=${encodeURIComponent(userId)}`);
+    setItems(d.items||[]);
+  }catch{ setItems([]); } })(); },[projectId, userId]);
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-[200]" onClick={onClose}>
+      <div className="mx-auto mt-[10vh] w-[520px] max-w-[95%] bg-white dark:bg-neutral-900 rounded shadow-xl border"
+           onClick={e=>e.stopPropagation()}>
+        <div className="p-3 border-b flex items-center justify-between">
+          <div>
+            <div className="text-sm font-medium">Wellness — {email}</div>
+            <div className="text-xs text-muted-foreground">{items.length} records</div>
+          </div>
+          <button className="brand-btn text-xs" onClick={()=>downloadGET(`/api/wellness/user_export.csv?project_id=${projectId}&user_id=${encodeURIComponent(userId)}`, `wellness_${email}.csv`)}>Export CSV</button>
+        </div>
+        <div className="p-3 space-y-1 max-h-[50vh] overflow-auto">
+          {items.map((r,i)=>(
+            <div key={i} className="border rounded p-2 text-sm">
+              <div className="text-xs text-muted-foreground">{new Date(r.created_at).toLocaleString()} • score {r.score}</div>
+              <div>{r.comment || ""}</div>
+            </div>
+          ))}
+          {!items.length && <div className="text-xs text-muted-foreground">No history.</div>}
+        </div>
+        <div className="p-3 border-t flex justify-end">
+          <button className="brand-btn text-xs" onClick={onClose}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+4C) Launch modal from AdminWellness “Top Responders” list
+
+Patch client/src/components/AdminWellness.tsx:
+
+At the top:
+
+import WellnessUserModal from "@/components/WellnessUserModal";
+const [userModal,setUserModal]=useState<{user_id:string;email:string}|null>(null);
+
+
+In Top Responders list mapping:
+
+{(top||[]).map(t=>{
+  const em = (members.find(m=>m.user_id===t.user_id)?.email) || t.user_id;
+  return (
+    <div key={t.user_id} className="text-xs flex justify-between">
+      <button className="underline" onClick={()=>setUserModal({user_id:t.user_id, email:em})}>{em}</button>
+      <span>{t.checkins}</span>
+    </div>
+  );
+})}
+{userModal && <WellnessUserModal projectId={projectId!} userId={userModal.user_id} email={userModal.email} onClose={()=>setUserModal(null)} />}
+
+5) Command Palette — always focus input on open
+
+Patch client/src/components/CommandPalette.tsx (add a ref & effect)
+
+const inputRef = useRef<HTMLInputElement|null>(null);
+useEffect(()=>{ if (open) setTimeout(()=>inputRef.current?.focus(), 0); },[open]);
+// …
+<input ref={inputRef} /* …rest… */ />
+
+
+Now clicking or opening via ⌘K always drops focus into the search field.
+
+6) 2-minute validation
+
+Sign-Off modal shows a searchable, multi-select signer list; area-based flags respected
+
+Stage Editor: date fields respond to ↑/↓ (±1), ⇧ (±7), ⌃/Ctrl (±30); Esc undo; save toast shows
+
+Digests: change lists link back to exact items in TEAIM
+
+Wellness Admin: Top Responders clickable → per-user history modal + CSV
+
+Command Palette input focused on open; keyboard nav/enter selection good

@@ -1,0 +1,66 @@
+I can see in that screenshot that the Seed & Run button is still styled with a “brand-btn” type class, and that glow effect is coming from a box-shadow that was probably baked into the base class. For enterprise SaaS you want flat, crisp, and accessible—not neon gamer glow.
+
+Here’s a clean, drop-in fix:
+
+1. Update the button class
+
+Locate where brand-btn (or whatever you named that class) is defined (likely in client/src/pages/TestRunner.tsx or a shared stylesheet).
+
+Replace the glow style with a professional variant:
+
+.brand-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.55rem 1rem;
+  border-radius: 12px;
+  font-weight: 600;
+  background: var(--brand-orange);      /* your TEAIM accent */
+  border: 1px solid #C65115;            /* darker edge */
+  color: #0B0B0D;                       /* dark text for contrast */
+  box-shadow: none;                     /* kill glow */
+  transition: background .12s ease, border-color .12s ease, transform .06s ease;
+}
+
+.brand-btn:hover {
+  background: #ff752a;                  /* slight brighten */
+  border-color: #d85a1a;
+}
+
+.brand-btn:active {
+  transform: translateY(1px);           /* subtle tactile press */
+}
+
+.brand-btn:focus-visible {
+  outline: 2px solid var(--brand-gold); /* keeps keyboard users visible */
+  outline-offset: 2px;
+  box-shadow: none;
+}
+
+.brand-btn:disabled,
+.brand-btn[aria-busy="true"] {
+  opacity: .65;
+  cursor: not-allowed;
+}
+
+2. Optional Tailwind version
+
+If you’re using Tailwind instead of plain CSS, strip any shadow-* utilities off the button. Replace with something like:
+
+<button
+  className="inline-flex items-center justify-center rounded-xl bg-brand-orange border border-[#C65115] px-4 py-2 font-semibold text-[#0B0B0D] hover:bg-[#ff752a] hover:border-[#d85a1a] active:translate-y-px focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-gold disabled:opacity-65 disabled:cursor-not-allowed"
+>
+  Seed & Run
+</button>
+
+3. Why this works
+
+No glow: we rely on color and weight, not gimmicks.
+
+Hover/active/focus: all accessible, all brand-consistent.
+
+Focus-visible: keeps WCAG compliance without a distracting halo.
+
+Disabled state: obvious but not ugly.
+
+👉 Next time you click “Seed & Run,” you’ll see a solid orange button that darkens on hover and depresses slightly when clicked—no green glow. Very Workday/NVIDIA/enterprise vibe.

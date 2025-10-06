@@ -1,0 +1,256 @@
+Let’s keep momentum and ship Next Big Build v2.6.6 (stage confidence + export polish), copy-paste ready.
+
+This pack delivers:
+
+Stage Signed Overlay on the timeline (✅ marks signed stages; at-risk coloring respects signatures)
+
+KPI Delta Flash (animated number + quick highlight on change)
+
+Branded Meeting Summary Export (one-click, client-ready HTML)
+
+Logo proxy “redirect to signed” (optional) for production performance
+
+Everything is brand-flag aware and dev-safe.
+
+1) Stage Signed Overlay
+1A) Server — list signed stages
+
+server/routers/stages_signed.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/stages", tags=["stages"])
+
+@router.get("/signed")
+def signed_stages(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    # Prefer signoff docs with stage_id + status 'signed'
+    rows = sb.table("signoff_docs").select("stage_id")\
+            .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+            .eq("status","signed").not_.is_("stage_id","null").execute().data or []
+    # Fallback: method_metrics with kind 'stage.signed'
+    if not rows:
+        mm = sb.table("method_metrics").select("stage_id")\
+              .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+              .eq("kind","stage.signed").not_.is_("stage_id","null").execute().data or []
+        ids = list({m["stage_id"] for m in mm if m.get("stage_id")})
+    else:
+        ids = list({r["stage_id"] for r in rows if r.get("stage_id")})
+    return {"stage_ids": ids}
+
+
+Mount in server/main.py:
+
+from .routers import stages_signed
+app.include_router(stages_signed.router)
+
+1B) Server — include stage_id in metrics when signing a doc
+
+Patch server/routers/signoff_docs.py inside token_sign (after updating signoff_docs status):
+
+# Fetch stage_id from doc to record a proper stage signed metric
+doc_info = sbs.table("signoff_docs").select("stage_id,org_id,project_id")\
+             .eq("id", row["doc_id"]).limit(1).execute().data
+stg = doc_info and doc_info[0]
+try:
+    sbs.table("method_metrics").insert({
+      "org_id": stg["org_id"], "project_id": stg["project_id"],
+      "kind": "stage.signed", "stage_id": stg.get("stage_id"),
+      "stage_title": None, "stage_area": None, "value": None,
+      "meta": {"doc_id": row["doc_id"], "event":"signoff.doc.signed"}
+    }).execute()
+except Exception:
+    ...
+
+
+(This replaces the earlier generic metric with one tied to the stage if available.)
+
+1C) UI — PhaseTimeline overlay & signed awareness
+
+Patch client/src/components/PhaseTimeline.tsx:
+
+Add imports + signed fetch:
+
+import { getJSON } from "@/lib/authFetch";
+// ...
+const [signed,setSigned]=useState<Set<string>>(new Set());
+
+useEffect(()=>{ (async()=>{
+  try{
+    const d = await getJSON<{stage_ids:string[]}>(`/api/stages/signed?project_id=${projectId}`);
+    setSigned(new Set(d.stage_ids || []));
+  }catch{ setSigned(new Set()); }
+})(); },[projectId]);
+
+
+Adjust color/glow logic inside stages.map:
+
+const today = new Date();
+const signedNow = signed.has(s.id);
+const atRisk = !signedNow && s.end_date ? (new Date(s.end_date) < today) : false;
+
+const baseCol = colors[s.area||"default"] || colors.default;
+const col = signedNow ? "var(--brand-good)" : (atRisk ? "var(--brand-warn)" : baseCol);
+const glow = signedNow
+  ? "0 0 14px rgba(25,212,146,.35)"
+  : (s.status==="in_review" ? "0 0 14px rgba(29,228,255,0.35)" : (atRisk ? "0 0 14px rgba(255,211,79,.35)" : "none"));
+
+
+Add a small check badge (optional) just above the bar:
+
+<div className="relative h-2 bg-white/10 rounded" title={tip}>
+  <div className="absolute h-2 rounded"
+       style={{ left:`${pctStart}%`, width:`${pctW}%`, background: col, boxShadow: glow }} />
+  {signedNow && <div className="absolute -top-4" style={{ left:`calc(${pctStart}% + ${pctW/2}%)`}}>
+    <span style={{fontSize:'10px',color:'var(--brand-good)'}}>✔</span>
+  </div>}
+</div>
+
+
+Legend update (once, above list):
+
+<div className="flex items-center gap-3 text-xs mb-2">
+  <div className="flex items-center gap-1"><span style={{display:'inline-block',width:10,height:4,background:'var(--brand-good)'}}/> Signed</div>
+  <div className="flex items-center gap-1"><span style={{display:'inline-block',width:10,height:4,background:'var(--brand-warn)'}}/> At risk</div>
+</div>
+
+2) KPI Delta Flash (increase/decrease)
+
+Patch client/src/components/CountUp.tsx:
+
+import { useEffect, useRef, useState } from "react";
+
+export default function CountUp({
+  to=0, duration=600, flashOnChange=true
+}:{ to:number; duration?:number; flashOnChange?:boolean }){
+  const [value,setValue]=useState(0);
+  const [flash,setFlash]=useState<"up"|"down"|null>(null);
+  const last = useRef(0);
+
+  useEffect(()=>{
+    const start = performance.now(); const from = last.current; const delta = to - from;
+    if (flashOnChange && delta!==0) setFlash(delta>0 ? "up" : "down");
+    let raf:number;
+    const tick = (t:number)=>{
+      const p = Math.min(1, (t-start)/duration);
+      setValue(Math.round(from + delta * p));
+      if (p<1) raf = requestAnimationFrame(tick);
+      else { last.current = to; setTimeout(()=>setFlash(null), 500); }
+    };
+    cancelAnimationFrame(raf); raf = requestAnimationFrame(tick);
+    return ()=> cancelAnimationFrame(raf);
+  },[to,duration,flashOnChange]);
+
+  return <span className={flash==="up" ? "applied-glow" : ""}>{value}</span>;
+}
+
+
+Use it in DashboardV2 (already integrated); the glow will flash on increase.
+
+3) Branded Meeting Summary Export
+3A) Server — export endpoint
+
+server/routers/meetings_export.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import HTMLResponse
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+from ..brand.export_header import export_header_html
+
+router = APIRouter(prefix="/api/meetings", tags=["meetings"])
+
+@router.get("/export_html", response_class=HTMLResponse)
+def export_html(project_id: str = Query(...), artifact_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    # fetch summary
+    s = sb.table("summaries").select("actions,risks,decisions")\
+          .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("artifact_id", artifact_id)\
+          .single().execute().data
+    if not s:
+        return HTMLResponse("<html><body>No summary.</body></html>")
+
+    proj = sb.table("projects").select("code").eq("id", project_id).single().execute().data or {}
+    org = sb.table("org_branding").select("*").eq("org_id", ctx.org_id).single().execute().data or {}
+    header = export_header_html(org, proj.get("code") or project_id)
+
+    def listify(title, arr, fields):
+        if not arr: return ""
+        rows = "".join([f"<li>{(x.get('title') or x.get('text') or '—')}</li>" for x in arr])
+        return f"<h3>{title}</h3><ul>{rows}</ul>"
+
+    html = f"""
+    <html><head><meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="/static/print.css" />
+    </head><body style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:880px;margin:auto">
+      {header}
+      <h2>Meeting Summary</h2>
+      {listify("Actions", s.get("actions") or [], ["title","owner"])}
+      {listify("Risks", s.get("risks") or [], ["title","severity"])}
+      {listify("Decisions", s.get("decisions") or [], ["title","decided_by"])}
+    </body></html>
+    """
+    return HTMLResponse(html)
+
+
+Mount in server/main.py:
+
+from .routers import meetings_export
+app.include_router(meetings_export.router)
+
+3B) UI — export button on Meeting page (optional)
+
+In client/src/pages/Meetings.tsx, wherever you show a summary for artifactId:
+
+import { downloadGET } from "@/lib/download";
+// ...
+<button className="brand-btn text-xs" onClick={()=>downloadGET(`/api/meetings/export_html?project_id=${projectId}&artifact_id=${artifactId}`, "meeting_summary.html")}>
+  Export Summary (HTML)
+</button>
+
+4) Logo proxy: redirect to signed (optional)
+
+Set env to enable:
+
+BRAND_SIGNED_URLS=1
+
+
+Patch server/routers/branding.py in logo_get:
+
+Right before returning StreamingResponse, add:
+
+if os.getenv("BRAND_SIGNED_URLS","0")=="1":
+    try:
+        # Try create a short-lived signed URL and redirect
+        res = sbs.storage().from_(bucket).create_signed_url(path, 60)  # 60 sec
+        url = res.get("signedURL") or res.get("signed_url")
+        if url:
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse(url, status_code=302)
+    except Exception:
+        pass
+
+
+Now prod can use a CDN path; dev keeps streaming.
+
+5) Mounts (server) — confirm once
+from .routers import stages_signed, meetings_export, wellness_export
+app.include_router(stages_signed.router)
+app.include_router(meetings_export.router)
+app.include_router(wellness_export.router)
+
+6) 90-second verification
+
+Timeline shows green ✔ for signed stages; overdue turns off once signed.
+
+KPI numbers flash briefly when new data arrives.
+
+“Export Summary (HTML)” on a meeting shows branded export page.
+
+Logos never stall the page; if they fail, they silently hide; cache works.
+
+(Optional) BRAND_SIGNED_URLS=1 → /branding/logo redirects to a signed URL.

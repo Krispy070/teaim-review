@@ -1,0 +1,429 @@
+define roles,
+
+route users to the right role home (via the top-left logo),
+
+add skeleton home pages for each role,
+
+wire a Team Access role editor, and
+
+add system-wide admin metrics for you (rev/usage hooks included).
+
+I kept names generic so you can paste without hunting cross-refs.
+
+0) Shared Role Model (client + server)
+client/src/roles.ts
+export type Role =
+  | "system_admin"
+  | "project_admin"
+  | "leadership_customer"
+  | "leadership_partner"
+  | "functional_lead"   // scoped by area in user.roleScopes?.areas
+  | "data_lead"         // partner/customer
+  | "worker";
+
+export type RoleScopes = {
+  areas?: string[];       // e.g., ["HCM","FIN"]
+  projectId?: string;     // explicit lock to a project
+};
+
+export type Me = {
+  id: string;
+  email: string;
+  role: Role;
+  roleScopes?: RoleScopes;
+  orgType?: "customer" | "partner";
+  defaultProjectId?: string;
+};
+
+export const homeForRole = (me: Me): string => {
+  const pid = me.roleScopes?.projectId || me.defaultProjectId || "current";
+  switch (me.role) {
+    case "system_admin": return "/home/admin";
+    case "project_admin": return `/home/pm/${pid}`;
+    case "leadership_customer": return `/home/exec/${pid}`;      // one project
+    case "leadership_partner":  return `/home/exec-partner`;     // global view
+    case "functional_lead":     return `/home/functional/${pid}`;
+    case "data_lead":           return `/home/data/${pid}`;
+    case "worker":              return `/home/worker/${pid}`;
+    default:                    return `/dashboard`;
+  }
+};
+
+1) Top-Left Logo → Role Home
+Update your header component (where the logo is)
+// client/src/components/HeaderBar.tsx
+import { useMe } from "@/state/useMe";
+import { homeForRole } from "@/roles";
+import { useNavigate } from "react-router-dom";
+
+export function HeaderBar(/* existing props */) {
+  const me = useMe();
+  const navigate = useNavigate();
+
+  return (
+    <header className="header ...">
+      <div className="mx-auto ...">
+        {/* Left: TEAIM brand */}
+        <button
+          aria-label="Home"
+          onClick={() => me && navigate(homeForRole(me), { replace: true })}
+          className="flex items-center gap-2 shrink-0"
+          style={{ background:"transparent", border:"0", cursor:"pointer" }}
+        >
+          <img src={/* new logo url */ "/brand/teaim-mark.svg"} alt="TEAIM" className="h-7 w-auto" />
+        </button>
+        {/* ...rest of header unchanged */}
+      </div>
+    </header>
+  );
+}
+
+
+Swap /brand/teaim-mark.svg to your updated square mark.
+
+2) Client Routes — Role Home Pages
+client/src/pages/home/* (skeletons you can style later)
+// client/src/pages/home/AdminHome.tsx
+export default function AdminHome() {
+  return (
+    <div className="mx-auto max-w-[1320px] grid gap-4">
+      <div className="card p-4">
+        <h3 className="card__title">System Overview</h3>
+        <ul className="grid md:grid-cols-3 gap-3 mt-3">
+          <li className="card p-4"><b>Customers</b><div id="sys-customers" /></li>
+          <li className="card p-4"><b>Active Projects</b><div id="sys-projects" /></li>
+          <li className="card p-4"><b>Users</b><div id="sys-users" /></li>
+        </ul>
+      </div>
+      <div className="grid md:grid-cols-2 gap-4">
+        <div className="card p-4"><h4 className="card__title">Revenue & Projections</h4><div id="sys-revenue" /></div>
+        <div className="card p-4"><h4 className="card__title">Feedback Stream</h4><div id="sys-feedback" /></div>
+      </div>
+      <div className="card p-4"><h4 className="card__title">Ingestion / LLM Health</h4><div id="sys-health" /></div>
+    </div>
+  );
+}
+
+// client/src/pages/home/PmHome.tsx
+export default function PmHome() {
+  return (
+    <div className="mx-auto max-w-[1320px] grid gap-4">
+      <div className="grid md:grid-cols-4 gap-3">
+        <div className="card p-4"><b>Risks Open</b><div id="pm-risks" /></div>
+        <div className="card p-4"><b>Overdue Actions</b><div id="pm-actions" /></div>
+        <div className="card p-4"><b>Sign-offs Pending</b><div id="pm-signoffs" /></div>
+        <div className="card p-4"><b>Team Wellness</b><div id="pm-wellness" /></div>
+      </div>
+      <div className="card p-4"><h4 className="card__title">Staged Items Requiring Review</h4><div id="pm-review-queue" /></div>
+      <div className="grid md:grid-cols-2 gap-4">
+        <div className="card p-4"><h4 className="card__title">Timeline</h4><div id="pm-timeline" /></div>
+        <div className="card p-4"><h4 className="card__title">Reports</h4><div id="pm-reports" /></div>
+      </div>
+    </div>
+  );
+}
+
+// client/src/pages/home/ExecCustomerHome.tsx
+export default function ExecCustomerHome() {
+  return (
+    <div className="mx-auto max-w-[1320px] grid gap-4">
+      <div className="grid md:grid-cols-4 gap-3">
+        <div className="card p-4"><b>Milestone RAG</b><div id="exec-rag" /></div>
+        <div className="card p-4"><b>Budget vs Burn</b><div id="exec-burn" /></div>
+        <div className="card p-4"><b>Top Risks</b><div id="exec-risks" /></div>
+        <div className="card p-4"><b>Next Gates</b><div id="exec-gates" /></div>
+      </div>
+      <div className="card p-4"><h4 className="card__title">Weekly Digest</h4><div id="exec-digest" /></div>
+      <div className="card p-4"><h4 className="card__title">Exports</h4><button className="k-btn">Download PPTX</button></div>
+    </div>
+  );
+}
+
+// client/src/pages/home/ExecPartnerHome.tsx
+export default function ExecPartnerHome() {
+  return (
+    <div className="mx-auto max-w-[1320px] grid gap-4">
+      <div className="grid md:grid-cols-4 gap-3">
+        <div className="card p-4"><b>Active Customers</b><div id="p-exec-customers" /></div>
+        <div className="card p-4"><b>Projects (RAG)</b><div id="p-exec-projects" /></div>
+        <div className="card p-4"><b>Resource Utilization</b><div id="p-exec-res" /></div>
+        <div className="card p-4"><b>MRR / Pipeline</b><div id="p-exec-rev" /></div>
+      </div>
+      <div className="card p-4"><h4 className="card__title">Feedback</h4><div id="p-exec-feedback" /></div>
+    </div>
+  );
+}
+
+// client/src/pages/home/FunctionalHome.tsx
+export default function FunctionalHome() {
+  return (
+    <div className="mx-auto max-w-[1320px] grid gap-4">
+      <div className="card p-4"><h4 className="card__title">My Area (BPs & Actions)</h4><div id="fl-areas" /></div>
+      <div className="grid md:grid-cols-2 gap-4">
+        <div className="card p-4"><h4 className="card__title">Pending Tests</h4><div id="fl-tests" /></div>
+        <div className="card p-4"><h4 className="card__title">Artifacts</h4><div id="fl-artifacts" /></div>
+      </div>
+    </div>
+  );
+}
+
+// client/src/pages/home/DataLeadHome.tsx
+export default function DataLeadHome() {
+  return (
+    <div className="mx-auto max-w-[1320px] grid gap-4">
+      <div className="grid md:grid-cols-3 gap-4">
+        <div className="card p-4"><b>Loads</b><div id="data-loads" /></div>
+        <div className="card p-4"><b>Defects</b><div id="data-defects" /></div>
+        <div className="card p-4"><b>Validation</b><div id="data-validation" /></div>
+      </div>
+      <div className="card p-4"><h4 className="card__title">Conversion Plan</h4><div id="data-plan" /></div>
+    </div>
+  );
+}
+
+// client/src/pages/home/WorkerHome.tsx
+export default function WorkerHome() {
+  return (
+    <div className="mx-auto max-w-[900px] grid gap-4">
+      <div className="card p-4"><h4 className="card__title">My Tasks</h4><div id="worker-tasks" /></div>
+      <div className="card p-4"><h4 className="card__title">Docs I Need</h4><div id="worker-docs" /></div>
+    </div>
+  );
+}
+
+Wire routes
+// client/src/routes/index.tsx
+import { Route } from "react-router-dom";
+import AdminHome from "@/pages/home/AdminHome";
+import PmHome from "@/pages/home/PmHome";
+import ExecCustomerHome from "@/pages/home/ExecCustomerHome";
+import ExecPartnerHome from "@/pages/home/ExecPartnerHome";
+import FunctionalHome from "@/pages/home/FunctionalHome";
+import DataLeadHome from "@/pages/home/DataLeadHome";
+import WorkerHome from "@/pages/home/WorkerHome";
+
+<Route path="/home/admin" element={<AdminHome />} />
+<Route path="/home/pm/:projectId" element={<PmHome />} />
+<Route path="/home/exec/:projectId" element={<ExecCustomerHome />} />
+<Route path="/home/exec-partner" element={<ExecPartnerHome />} />
+<Route path="/home/functional/:projectId" element={<FunctionalHome />} />
+<Route path="/home/data/:projectId" element={<DataLeadHome />} />
+<Route path="/home/worker/:projectId" element={<WorkerHome />} />
+
+3) Team Access — Role Assignment (client UI + server)
+Server: read/update roles
+server/routers/roles.py
+from fastapi import APIRouter, Body, HTTPException, Query
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
+from db import pg
+
+router = APIRouter(prefix="/api", tags=["roles"])
+
+class RoleBody(BaseModel):
+    userId: str
+    role: str
+    roleScopes: Optional[Dict[str, Any]] = None
+    defaultProjectId: Optional[str] = None
+
+@router.get("/roles/users")
+def list_users(projectId: Optional[str] = Query(None)):
+    if projectId:
+        rows = pg.query("""
+           select u.id, u.email, u.role, u.role_scopes, u.default_project_id, u.org_type
+           from users u
+           join memberships m on m.user_id=u.id and m.project_id=%s
+        """,(projectId,))
+    else:
+        rows = pg.query("""select id, email, role, role_scopes, default_project_id, org_type from users""",())
+    return {"ok": True, "items": rows}
+
+@router.post("/roles/set")
+def set_role(body: RoleBody):
+    exists = pg.one("select id from users where id=%s", (body.userId,))
+    if not exists: raise HTTPException(404, "user not found")
+    pg.exec("""update users set role=%s, role_scopes=%s::jsonb, default_project_id=%s where id=%s""",
+            (body.role, pg.json(body.roleScopes or {}), body.defaultProjectId, body.userId))
+    return {"ok": True}
+
+
+Assumes users.role (text), users.role_scopes (jsonb), users.default_project_id exist. If not, add in your migration/bootstrap.
+
+DDL (if needed)
+
+alter table users add column if not exists role text default 'worker';
+alter table users add column if not exists role_scopes jsonb default '{}'::jsonb;
+alter table users add column if not exists default_project_id uuid;
+alter table users add column if not exists org_type text; -- 'customer'|'partner'
+
+
+Mount
+
+# server/main.py
+from routers.roles import router as roles_router
+app.include_router(roles_router)
+
+Client: Team Access role editor
+client/src/pages/admin/TeamAccess.tsx
+import * as React from "react";
+import { useQuery } from "@tanstack/react-query";
+
+export default function TeamAccess({ projectId }:{ projectId?:string }) {
+  const { data, refetch } = useQuery(["roles-users", projectId], async () => {
+    const qs = new URLSearchParams(); if (projectId) qs.set("projectId", projectId);
+    const r = await fetch(`/api/roles/users?${qs.toString()}`); return r.json();
+  });
+  const users = data?.items || [];
+
+  const updateRole = async (userId:string, role:string, roleScopes:any={}, defaultProjectId?:string) => {
+    await fetch(`/api/roles/set`, {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ userId, role, roleScopes, defaultProjectId })
+    });
+    refetch();
+  };
+
+  return (
+    <div className="mx-auto max-w-[1200px] card p-4">
+      <h3 className="card__title mb-3">Team Access & Roles</h3>
+      <table className="min-w-full text-sm">
+        <thead className="text-text-muted">
+          <tr><th className="text-left py-2">User</th><th className="text-left">Org Type</th><th className="text-left">Role</th><th className="text-left">Scopes</th><th className="text-left">Default Project</th><th /></tr>
+        </thead>
+        <tbody>
+          {users.map((u:any)=>(
+            <tr key={u.id} className="border-t border-border align-top">
+              <td className="py-2">{u.email}</td>
+              <td className="py-2">{u.org_type || "—"}</td>
+              <td className="py-2">
+                <select defaultValue={u.role} className="k-input"
+                  onChange={e=>updateRole(u.id, e.target.value, u.role_scopes, u.default_project_id)}>
+                  <option value="system_admin">System Admin</option>
+                  <option value="project_admin">Project Admin / PM</option>
+                  <option value="leadership_customer">Leadership (Customer)</option>
+                  <option value="leadership_partner">Leadership (Partner)</option>
+                  <option value="functional_lead">Functional Lead</option>
+                  <option value="data_lead">Data Lead</option>
+                  <option value="worker">General Worker</option>
+                </select>
+              </td>
+              <td className="py-2">
+                <details>
+                  <summary className="cursor-pointer text-text-muted">Edit</summary>
+                  <ScopesEditor user={u} onSave={(scopes, pid)=>updateRole(u.id, u.role, scopes, pid)} />
+                </details>
+              </td>
+              <td className="py-2">{u.default_project_id || "—"}</td>
+              <td className="py-2 text-right">
+                <button className="k-btn" onClick={()=>updateRole(u.id, u.role, u.role_scopes, u.default_project_id)}>Save</button>
+              </td>
+            </tr>
+          ))}
+          {users.length===0 && <tr><td colSpan={6} className="py-6 text-center text-text-muted">No users.</td></tr>}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ScopesEditor({ user, onSave }:{ user:any; onSave:(scopes:any, defaultProjectId?:string)=>void }) {
+  const [areas, setAreas] = React.useState<string>((user.role_scopes?.areas||[]).join(","));
+  const [pid, setPid] = React.useState<string>(user.default_project_id || "");
+  return (
+    <div className="mt-2 p-2 rounded-lg bg-[#161821] border border-border">
+      <label className="flex flex-col gap-1 mb-2">
+        <span className="text-xs text-text-muted">Areas (comma)</span>
+        <input className="k-input" value={areas} onChange={e=>setAreas(e.target.value)} />
+      </label>
+      <label className="flex flex-col gap-1 mb-2">
+        <span className="text-xs text-text-muted">Default Project ID</span>
+        <input className="k-input" value={pid} onChange={e=>setPid(e.target.value)} />
+      </label>
+      <button className="k-btn k-btn--primary" onClick={()=>{
+        const scopes = { areas: areas.split(",").map((s)=>s.trim()).filter(Boolean), projectId: pid || undefined };
+        onSave(scopes, pid || undefined);
+      }}>Save Scopes</button>
+    </div>
+  );
+}
+
+
+Add a nav link for admins:
+
+// client/src/components/Sidebar.tsx (admin section)
+{me?.role === "system_admin" || me?.role === "project_admin" ? (
+  <NavLink to="/admin/team-access" className="item"><span className="icon">👥</span><span>Team Access</span></NavLink>
+) : null}
+
+
+Add route:
+
+// client/src/routes/index.tsx
+import TeamAccess from "@/pages/admin/TeamAccess";
+<Route path="/admin/team-access" element={<TeamAccess projectId={project.id} />} />
+
+4) System-wide Admin Metrics (server)
+server/routers/system_stats.py
+from fastapi import APIRouter
+from db import pg
+
+router = APIRouter(prefix="/api", tags=["system"])
+
+@router.get("/system/overview")
+def system_overview():
+    customers = pg.one("select count(distinct org_id)::int as c from projects",()).get("c",0)
+    projects  = pg.one("select count(*)::int as c from projects where status<>'archived'",()).get("c",0)
+    users     = pg.one("select count(*)::int as c from users",()).get("c",0)
+    # Replace with your finance tables when ready
+    mrr       = pg.one("select coalesce(sum(mrr),0)::numeric as v from revenue",()).get("v",0) if pg.table_exists("revenue") else 0
+    return {"ok": True, "customers": customers, "projects": projects, "users": users, "mrr": float(mrr)}
+
+@router.get("/system/feedback")
+def system_feedback():
+    rows = pg.query("""
+      select created_at as "createdAt", user_id as "userId", message
+      from feedback order by created_at desc limit 50
+    """,()) if pg.table_exists("feedback") else []
+    return {"ok": True, "items": rows}
+
+
+Mount
+
+# server/main.py
+from routers.system_stats import router as system_stats_router
+app.include_router(system_stats_router)
+
+
+Client wiring (AdminHome)
+
+// admin home quick fetch example (drop in useEffect)
+useEffect(()=>{ (async ()=>{
+  const o = await fetch("/api/system/overview").then(r=>r.json());
+  if (o?.ok) {
+    (document.getElementById("sys-customers")!).innerHTML = `<div class='text-2xl font-bold'>${o.customers}</div>`;
+    (document.getElementById("sys-projects")!).innerHTML = `<div class='text-2xl font-bold'>${o.projects}</div>`;
+    (document.getElementById("sys-users")!).innerHTML = `<div class='text-2xl font-bold'>${o.users}</div>`;
+    (document.getElementById("sys-revenue")!).innerHTML = `<div class='text-2xl font-bold'>$${(o.mrr||0).toLocaleString()}</div>`;
+  }
+})(); }, []);
+
+5) Leadership rules (as requested)
+
+Customer Leadership/SteerCo → only the current project (/home/exec/:projectId).
+
+Partner Leadership/SteerCo → global view (/home/exec-partner), plus (optional later) a project selector card that deep-links to a project-specific exec page.
+
+Enforce with a simple guard in the exec route (optional):
+
+// client/route guard example
+if (me.role === "leadership_customer" && route !== `/home/exec/${projectId}`) navigate(`/home/exec/${projectId}`, { replace: true });
+
+6) Quick “Did we wire it?” checklist
+
+Clicking the TEAIM logo takes you to the correct home by role.
+
+Team Access page lets you set role + scopes + default project.
+
+Exec Customer sees /home/exec/:projectId only; Exec Partner sees /home/exec-partner.
+
+System Admin home shows customers/projects/users/MRR and feedback stream blocks.

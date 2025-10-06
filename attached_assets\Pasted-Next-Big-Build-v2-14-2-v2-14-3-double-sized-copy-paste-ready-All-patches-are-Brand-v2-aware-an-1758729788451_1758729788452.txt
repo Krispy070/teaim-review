@@ -1,0 +1,301 @@
+Next Big Build v2.14.2 + v2.14.3 (double-sized, copy-paste ready)
+
+All patches are Brand v2–aware and dev-safe (endpoints return safe empties if a table/column is missing).
+
+v2.14.2 — Workstreams area hub (open items, next meeting, area export)
+1) Backend — Open items by area, next-meeting, area export (ZIP)
+1A) Open Actions by area (dev-safe)
+
+server/routers/actions_by_area.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/actions", tags=["actions"])
+
+@router.get("/by_area")
+def by_area(project_id: str = Query(...), area: str = Query(...), status: str = "open",
+            ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        q = sb.table("actions").select("id,title,owner,area,status,created_at")\
+             .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("area", area)
+        if status: q = q.eq("status", status)
+        rows = q.order("created_at", desc=True).limit(200).execute().data or []
+        return {"items": rows}
+    except Exception:
+        return {"items": []}
+
+
+Mount in server/main.py:
+
+from .routers import actions_by_area
+app.include_router(actions_by_area.router)
+
+1B) Area meta (next-meeting) + area ZIP package
+
+server/routers/area_tools.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse, HTMLResponse
+from pydantic import BaseModel
+from datetime import datetime, timezone
+import io, zipfile, csv, json
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+from ..brand.export_header import export_header_html
+
+router = APIRouter(prefix="/api/area", tags=["areas"])
+PM_PLUS = require_role({"owner","admin","pm"})
+
+class NextMeetingBody(BaseModel):
+    area: str
+    starts_at: str  # ISO string
+
+@router.post("/next_meeting")
+def set_next_meeting(body: NextMeetingBody, project_id: str = Query(...),
+                     ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    try:
+        sb.table("area_meta").upsert({
+            "org_id": ctx.org_id, "project_id": project_id, "area": body.area,
+            "next_meeting": body.starts_at
+        }, on_conflict="org_id,project_id,area").execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+@router.get("/next_meeting")
+def get_next_meeting(project_id: str = Query(...), area: str = Query(...),
+                     ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        r = sb.table("area_meta").select("next_meeting").eq("org_id", ctx.org_id)\
+             .eq("project_id", project_id).eq("area", area).single().execute().data or {}
+        return {"next_meeting": r.get("next_meeting")}
+    except Exception:
+        return {"next_meeting": None}
+
+@router.get("/export.zip")
+def export_area_zip(project_id: str = Query(...), area: str = Query(...),
+                    ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    buf = io.BytesIO(); z = zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED)
+    # brand header
+    org = sb.table("org_branding").select("*").eq("org_id", ctx.org_id).single().execute().data or {}
+    proj = sb.table("projects").select("code").eq("id", project_id).single().execute().data or {}
+    hdr = export_header_html(org, proj.get("code") or project_id)
+
+    # manifest
+    manifest = {"org_id": str(ctx.org_id), "project_id": project_id, "area": area,
+                "generated_at": datetime.now(timezone.utc).isoformat()}
+    z.writestr("manifest.json", json.dumps(manifest, indent=2))
+    z.writestr("manifest.html", f"<html><body>{hdr}<h2>Area Package — {area}</h2><pre>{json.dumps(manifest,indent=2)}</pre></body></html>")
+
+    def csv_write(name, cols, rows):
+        s = io.StringIO(); w = csv.writer(s); w.writerow(cols)
+        for r in rows: w.writerow([r.get(c) for c in cols])
+        z.writestr(name, s.getvalue())
+
+    # actions/risks/decisions/workbooks/workbook_runs (best effort)
+    try:
+        a = sb.table("actions").select("id,title,owner,area,status,created_at").eq("org_id",ctx.org_id)\
+             .eq("project_id",project_id).eq("area",area).limit(5000).execute().data or []
+        csv_write("actions.csv", ["id","title","owner","area","status","created_at"], a)
+    except Exception: ...
+    try:
+        r = sb.table("risks").select("id,title,owner,area,status,created_at").eq("org_id",ctx.org_id)\
+             .eq("project_id",project_id).eq("area",area).limit(5000).execute().data or []
+        csv_write("risks.csv", ["id","title","owner","area","status","created_at"], r)
+    except Exception: ...
+    try:
+        d = sb.table("decisions").select("id,title,decided_by,area,status,created_at").eq("org_id",ctx.org_id)\
+             .eq("project_id",project_id).eq("area",area).limit(5000).execute().data or []
+        csv_write("decisions.csv", ["id","title","decided_by","area","status","created_at"], d)
+    except Exception: ...
+    try:
+        w = sb.table("workbooks").select("id,name,area,asof_date,due_date,iterations_planned,iterations_done,status").eq("org_id",ctx.org_id)\
+             .eq("project_id",project_id).eq("area",area).limit(2000).execute().data or []
+        csv_write("workbooks.csv", ["id","name","area","asof_date","due_date","iterations_planned","iterations_done","status"], w)
+        # runs for those
+        ids = [x.get("id") for x in w if x.get("id")]
+        if ids:
+            runs = sb.table("workbook_runs").select("workbook_id,run_no,pulled_on,rows,status").eq("org_id",ctx.org_id)\
+                   .eq("project_id",project_id).in_("workbook_id", ids).order("run_no",desc=True).limit(5000).execute().data or []
+            csv_write("workbook_runs.csv", ["workbook_id","run_no","pulled_on","rows","status"], runs)
+    except Exception: ...
+    z.close(); buf.seek(0)
+    return StreamingResponse(iter([buf.getvalue()]), media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename=\"area_{area.replace(' ','_')}.zip\""})
+
+
+Mount in server/main.py:
+
+from .routers import area_tools
+app.include_router(area_tools.router)
+
+2) Frontend — Workstream Area page (open items + meeting + export)
+
+Patch client/src/pages/WorkstreamArea.tsx (augment)
+
+import { downloadGET } from "@/lib/download";
+
+const [next,setNext]=useState<string>("");
+useEffect(()=>{ (async()=>{ try{
+  const n = await getJSON(`/api/area/next_meeting?project_id=${projectId}&area=${encodeURIComponent(area)}`);
+  setNext(n.next_meeting||"");
+}catch{} })(); },[projectId, area]);
+
+async function saveNext(){
+  if (!next) return;
+  await postJSON(`/api/area/next_meeting?project_id=${projectId}`, { area, starts_at: next });
+  setSum({ ...sum, next_meeting: next });
+}
+
+// Open items inline (fetch from new endpoint)
+const [openItems,setOpenItems]=useState<any[]>([]);
+useEffect(()=>{ (async()=>{ try{
+  const d = await getJSON(`/api/actions/by_area?project_id=${projectId}&area=${encodeURIComponent(area)}&status=open`);
+  setOpenItems(d.items||[]);
+}catch{ setOpenItems([]);} })(); },[projectId, area]);
+
+// In render, replace Open Items stub:
+<div className="brand-card p-3">
+  <div className="flex items-center justify-between">
+    <div className="text-sm font-medium">Open Items</div>
+    <a className="brand-btn text-xs" href={`/projects/${projectId}/actions/list#openFilters=1&area=${encodeURIComponent(area)}`}>Manage in Actions</a>
+  </div>
+  <div className="overflow-auto">
+    <table className="w-full text-xs">
+      <thead><tr><th className="text-left p-1">Title</th><th className="text-left p-1">Owner</th><th className="text-left p-1">Created</th></tr></thead>
+      <tbody>
+        {openItems.map((a:any)=>(
+          <tr key={a.id}>
+            <td className="p-1"><a className="underline" href={`/projects/${projectId}/actions/list#openFilters=1&area=${encodeURIComponent(area)}&id=${a.id}`}>{a.title||a.id}</a></td>
+            <td className="p-1">{a.owner||"—"}</td>
+            <td className="p-1">{a.created_at? new Date(a.created_at).toLocaleString():"—"}</td>
+          </tr>
+        ))}
+        {!openItems.length && <tr><td className="p-2 text-muted-foreground" colSpan={3}>No open items.</td></tr>}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+// Next meeting control (under summary)
+<div className="brand-card p-3">
+  <div className="text-sm font-medium mb-1">Next Meeting</div>
+  <div className="flex items-center gap-2">
+    <input type="datetime-local" className="border rounded p-2 text-sm" value={next} onChange={e=>setNext(e.target.value)} />
+    <button className="brand-btn text-xs" onClick={saveNext}>Save</button>
+  </div>
+</div>
+
+// Area Export button (footer of page)
+<div className="flex items-center gap-2">
+  <button className="brand-btn text-xs" onClick={()=>downloadGET(`/api/area/export.zip?project_id=${projectId}&area=${encodeURIComponent(area)}`, `area_${area}.zip`)}>Export Area Package</button>
+</div>
+
+v2.14.3 — Update dots counter & Slack/Teams intake (light)
+3) Header Updates bell (unseen changes count)
+
+client/src/hooks/useNavUpdates.ts (new)
+
+import { useEffect, useState } from "react";
+import { getJSON } from "@/lib/authFetch";
+
+export function useNavUpdates(projectId:string){
+  const [feed,setFeed]=useState<{_global?:string} & Record<string,string>>({});
+  useEffect(()=>{ (async()=>{ try{
+    const d = await getJSON(`/api/areas/last_updates?project_id=${projectId}`); setFeed(d.items||{});
+  }catch{ setFeed({}); } })(); },[projectId]);
+
+  function unseenCount(){
+    try{
+      const key = `kap.page.lastSeen.${projectId}._global`;
+      const seen = localStorage.getItem(key);
+      const lu = feed?._global;
+      return (lu && (!seen || new Date(lu) > new Date(seen))) ? 1 : 0;
+    }catch{ return 0; }
+  }
+  function markSeen(){ try{ localStorage.setItem(`kap.page.lastSeen.${projectId}._global`, new Date().toISOString()); }catch{} }
+  return { unseenCount, markSeen };
+}
+
+
+Patch client/src/components/BrandedHeader.tsx — add a small red dot counter near the Notifications button:
+
+import { useParams } from "react-router-dom";
+import { useNavUpdates } from "@/hooks/useNavUpdates";
+
+const { projectId } = useParams();
+const { unseenCount, markSeen } = useNavUpdates(projectId || "");
+
+<button className="brand-btn text-xs relative" onClick={()=>{ markSeen(); /* open notifications drawer if you have one */ }}>
+  Updates
+  {unseenCount()>0 && <span className="absolute -top-1 -right-1 w-[8px] h-[8px] rounded-full bg-red-500"></span>}
+</button>
+
+
+(We reuse the global _global timestamp; your area dots already work per-area.)
+
+4) Slack/Teams incoming webhook → Area comments
+
+Backend (dev-safe): server/routers/areas_webhook.py (new)
+
+from fastapi import APIRouter, Depends, Query, Header
+from pydantic import BaseModel
+import os
+from ..tenant import TenantCtx
+from ..deps import get_service_supabase
+
+router = APIRouter(prefix="/api/areas", tags=["areas"])
+
+class InMsg(BaseModel):
+  project_id: str
+  area: str
+  actor: str | None = None
+  text: str
+
+@router.post("/webhook_incoming")
+def webhook_incoming(body: InMsg, token: str | None = Header(default=None)):
+  # simple shared-secret check; dev-safe: allow if no token set
+  EXPECT = os.getenv("INCOMING_WEBHOOK_TOKEN", "")
+  if EXPECT and token != EXPECT: 
+    return {"ok": False, "reason": "unauthorized"}
+
+  sbs = get_service_supabase()
+  try:
+    sbs.table("area_comments").insert({
+      "org_id": None,  # if your table requires org_id, you could look it up from project here
+      "project_id": body.project_id, "area": body.area,
+      "user_id": (body.actor or "webhook"), "message": body.text
+    }).execute()
+    return {"ok": True}
+  except Exception:
+    return {"ok": False}
+
+
+Mount in server/main.py:
+
+from .routers import areas_webhook
+app.include_router(areas_webhook.router)
+
+
+How to use now: point a Slack/Teams outgoing/incoming webhook (e.g., via Zapier) to
+POST /api/areas/webhook_incoming with headers token: <INCOMING_WEBHOOK_TOKEN> and JSON
+{ "project_id": "<pid>", "area": "HCM", "actor": "alice@acme.com", "text": "Need to update eligibility rules." }
+It will append a comment in the HCM area. (Dev-safe: if token not set, it allows during development.)
+
+90-second validation
+
+Area page now shows Open Items inline, a Next Meeting picker (saved), and an Export Area Package ZIP
+
+Update dots appear on area links (existing) and a global Updates dot in the header (clears on click)
+
+Slack/Teams intake: simple webhook adds comments into an area (centralized context)
+
+All endpoints return empties if data tables are missing (no crashes)

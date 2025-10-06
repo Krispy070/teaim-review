@@ -1,0 +1,148 @@
+Got you, Kris. The red overlay is Vite’s HMR error overlay—it pops because the Test Runner is literally throwing:
+
+if (!d?.ok) throw new Error("Seed failed");
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+
+So even a useful error payload from the server becomes a blocker UI. Two moves:
+
+A) Make the Test Runner resilient (no throws, full diagnostics)
+Drop-in patch for client/src/pages/TestRunner.tsx
+
+Replace your seed function with this (copy/paste):
+
+async function seed() {
+  setBusy(true);
+  setErr(null);
+
+  try {
+    const res = await fetch("/admin/test/seed-v2", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        projectId,
+        userId: currentUserId || undefined, // ok if undefined
+      }),
+    });
+
+    const raw = await res.text();
+    let d: any;
+    try {
+      d = raw ? JSON.parse(raw) : {};
+    } catch (e: any) {
+      d = { ok: false, parseError: String(e), raw, status: res.status };
+    }
+
+    // Always show what came back
+    addLog(JSON.stringify(d));
+    setSeedLog(JSON.stringify(d, null, 2));
+
+    // Don’t throw (it triggers the overlay). Surface a banner and let the page keep working.
+    if (!res.ok || d?.ok === false) {
+      setErr(
+        `Seed endpoint error (HTTP ${res.status}).` +
+          (d?.error ? ` ${d.error}` : d?.parseError ? ` ${d.parseError}` : "")
+      );
+      return; // keep UI alive
+    }
+
+    // Success path: optionally kick tests here
+    await runAllTests(projectId);
+
+  } catch (e: any) {
+    // Network/JS failure — still don’t throw; show diagnostics
+    setErr(`Seed call failed: ${String(e)}`);
+  } finally {
+    setBusy(false);
+  }
+}
+
+
+Also ensure the button doesn’t fire twice:
+
+<button
+  className="k-btn k-btn--primary"
+  onClick={seed}
+  disabled={busy}
+  aria-busy={busy ? "true" : "false"}
+>
+  {busy ? "Seeding…" : "Seed & Run"}
+</button>
+{err && <div className="mt-2 text-[13px] text-red-400">{err}</div>}
+
+
+What this does
+
+No throw → the overlay won’t hijack the screen.
+
+You see status / raw body / parse error in the panel to actually debug.
+
+Works whether the backend returns JSON or an HTML error page.
+
+If you want the nuclear option too: set server.hmr.overlay = false in vite.config.ts. I prefer fixing the throw, not hiding errors.
+
+B) Common Replit gotchas (fix in 60s)
+
+Two servers running (stale routes):
+
+In Replit, stop the server pane, then start once.
+
+Kill any old “background” tasks you see.
+
+Wrong route path:
+
+Confirm the runner calls POST /admin/test/seed-v2.
+
+In FastAPI main.py, you should have:
+
+app.include_router(testAdminRouter, prefix="/admin/test")
+
+
+Quick sanity in server logs at boot:
+
+print("Routes:", [r.path for r in app.router.routes])
+
+
+Make sure /admin/test/seed-v2 is listed.
+
+Camel vs snake:
+
+We’ve standardized to projectId (camel) in the query/body.
+
+If your server still reads project_id, accept both:
+
+pid = projectId or project_id
+
+
+CORS/CSRF or 500s:
+
+With the new seed code, you’ll see HTTP 403/500 and the raw body in the green panel. That tells us exactly what to fix.
+
+C) (If you want) tiny server-side guard so seed never 500s in dev
+
+In your seed-v2 handler, wrap everything and always return JSON:
+
+@test_router.post("/seed-v2")
+def seed_v2(body: SeedBody):
+    try:
+        out = seedMinimal(body.projectId, getattr(body, "userId", None))
+        return {"seeder":"v2","ok":True, **out}
+    except Exception as e:
+        # never return HTML error pages to the client — always JSON
+        return {"seeder":"v2","ok":False,"error":str(e)}
+
+D) Quick next steps to unstick you now
+
+Paste the TestRunner patch above (no throws).
+
+Click Seed & Run again.
+
+Read the Seed Response and/or the error banner:
+
+If HTTP 404 or parse error → it’s the route path.
+
+If ok:false with an error → paste me that string; I’ll give you a 2–3 line server fix.
+
+If HTTP 200 ok:true → hit the three smokes (ZIP/NOTIF/ICS) and we’ll flip those last reds.
+
+If you want, paste the exact JSON the panel prints after the patch. I’ll zero in on the backend route or parameter that’s still off and give you the specific FastAPI snippet to drop.

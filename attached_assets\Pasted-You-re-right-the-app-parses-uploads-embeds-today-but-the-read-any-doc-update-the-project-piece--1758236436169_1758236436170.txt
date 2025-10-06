@@ -1,0 +1,292 @@
+You’re right—the app parses/uploads/embeds today, but the “read any doc → update the project” piece needs one more layer: a classifier that turns raw text into structured updates (actions, risks, decisions, integrations, workstreams, metrics, logistics, etc.) and then writes those into your tables, with a safety net (review queue + confidence thresholds).
+
+Below is a tight, drop-in plan you can paste in. It adds three things:
+
+a unified extraction schema (what the model returns)
+
+a /classify service that calls GPT with a strong, deterministic prompt and returns that schema
+
+an updater that writes those objects into the right tables (and queues low-confidence items for review)
+
+Once wired, any ingestion path (upload, email, SOW, timeline) can call apply_updates() to keep the dashboard fresh.
+
+0) The contract: a single JSON schema
+
+We’ll ask the model to return exactly this (add/remove fields as needed):
+
+{
+  "doc_type": "minutes|sow|timeline|spec|email|report|other",
+  "summary": "short human summary",
+  "workstreams": [
+    {"name": "Payroll", "confidence": 0.92, "action": "add|keep|drop", "description": "optional"}
+  ],
+  "actions": [
+    {"title": "Deliver SFTP cert", "owner_email": "sam@client.com", "due_date": "2025-09-22", "confidence": 0.85}
+  ],
+  "risks": [
+    {"text": "SFTP cert expires soon", "severity": "High|Medium|Low", "confidence": 0.78}
+  ],
+  "decisions": [
+    {"text": "Use retro policy v2 starting next sprint", "decided_on": "2025-09-18", "confidence": 0.9}
+  ],
+  "integrations": [
+    {"name": "ADP → Workday", "transport": "SFTP|API|File", "frequency": "daily|weekly|ad-hoc", "confidence": 0.83}
+  ],
+  "reporting_requests": [
+    {"text": "Payroll exceptions dashboard", "confidence": 0.7}
+  ],
+  "logistics": {
+    "cadence": "Steering Fridays 4pm", "links": ["https://..."], "confidence": 0.7
+  },
+  "metrics": [
+    {"name": "Go-live", "value": "07/01", "confidence": 0.8},
+    {"name": "Payroll accuracy", "value": "99.5%", "confidence": 0.8}
+  ]
+}
+
+
+We’ll persist >= 0.8 directly; below that goes to the review queue.
+
+1) Add a Review Queue (2 small tables)
+
+Run in Supabase → SQL:
+
+create table if not exists extracted_items (
+  id bigserial primary key,
+  org_id uuid not null,
+  project_id uuid not null,
+  artifact_id uuid,               -- where it came from
+  item_type text not null,        -- action|risk|decision|integration|workstream|reporting|logistics|metrics
+  payload jsonb not null,         -- raw model object
+  confidence numeric,             -- 0..1
+  is_published boolean default false,
+  created_at timestamptz default now()
+);
+
+create table if not exists ingestion_audit (
+  id bigserial primary key,
+  org_id uuid,
+  project_id uuid,
+  artifact_id uuid,
+  doc_type text,
+  tokens int,
+  cost numeric,
+  status text,
+  created_at timestamptz default now()
+);
+
+
+(We already have actions/risks/decisions tables or equivalents via summaries/mem_entries; we’ll write to those too.)
+
+2) The classifier prompt (deterministic & safe)
+
+/server/classifier.py
+
+import json, os
+from openai import OpenAI
+
+oai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+CHAT_MODEL  = os.getenv("CHAT_MODEL","gpt-4.1-mini")
+
+SYSTEM = """You are a Workday implementation PMO classifier.
+Return ONLY valid JSON that matches the provided schema. No text before/after.
+Extract: workstreams, actions (owner+due), risks (severity), decisions, integrations (name transport frequency),
+reporting asks, logistics (cadence/links), metrics, and doc_type."""
+
+SCHEMA_HINT = """Schema:
+{
+ "doc_type": "...",
+ "summary": "...",
+ "workstreams":[{"name":"", "confidence":0.0, "action":"add|keep|drop", "description":""}],
+ "actions":[{"title":"", "owner_email":"", "due_date":"YYYY-MM-DD", "confidence":0.0}],
+ "risks":[{"text":"", "severity":"High|Medium|Low", "confidence":0.0}],
+ "decisions":[{"text":"", "decided_on":"YYYY-MM-DD", "confidence":0.0}],
+ "integrations":[{"name":"", "transport":"SFTP|API|File|Other", "frequency":"daily|weekly|ad-hoc|other", "confidence":0.0}],
+ "reporting_requests":[{"text":"", "confidence":0.0}],
+ "logistics":{"cadence":"", "links":["..."], "confidence":0.0},
+ "metrics":[{"name":"", "value":"", "confidence":0.0}]
+}"""
+
+def classify_text(text: str, project_code: str) -> dict:
+    prompt = f"""Project: {project_code}
+
+{SCHEMA_HINT}
+
+Text:
+{text[:16000]}"""
+    r = oai.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[{"role":"system","content":SYSTEM},{"role":"user","content":prompt}],
+        temperature=0
+    )
+    raw = r.choices[0].message.content.strip()
+    try:
+        return json.loads(raw)
+    except Exception:
+        # salvage by trying to find { ... }
+        import re
+        m = re.search(r"\{[\s\S]+\}", raw)
+        return json.loads(m.group(0)) if m else {"doc_type":"other","summary":"","workstreams":[],"actions":[],"risks":[],"decisions":[],"integrations":[],"reporting_requests":[],"logistics":{},"metrics":[]}
+
+3) The updater (writes into your tables)
+
+/server/updater.py
+
+from .supabase_client import sb
+from .db import get_conn
+
+CONFIDENCE_PUBLISH = 0.8
+
+def queue_item(org_id, project_id, artifact_id, item_type, obj, conf):
+    sb.table("extracted_items").insert({
+      "org_id": org_id, "project_id": project_id, "artifact_id": artifact_id,
+      "item_type": item_type, "payload": obj, "confidence": conf
+    }).execute()
+
+def publish_action(org_id, project_id, artifact_id, obj):
+    sb.table("actions").insert({
+      "org_id": org_id, "project_id": project_id,
+      "title": obj.get("title"), "owner_email": obj.get("owner_email"),
+      "due_date": obj.get("due_date"), "source_artifact": artifact_id, "status":"open"
+    }).execute()
+
+def publish_risk(org_id, project_id, artifact_id, obj):
+    # keep risks inside summaries (or your risks table if you have one)
+    sb.table("summaries").insert({
+      "org_id": org_id, "project_id": project_id, "artifact_id": artifact_id,
+      "level": "artifact", "risks": [obj], "summary": ""
+    }).execute()
+
+def publish_decision(org_id, project_id, artifact_id, obj):
+    sb.table("summaries").insert({
+      "org_id": org_id, "project_id": project_id, "artifact_id": artifact_id,
+      "level": "artifact", "decisions": [obj], "summary": ""
+    }).execute()
+
+def publish_integration(org_id, project_id, obj):
+    # you may have a real integrations table; for now, store as semantic memory
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""insert into mem_entries (org_id, project_id, type, title, body)
+                       values (%s,%s,'semantic','integration',%s)""",
+                    (org_id, project_id, f"{obj.get('name')} | {obj.get('transport')} | {obj.get('frequency')}"))
+
+def publish_workstream(org_id, project_id, obj, sort_idx):
+    # ensure exists in workstreams table
+    try:
+        sb.table("workstreams").insert({
+          "org_id": org_id, "project_id": project_id, "name": obj.get("name","")[:120],
+          "description": obj.get("description",""), "sort_order": sort_idx, "is_active": True
+        }).execute()
+    except Exception:
+        pass
+
+def apply_updates(org_id, project_id, artifact_id, project_code, updates: dict):
+    # summary → summaries table (optional)
+    if updates.get("summary"):
+        sb.table("summaries").insert({
+          "org_id": org_id, "project_id": project_id, "artifact_id": artifact_id,
+          "level": "artifact", "summary": updates["summary"]
+        }).execute()
+
+    # workstreams
+    for i,ws in enumerate(updates.get("workstreams",[])):
+        if ws.get("confidence",0) >= CONFIDENCE_PUBLISH:
+            publish_workstream(org_id, project_id, ws, i)
+        else:
+            queue_item(org_id, project_id, artifact_id, "workstream", ws, ws.get("confidence",0))
+
+    # actions
+    for a in updates.get("actions",[]):
+        if a.get("confidence",0) >= CONFIDENCE_PUBLISH and a.get("title"):
+            publish_action(org_id, project_id, artifact_id, a)
+        else:
+            queue_item(org_id, project_id, artifact_id, "action", a, a.get("confidence",0))
+
+    # risks
+    for r in updates.get("risks",[]):
+        if r.get("confidence",0) >= CONFIDENCE_PUBLISH:
+            publish_risk(org_id, project_id, artifact_id, r)
+        else:
+            queue_item(org_id, project_id, artifact_id, "risk", r, r.get("confidence",0))
+
+    # decisions
+    for d in updates.get("decisions",[]):
+        if d.get("confidence",0) >= CONFIDENCE_PUBLISH:
+            publish_decision(org_id, project_id, artifact_id, d)
+        else:
+            queue_item(org_id, project_id, artifact_id, "decision", d, d.get("confidence",0))
+
+    # integrations
+    for ig in updates.get("integrations",[]):
+        if ig.get("confidence",0) >= CONFIDENCE_PUBLISH:
+            publish_integration(org_id, project_id, ig)
+        else:
+            queue_item(org_id, project_id, artifact_id, "integration", ig, ig.get("confidence",0))
+
+    # reporting asks, logistics, metrics → queue if low; write mem_entries if high
+    # (same pattern; omitted for brevity)
+
+4) Wire it into /ingest and /email now
+
+At the end of your existing ingestion path (upload & email), once you have text, call:
+
+from .classifier import classify_text
+from .updater import apply_updates
+
+updates = classify_text(text, project_code="<WD-ACME or from lookup>")
+apply_updates(org_id, project_id, art_id, "<WD-ACME>", updates)
+
+
+That’s all. From now on, any doc that flows through /ingest or /email/mailgun will extract structured updates and push them to the dashboard (or queue for review if confidence is low).
+
+5) Minimal Review page (optional quick win)
+
+Add a simple page to approve queued items:
+
+GET /review/pending?org_id&project_id → extracted_items where is_published=false
+
+POST /review/approve → takes {id, publish:true, edit_payload?} and writes to the right table using the same publish_* functions.
+
+This gives you an “Approve” button for anything the model flags below 0.8.
+
+6) Test scripts
+
+A) Upload a doc
+
+BASE="http://localhost:5000/api"
+ORG="<ORG_UUID>"; PROJ="<PROJ_UUID>"
+
+echo "WG Minutes: Decision: adopt retro v2. Risk: SFTP cert expiry (High). Action: Sam deliver SFTP cert by 2025-09-22. ADP → Workday daily SFTP." > /tmp/min.txt
+
+curl -s -X POST "$BASE/ingest-sync" \
+  -F "org_id=$ORG" -F "project_id=$PROJ" \
+  -F "file=@/tmp/min.txt"
+
+
+B) Verify dashboard moves
+
+Pending shows an action.
+
+Red Flags shows the High risk.
+
+Integrations & Tech lists “ADP → Workday”.
+
+Functional Areas get Payroll tagged if the text mentions it.
+
+C) Check the queue
+
+curl -s "$BASE/review/pending?org_id=$ORG&project_id=$PROJ"
+
+7) Why this pattern works
+
+Unified schema means new doc types “just work.”
+
+Confidence thresholds keep the UI clean and prevent junk updates.
+
+Review queue gives you human control when needed.
+
+Idempotent by artifact (and Message-Id for email) prevents duplicates.
+
+Zero tight coupling to any one document format—PDF, DOCX, TXT, EML, VTT, SRT all flow through the same classify → apply.
+
+If you want, I can paste a tiny /review API + a quick React table next, so you can approve anything under 0.8 with one click.

@@ -1,0 +1,266 @@
+v2.16.6 — Server-side prefs, richer Guides, threaded promote, saved filters
+1) Server-side last tab per area (per user)
+
+server/routers/area_prefs.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/area_prefs", tags=["areas"])
+
+class PrefBody(BaseModel):
+    area: str
+    key: str
+    val: str
+
+@router.get("/get")
+def get_pref(project_id: str = Query(...), area: str = Query(...), key: str = Query(...),
+             ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        r = sb.table("area_prefs").select("val").eq("org_id",ctx.org_id).eq("project_id",project_id)\
+             .eq("user_id",ctx.user_id).eq("area",area).eq("key",key).single().execute().data or {}
+        return {"val": r.get("val")}
+    except Exception:
+        return {"val": None}
+
+@router.post("/set")
+def set_pref(body: PrefBody, project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        sb.table("area_prefs").upsert({
+            "org_id": ctx.org_id, "project_id": project_id, "user_id": ctx.user_id,
+            "area": body.area, "key": body.key, "val": body.val
+        }, on_conflict="org_id,project_id,user_id,area,key").execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+
+Mount in server/main.py:
+
+from .routers import area_prefs
+app.include_router(area_prefs.router)
+
+
+Front-end (WorkstreamArea) — prefer server-pref but keep local fallback:
+
+// imports
+import { getJSON, postJSON } from "@/lib/authFetch";
+// ...
+const storeTabKey = `kap.area.tab.${projectId}.${area}`;
+const [tab,setTab]=useState<"open"|"risks"|"decisions"|"workbooks"|"guides">("open");
+
+useEffect(()=>{ (async()=>{
+  // server pref first
+  try{
+    const d = await getJSON(`/api/area_prefs/get?project_id=${projectId}&area=${encodeURIComponent(area)}&key=last_tab`);
+    const serverTab = d.val as any;
+    if (serverTab) setTab(serverTab);
+    else {
+      const local = localStorage.getItem(storeTabKey) as any;
+      if (local) setTab(local);
+    }
+  }catch{
+    const local = localStorage.getItem(storeTabKey) as any;
+    if (local) setTab(local);
+  }
+})(); },[projectId, area]);
+
+useEffect(()=>{ (async()=>{
+  try{ localStorage.setItem(storeTabKey, tab); }catch{}
+  try{ await postJSON(`/api/area_prefs/set?project_id=${projectId}`, { area, key:"last_tab", val: tab }); }catch{}
+})(); },[tab]);
+
+2) Guides: file/image upload + insert into steps (markdown/link)
+
+server/routers/guides_upload.py (new)
+
+from fastapi import APIRouter, Depends, Query, UploadFile, File
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase, get_service_supabase
+import os, uuid
+
+router = APIRouter(prefix="/api/guides", tags=["guides"])
+
+@router.post("/upload")
+def upload(project_id: str = Query(...), guide_id: str | None = None,
+           file: UploadFile = File(...), ctx: TenantCtx = Depends(member_ctx)):
+    sbs = get_service_supabase()
+    try:
+        bucket = os.getenv("GUIDES_BUCKET","guides")
+        ext = (file.filename or "file").split(".")[-1].lower()
+        key = f"{ctx.org_id}/{project_id}/{guide_id or 'tmp'}/{uuid.uuid4().hex}.{ext}"
+        data = file.file.read()
+        sbs.storage().from_(bucket).upload(key, data, {"upsert": True})
+        # if you expose public URLs
+        url = sbs.storage().from_(bucket).get_public_url(key)
+        return {"url": url, "path": key}
+    except Exception:
+        return {"url": None, "path": None}
+
+
+Mount in server/main.py:
+
+from .routers import guides_upload
+app.include_router(guides_upload.router)
+
+
+client/src/components/GuideEditor.tsx — add “Add image/file”:
+
+const [uploading,setUploading]=useState(false);
+async function onUpload(e:any){
+  const f = e.target.files?.[0]; if(!f) return;
+  setUploading(true);
+  const fd = new FormData(); fd.append("file", f);
+  const r = await fetch(`/api/guides/upload?project_id=${projectId}${g.id?`&guide_id=${g.id}`:""}`, { method:"POST", body: fd, credentials:"include" });
+  const d = await r.json().catch(()=>({}));
+  setUploading(false);
+  if(d?.url){
+    // insert as a new step with markdown
+    setG((s:any)=> ({...s, steps:[...(s.steps||[]), (f.type||"").startsWith("image/")? `![image](${d.url})` : `[${f.name}](${d.url})`]}));
+  } else alert("Upload failed");
+}
+{/* In editor body, under Steps header */}
+<input type="file" className="text-[11px]" onChange={onUpload} disabled={uploading}/>
+
+3) Promote thread → guide (capture replies as steps)
+
+Backend: extend comments to include id/parent_id.
+
+Patch list to return id (if not already). Add replies endpoint:
+
+server/routers/area_comments.py (append)
+
+@router.get("/comments/thread")
+def thread(project_id: str = Query(...), parent_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        rows = sb.table("area_comments").select("id,created_at,user_id,message,parent_id")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id).or_(f"id.eq.{parent_id},parent_id.eq.{parent_id}")\
+               .order("created_at", asc=True).limit(200).execute().data or []
+        return {"items": rows}
+    except Exception:
+        return {"items": []}
+
+
+server/routers/guides.py — new endpoint:
+
+@router.post("/promote_thread")
+def promote_thread(project_id: str = Query(...), area: str = Query(...), root_id: str = Query(...),
+                   ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        th = sb.table("area_comments").select("id,created_at,user_id,message,parent_id")\
+              .eq("org_id",ctx.org_id).eq("project_id",project_id).or_(f"id.eq.{root_id},parent_id.eq.{root_id}")\
+              .order("created_at", asc=True).limit(200).execute().data or []
+        if not th: return {"ok": False}
+        steps = [x.get("message") or "" for x in th]
+        title = (steps[0] or "").split("\n")[0][:120] or "Mini Guide"
+        sb.table("guides").insert({
+            "org_id": ctx.org_id, "project_id": project_id,
+            "title": title, "area": area, "owner": ctx.user_id,
+            "steps": steps, "sources":[{"type":"comment_thread","root_id":root_id}],
+            "status":"draft", "updated_at": datetime.now(timezone.utc).isoformat()
+        }).execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+
+Front-end (comments list item in WorkstreamArea):
+
+<button className="brand-btn text-[11px]" onClick={async()=>{
+  await fetch(`/api/guides/promote_thread?project_id=${projectId}&area=${encodeURIComponent(area)}&root_id=${encodeURIComponent(c.id)}`, {method:"POST",credentials:"include"});
+  alert("Promoted thread → Guide"); setTab("guides");
+}}>Promote thread → Guide</button>
+
+
+(If you don’t have threaded replies yet, users can still “promote comment” which we added previously.)
+
+4) Save audit widget filters per user (server-side)
+
+server/routers/area_prefs.py (reuse) — store audit_kinds:
+
+Front-end (WorkstreamArea audit widget):
+
+// load
+useEffect(()=>{ (async()=>{ try{
+  const d=await getJSON(`/api/area_prefs/get?project_id=${projectId}&area=${encodeURIComponent(area)}&key=audit_kinds`);
+  if (d?.val) setKinds((d.val as string).split(",").filter(Boolean));
+}catch{} })(); },[projectId, area]);
+
+// save on change
+useEffect(()=>{ (async()=>{ try{
+  await postJSON(`/api/area_prefs/set?project_id=${projectId}`, { area, key:"audit_kinds", val: kinds.join(",") });
+}catch{} })(); },[kinds.join(","), projectId, area]);
+
+v2.16.7 — Perf/UX micro: caching headers, lazy tabs, shortcuts, ops polish
+5) Caching headers for area summaries (perf)
+
+server/routers/areas.py — in summary_all and summary, add Cache-Control (best effort):
+
+from fastapi import Response
+# change signature: def summary_all(..., response:Response):
+response.headers["Cache-Control"] = "public, max-age=30"
+
+
+(Repeat for summary if desired.)
+
+6) Lazy-load tabs (WorkstreamArea)
+// around each tab pane:
+const [ready,setReady]=useState<Record<string,boolean>>({});
+useEffect(()=> setReady(r=>({...r,[tab]:true})), [tab]);
+// render only when ready[tab] is true
+
+7) Keyboard shortcuts (WorkstreamArea)
+useEffect(()=>{ function onKey(e:KeyboardEvent){
+  if (e.key==="/"){ e.preventDefault(); const el=document.querySelector<HTMLInputElement>('input[placeholder^="Add a note"]'); el?.focus(); }
+  if (e.key==="g" || e.key==="G"){ e.preventDefault(); setEditor({title:"", area}); setTab("guides"); }
+}
+window.addEventListener("keydown", onKey); return ()=>window.removeEventListener("keydown", onKey); },[area]);
+
+8) Header: Queue errors pill (if any last_error in queue)
+
+Ops page already lists queue; add a mini pill in header:
+
+// in BrandedHeader.tsx
+const [qerr,setQerr]=useState(0);
+useEffect(()=>{ (async()=>{ try{
+  const d=await getJSON(`/api/ops/queue?limit=50`); setQerr((d.items||[]).filter((x:any)=>x.last_error).length);
+}catch{} })(); },[]);
+{qerr>0 && <span className="ml-2 text-[11px] px-1.5 py-[1px] rounded bg-red-500/20 text-red-600">Queue issues: {qerr}</span>}
+
+Optional DDL (when you’re ready)
+-- area_prefs: stores per-user preferences such as last_tab and audit_kinds
+create table if not exists area_prefs (
+  org_id uuid, project_id uuid, user_id uuid, area text, key text, val text,
+  primary key(org_id, project_id, user_id, area, key)
+);
+
+-- area_comments: add id and parent_id if missing
+alter table area_comments add column if not exists id uuid default gen_random_uuid() primary key;
+alter table area_comments add column if not exists parent_id uuid;
+
+-- guides & uploads
+create table if not exists guides (
+  id uuid default gen_random_uuid() primary key,
+  org_id uuid, project_id uuid, area text, owner text,
+  title text, status text, tags jsonb, steps jsonb, sources jsonb,
+  updated_at timestamptz
+);
+-- storage bucket 'guides' should exist (public or signed URLs based on your choice)
+
+2-Minute Validation
+
+Area tabs remember per-user server-side; audit filters persist
+
+Guides accept files/images, promote thread → guide, export HTML/CSV, dashboard shows latest
+
+Perf: area summaries/calls cache for 30s; tabs lazy-load; shortcuts speed PM work
+
+Ops: header shows queue issues count; page shows retries/backoff

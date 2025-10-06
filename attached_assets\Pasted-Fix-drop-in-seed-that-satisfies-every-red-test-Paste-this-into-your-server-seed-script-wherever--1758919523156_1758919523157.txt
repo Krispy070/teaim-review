@@ -1,0 +1,276 @@
+Fix: drop-in seed that satisfies every red test
+
+Paste this into your server seed script (wherever /admin/test triggers seeding). It creates 1 customer, 1 project, 2 areas (HCM, FIN), 2 workbooks, 2 reports, 2 change log entries, 2 comments, 1 release (ICS), 1 notification, and 1 sign-off token (plus an intentionally invalid one to keep the negative test green).
+
+Adjust table names/ids to your schema. I’m using common names I’ve seen in your stack.
+
+// server/admin/test/seedMinimal.ts
+import { v4 as uuid } from "uuid";
+import { db } from "../db"; // your knex/prisma/pg client
+import dayjs from "dayjs";
+
+export async function seedMinimal(projectId: string) {
+  const now = dayjs();
+  const orgId = uuid();
+  const vendorId = uuid();
+  const customerId = uuid();
+
+  const areaHcm = uuid();
+  const areaFin = uuid();
+
+  const wbHcm = uuid();
+  const wbFin = uuid();
+
+  const rptHcm = uuid();
+  const rptFin = uuid();
+
+  const change1 = uuid();
+  const change2 = uuid();
+
+  const cmt1 = uuid();
+  const cmt2 = uuid();
+
+  const release1 = uuid();
+  const notif1 = uuid();
+
+  const signoffValid = uuid();
+  const signoffInvalid = "bad-token";
+
+  // idempotency: clean project’s test data
+  await db.transaction(async (tx) => {
+    await tx("notifications").where({ project_id: projectId }).del();
+    await tx("releases").where({ project_id: projectId }).del();
+    await tx("comments").where({ project_id: projectId }).del();
+    await tx("changes").where({ project_id: projectId }).del();
+    await tx("reports").where({ project_id: projectId }).del();
+    await tx("workbooks").where({ project_id: projectId }).del();
+    await tx("areas").where({ project_id: projectId }).del();
+
+    // orgs / vendors / customers (if your schema expects them)
+    await tx("orgs").insert([
+      { id: orgId, name: "TEAIM Test Org", created_at: now.toISOString() },
+    ]).onConflict("id").ignore();
+
+    await tx("vendors").insert([
+      { id: vendorId, name: "TEAIM Test Vendor", org_id: orgId },
+    ]).onConflict("id").ignore();
+
+    await tx("customers").insert([
+      { id: customerId, name: "Project TEAIM Test Customer", org_id: orgId },
+    ]).onConflict("id").ignore();
+
+    // areas
+    await tx("areas").insert([
+      { id: areaHcm, project_id: projectId, key: "HCM", name: "HCM", status: "active" },
+      { id: areaFin, project_id: projectId, key: "FIN", name: "Financials", status: "active" },
+    ]);
+
+    // workbooks (one per area)
+    await tx("workbooks").insert([
+      { id: wbHcm, project_id: projectId, area_id: areaHcm, title: "HCM Master Workbook", metrics: { items: 12, open: 4, closed: 8 } },
+      { id: wbFin, project_id: projectId, area_id: areaFin, title: "FIN Master Workbook", metrics: { items: 9, open: 3, closed: 6 } },
+    ]);
+
+    // reports (wb export coverage)
+    await tx("reports").insert([
+      { id: rptHcm, project_id: projectId, type: "wb_export_csv", area_id: areaHcm, title: "HCM Export", payload: { rows: 12 } },
+      { id: rptFin, project_id: projectId, type: "wb_export_csv", area_id: areaFin, title: "FIN Export", payload: { rows: 9 } },
+    ]);
+
+    // changes (digest & zip need content)
+    await tx("changes").insert([
+      { id: change1, project_id: projectId, area_id: areaHcm, kind: "update", summary: "Updated HCM position sync", created_at: now.subtract(1, "day").toISOString() },
+      { id: change2, project_id: projectId, area_id: areaFin, kind: "add", summary: "Added GL segment validation", created_at: now.subtract(2, "day").toISOString() },
+    ]);
+
+    // comments (digest preview)
+    await tx("comments").insert([
+      { id: cmt1, project_id: projectId, area_id: areaHcm, body: "Please verify job catalog mapping.", author: "System", created_at: now.toISOString() },
+      { id: cmt2, project_id: projectId, area_id: areaFin, body: "Need sign-off on journal import.", author: "System", created_at: now.toISOString() },
+    ]);
+
+    // release (ICS)
+    await tx("releases").insert([
+      { id: release1, project_id: projectId, tag: "v0.1.0-test", channel: "staging", kind: "ics", created_at: now.toISOString() },
+    ]);
+
+    // notifications (unseen count)
+    await tx("notifications").insert([
+      { id: notif1, project_id: projectId, kind: "digest_ready", seen: false, created_at: now.toISOString(), payload: { areas: ["HCM","FIN"] } },
+    ]);
+
+    // sign-off tokens
+    await tx("signoffs").insert([
+      { token: signoffValid, project_id: projectId, status: "issued", expires_at: now.add(3, "day").toISOString() },
+    ]);
+    // no insert for invalid: the test should keep using `bad-token`
+  });
+
+  return {
+    ok: true,
+    inserted: {
+      workbooks: 2, reports: 2, changes: 2, comments: 2, releases: 1, notifications: 1, areas: 2, signoffs: 1
+    }
+  };
+}
+
+
+And wire it in your admin test endpoint:
+
+// server/admin/test/index.ts
+import { seedMinimal } from "./seedMinimal";
+app.post("/admin/test/seed", async (req, res) => {
+  const projectId = req.body?.projectId;
+  if (!projectId) return res.status(400).json({ ok: false, error: "projectId required" });
+  try {
+    const out = await seedMinimal(projectId);
+    return res.json(out);
+  } catch (e:any) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+What this unblocks in your runner
+
+Workbooks metrics ✅ two workbooks with non-zero metrics
+
+Workbook export CSV ✅ two reports payloads
+
+Digest preview HTML ✅ recent changes + comments
+
+Area export ZIP (HCM) ✅ HCM has workbook + changes
+
+Notifications unseen count ✅ one unseen notification
+
+Releases ICS ✅ one release row
+
+Sign-off invalid token (negative) ✅ still uses bad-token
+
+Areas summary ✅ already green
+
+Run flow in the UI: Admin → Test → “Seed & Run” again. You should see inserted counts bump from zeros to the values above and the reds flip to green.
+
+Header cleanup (premium look + 3 logos)
+UX goals
+
+Left: App identity (TEAIM) — small, consistent.
+
+Center: Customer logo dominant (they’re paying).
+
+Right: Implementor logo + user menu + environment pill (DEV/STAGE/PROD).
+
+Keep height ~64px, no double toolbars, constrained max width (1200–1320px), sticky, with subtle shadow.
+
+Data model (where to store)
+
+orgs.logo_url → TEAIM (or global brand config)
+
+customers.logo_url → Customer
+
+vendors.logo_url → Implementor
+
+Also allow per-project overrides: projects.brand_overrides JSON (optional).
+
+Component (React + Tailwind, production-ready)
+
+Drop this into your front-end:
+
+// ui/components/HeaderBar.tsx
+import React from "react";
+import { cn } from "@/lib/cn";
+
+type Logo = { src?: string; alt: string; href?: string; };
+type Env = "DEV" | "STAGE" | "PROD";
+
+export function HeaderBar({
+  teaim,
+  customer,
+  implementor,
+  projectName,
+  env = "DEV",
+  onPickProject,
+}: {
+  teaim: Logo;
+  customer: Logo;
+  implementor?: Logo;
+  projectName?: string;
+  env?: Env;
+  onPickProject?: () => void;
+}) {
+  return (
+    <header className="sticky top-0 z-50 w-full border-b border-zinc-800 bg-[#0B0B0E]/95 backdrop-blur">
+      <div className="mx-auto flex h-16 max-w-[1320px] items-center gap-4 px-4">
+        {/* Left: TEAIM brand */}
+        <a href={teaim.href || "#"} className="flex items-center gap-2 shrink-0">
+          {teaim.src ? (
+            <img src={teaim.src} alt={teaim.alt} className="h-6 w-auto" />
+          ) : (
+            <span className="text-lg font-semibold tracking-wide text-white">TEAIM</span>
+          )}
+        </a>
+
+        {/* Center: Customer logo (dominant) */}
+        <div className="mx-auto flex min-w-0 items-center justify-center">
+          <div className="flex items-center gap-3">
+            {customer?.src ? (
+              <img src={customer.src} alt={customer.alt} className="h-7 w-auto max-w-[240px] object-contain" />
+            ) : (
+              <span className="truncate text-sm text-zinc-300">{customer.alt}</span>
+            )}
+            {projectName && (
+              <button
+                onClick={onPickProject}
+                className="truncate rounded-xl border border-zinc-700 px-3 py-1 text-xs text-zinc-200 hover:bg-zinc-800"
+                title="Switch project"
+              >
+                {projectName}
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Right: Implementor + env + user */}
+        <div className="flex items-center gap-3">
+          {implementor?.src && (
+            <img src={implementor.src} alt={implementor.alt} className="h-6 w-auto opacity-80" />
+          )}
+          <span
+            className={cn(
+              "rounded-lg px-2 py-0.5 text-[11px] font-medium",
+              env === "PROD" && "bg-emerald-600/20 text-emerald-300 border border-emerald-700/50",
+              env === "STAGE" && "bg-amber-600/20 text-amber-300 border border-amber-700/50",
+              env === "DEV" && "bg-sky-600/20 text-sky-300 border border-sky-700/50"
+            )}
+          >
+            {env}
+          </span>
+          <div className="h-7 w-7 shrink-0 overflow-hidden rounded-full bg-zinc-700/60" />
+        </div>
+      </div>
+    </header>
+  );
+}
+
+
+Usage example (pulling from your Supabase/org cache):
+
+<HeaderBar
+  teaim={{ src: brand.teaimLogoUrl, alt: "TEAIM", href: "/" }}
+  customer={{ src: project.customerLogoUrl, alt: project.customerName }}
+  implementor={{ src: project.implementorLogoUrl, alt: "Implementor" }}
+  projectName={project.name}
+  env={process.env.NODE_ENV === "production" ? "PROD" : "DEV"}
+  onPickProject={() => setProjectPickerOpen(true)}
+/>
+
+Visual polish checklist
+
+One header. No second row. Move “Sign in”, “Pick project”, “Brand v2” toggles into a kebab menu on the right or into System Health page.
+
+Max width: keep content centered; avoid full-bleed for enterprise vibe.
+
+Shadows: subtle (already applied via border + backdrop).
+
+Consistency: all icons and pills use the same 8px radii and spacing scale.
+
+Empty logos: show graceful text fallback, never broken images.

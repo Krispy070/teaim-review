@@ -1,0 +1,217 @@
+Alright Kris — two things are happening:
+
+Crash in TestRunner: useLocation() is being called outside a <Router> → hard overlay.
+
+Old vs. new nav: some links still hit legacy paths (no /projects/:projectId/...), so the Test Runner doesn’t get a projectId.
+
+I’ll fix both with safe, copy-paste patches.
+
+1) Kill the useLocation crash (use window + fallbacks)
+
+Why: useLocation() (React Router) may not be available when the page is rendered in a context that isn’t wrapped by your Router (iframe, modal, or a stand-alone mount). Use window instead; it always works in Replit preview.
+
+Patch: client/src/pages/TestRunner.tsx
+
+Replace your “resolve project id” hook/function with this non-hook utility (no useLocation):
+
+// Put this at the top of TestRunner.tsx (or a utils file and import it)
+function resolveProjectId(currentProject?: { id?: string }): string {
+  // 1) current in-memory state
+  if (currentProject?.id) return currentProject.id;
+
+  // 2) URL path: /projects/:projectId/...
+  const path = typeof window !== "undefined" ? window.location.pathname : "";
+  let m = path.match(/\/projects\/([0-9a-f-]{36})\b/i);
+  if (m) return m[1];
+
+  // 3) Query param: ?projectId=...
+  const qs =
+    typeof window !== "undefined"
+      ? new URLSearchParams(window.location.search)
+      : new URLSearchParams();
+  const qp = qs.get("projectId");
+  if (qp) return qp;
+
+  // 4) Last known (sticky) project from localStorage
+  try {
+    const fromLS = localStorage.getItem("teaim:lastProjectId");
+    if (fromLS) return fromLS;
+  } catch {}
+
+  // 5) Global injected PID (optional)
+  // @ts-ignore
+  if (typeof window !== "undefined" && window.__PID) return window.__PID as string;
+
+  return "";
+}
+
+
+Use it inside your component:
+
+const projectId = resolveProjectId(currentProject);
+
+// After you know projectId, persist it for later:
+React.useEffect(() => {
+  if (projectId) try { localStorage.setItem("teaim:lastProjectId", projectId); } catch {}
+}, [projectId]);
+
+
+Guard the Seed button and remove throw:
+
+<button
+  className="k-btn k-btn--primary"
+  onClick={seed}
+  disabled={!projectId || busy}
+>
+  {busy ? "Seeding…" : "Seed & Run"}
+</button>
+{!projectId && (
+  <div className="mt-2 text-[13px] text-amber-300">
+    No project detected. Open a project or add ?projectId=UUID to the URL.
+  </div>
+)}
+
+
+Seed call (don’t throw):
+
+async function seed() {
+  setBusy(true); setErr(null);
+  if (!projectId) { setErr("projectId required"); setBusy(false); return; }
+
+  try {
+    const res = await fetch("/admin/test/seed-v2", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId })
+    });
+
+    const raw = await res.text();
+    let d: any;
+    try { d = raw ? JSON.parse(raw) : {}; } catch (e:any) { d = { ok:false, parseError:String(e), raw, status:res.status }; }
+
+    setSeedLog(JSON.stringify(d, null, 2));
+    if (!res.ok || d?.ok === false) {
+      setErr(`Seed endpoint error (HTTP ${res.status}). ${d?.error ?? d?.parseError ?? ""}`);
+      return;
+    }
+    await runAllTests(projectId);
+  } catch (e:any) {
+    setErr(`Seed call failed: ${String(e)}`);
+  } finally {
+    setBusy(false);
+  }
+}
+
+
+This removes the overlay, shows clear diagnostics, and always passes a projectId.
+
+2) Unify old vs. new nav (ensure every link carries projectId)
+
+You likely have a mix of:
+
+Old: /admin/test?projectId=... or /admin/test (no pid)
+
+New: /projects/:projectId/admin/test ✅
+
+We’ll fix generation and consumption.
+
+A) Generate correct links in the sidebar
+
+Patch: client/src/components/Sidebar.tsx (or wherever you build nav)
+
+function currentPid(): string {
+  return resolveProjectId(/* pass current project object if you have one */);
+}
+
+const pid = currentPid();
+
+<NavLink to={`/projects/${pid}/admin/test`} className="item">Test Runner</NavLink>
+<NavLink to={`/projects/${pid}/actions`} className="item">Actions</NavLink>
+<NavLink to={`/projects/${pid}/workstreams`} className="item">Workstreams</NavLink>
+/* ...and so on for every project-scoped page */
+
+
+If pid is empty, disable links or route to a project picker.
+
+B) Backward-compat redirect (users may have old bookmarks)
+
+Add a redirect route that upgrades old paths to new:
+
+// client/src/routes/CompatRedirect.tsx
+import { useEffect } from "react";
+import { useNavigate } from "react-router-dom";
+
+export default function CompatRedirect() {
+  const navigate = useNavigate();
+  useEffect(() => {
+    const pid = resolveProjectId();
+    if (!pid) return; // show picker if you have one
+    // Map old => new
+    const path = window.location.pathname;
+    const map: Record<string, string> = {
+      "/admin/test": `/projects/${pid}/admin/test`,
+      "/actions": `/projects/${pid}/actions`,
+      "/workstreams": `/projects/${pid}/workstreams`,
+      // add any other legacy endpoints here
+    };
+    const target = map[path];
+    if (target) navigate(target, { replace: true });
+  }, [navigate]);
+  return null;
+}
+
+
+Wire it:
+
+// client/src/routes/index.tsx
+<Route path="/admin/test" element={<CompatRedirect />} />
+<Route path="/actions" element={<CompatRedirect />} />
+<Route path="/workstreams" element={<CompatRedirect />} />
+
+
+Now old links won’t break the Test Runner; they’ll upgrade to the project-scoped routes.
+
+3) Server safety net (accept camel & snake)
+
+Patch your seed handler (FastAPI):
+
+@router.post("/seed-v2")
+def seed_v2(body: dict = Body(...)):
+    pid = body.get("projectId") or body.get("project_id")
+    if not pid:
+        return {"ok": False, "error": "projectId required"}
+    try:
+        out = seedMinimal(pid, body.get("userId"))
+        return {"seeder":"v2", "ok": True, **out}
+    except Exception as e:
+        return {"seeder":"v2", "ok": False, "error": str(e)}
+
+
+Do the same camel+snake acceptance for the ZIP/NOTIF/ICS endpoints if needed.
+
+4) Quick sanity (run these right now in Console)
+const PID="e1ec6ad0-a4e8-45dd-87b0-e123776ffe6e";
+// Seed (should return ok:true or useful error message)
+fetch("/admin/test/seed-v2", {
+  method:"POST", headers:{ "Content-Type":"application/json" },
+  body: JSON.stringify({ projectId: PID })
+}).then(r=>r.json()).then(console.log);
+
+
+If that works, click Seed & Run in the UI; the overlay should be gone and the response panel will show what the server returned.
+
+5) (Optional) Tighten nav: store + reuse last PID
+
+You already write to localStorage. Also read it in your AppShell when building the sidebar to keep links live across refreshes.
+
+TL;DR
+
+Replace useLocation() with a window-based resolver to stop the overlay and always have a projectId.
+
+Update sidebar links to /projects/${pid}/... consistently.
+
+Add a compat redirect for old paths.
+
+Server: accept both projectId and project_id.
+
+Do those and your Test Runner will seed reliably, and the old/new nav mismatch will stop tripping you up. Want me to scan your sidebar routes and hand you a tiny list of legacy paths to add to the redirect map?

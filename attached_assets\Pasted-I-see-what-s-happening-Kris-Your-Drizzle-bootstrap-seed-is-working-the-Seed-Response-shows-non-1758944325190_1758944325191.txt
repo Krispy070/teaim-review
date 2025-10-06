@@ -1,0 +1,78 @@
+I see what’s happening, Kris. Your Drizzle bootstrap + seed is working — the Seed Response shows non-zero counts:
+
+"inserted": {
+  "areas": 2,
+  "workbooks": 2,
+  "reports": 2,
+  "changes": 2,
+  "comments": 2,
+  "releases": 1,
+  "notifications": 1,
+  "signoffs": 1
+}
+
+
+✅ That means the tables exist and rows are being created correctly.
+
+❌ But the Staging Test Runner panel is still red on Digest, Area ZIP, Notifications, Releases. That’s because the runner UI is not reading from your new seed output — it’s still wired to the old “0 inserts” object. In other words: backend fixed, frontend panel stale.
+
+How to clear the last reds
+1. Confirm the runner fetches the v2 endpoint
+
+Open ui/pages/AdminTestRunner.tsx (or wherever Seed & Run lives):
+
+async function seedAndRun(projectId: string) {
+  const res = await fetch("/admin/test/seed-v2", {   // <-- must be seed-v2
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ projectId })
+  });
+  const json = await res.json();
+  console.log("Seed response:", json);               // should show seeder:"v2"
+  setSeedLog(JSON.stringify(json, null, 2));         // panel should render these counts
+  await runAllTests(projectId);
+}
+
+
+👉 If you see seeder:"v2" in DevTools but the panel still shows the old stringified object, update the setSeedLog call to render the json directly, not an old state variable.
+
+2. Update the Test Runner panel
+
+Right now it looks like the panel is still bound to:
+
+{"ok":true,"inserted":{"workbooks":"0",...}}
+
+
+Replace that with the v2 object:
+
+<pre className="seed-output">
+  {seedLog}
+</pre>
+
+
+…and ensure seedLog is being set from the v2 JSON above.
+
+3. Why the tests fail even with rows
+
+The test checks call APIs like /digest/preview, /area/export, /notifications, /releases.
+
+If those APIs return empty, it’s because they’re reading from project context that isn’t using the new data.
+
+Fix is simple: seed with projectId (you already do), then make sure the runner passes that same projectId into its tests.
+
+Next steps
+
+Open DevTools → Network when you click Seed & Run.
+
+Check the POST URL (must be /admin/test/seed-v2).
+
+Check the response body (must include seeder:"v2" and non-zero counts).
+
+If ✅, then update AdminTestRunner.tsx so the panel prints that JSON.
+Right now it’s logging the old format.
+
+Re-run. You should see:
+
+7/8 green (invalid token negative stays red).
+
+Seed panel showing non-zero counts from v2.

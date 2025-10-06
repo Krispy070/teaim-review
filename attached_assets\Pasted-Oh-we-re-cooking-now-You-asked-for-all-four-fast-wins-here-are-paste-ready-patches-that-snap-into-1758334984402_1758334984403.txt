@@ -1,0 +1,364 @@
+Oh we’re cooking now. You asked for all four fast-wins — here are paste-ready patches that snap into what we’ve already built.
+
+0) SQL — minimal schema to support all 4
+
+Run in Supabase SQL:
+
+-- A) Team Subscriptions (drive digest recipients by opt-in)
+create table if not exists public.team_subscriptions (
+  org_id uuid not null,
+  project_id uuid not null,
+  user_id uuid not null,
+  digest_weekly boolean not null default true,
+  digest_monthly boolean not null default false,
+  updated_at timestamptz not null default now(),
+  primary key (org_id, project_id, user_id)
+);
+alter table public.team_subscriptions enable row level security;
+
+create policy "subs_select_member"
+  on public.team_subscriptions for select
+  using (org_id = public.current_org() and public.is_member(org_id, project_id));
+
+create policy "subs_upsert_admin_pm"
+  on public.team_subscriptions for insert
+  with check (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm']));
+create policy "subs_update_admin_pm"
+  on public.team_subscriptions for update
+  using (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm']))
+  with check (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm']));
+
+-- B) Review items (for OCR “needs_ocr” flag)
+create table if not exists public.review_items (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid not null,
+  project_id uuid not null,
+  artifact_id uuid,
+  kind text not null,            -- 'needs_ocr' | ...
+  severity text default 'info',
+  details jsonb,
+  status text not null default 'pending', -- pending|resolved
+  created_at timestamptz not null default now(),
+  resolved_at timestamptz
+);
+alter table public.review_items enable row level security;
+
+create index if not exists idx_review_items_proj on public.review_items(project_id, kind, status);
+
+create policy "review_read_member"
+  on public.review_items for select
+  using (org_id = public.current_org() and public.is_member(org_id, project_id));
+create policy "review_insert_server"
+  on public.review_items for insert
+  with check (org_id = public.current_org());
+create policy "review_update_admin_pm"
+  on public.review_items for update
+  using (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm']))
+  with check (org_id = public.current_org());
+
+-- C) Comms dry-run (send digest only to tester for a window)
+alter table public.org_comms_settings
+  add column if not exists digest_dry_run_to_email text,
+  add column if not exists digest_dry_run_until timestamptz;
+
+-- D) (Backups) Create a Supabase Storage bucket named 'backups' in UI.
+--    Path convention: org/{org_id}/project/{project_id}/YYYYMMDD.zip
+
+select pg_notify('pgrst','reload schema');
+
+1) Recipients by subscription (server)
+
+Replace _recipients in server/routers/digest.py:
+
+def _recipients(sb, org_id: str, project_id: str, period: str = "weekly"):
+    # Respect org dry-run first
+    s = sb.table("org_comms_settings").select("digest_dry_run_to_email,digest_dry_run_until")\
+         .eq("org_id", org_id).single().execute().data or {}
+    if s.get("digest_dry_run_to_email") and s.get("digest_dry_run_until"):
+        from datetime import datetime, timezone
+        if datetime.now(timezone.utc) < datetime.fromisoformat(s["digest_dry_run_until"]):
+            return [s["digest_dry_run_to_email"]]
+
+    want_col = "digest_weekly" if period == "weekly" else "digest_monthly"
+
+    # Members by role
+    roles = ['owner','admin','pm','lead']
+    ms = sb.table("project_members").select("user_id, role")\
+         .eq("org_id", org_id).eq("project_id", project_id).in_("role", roles).execute().data or []
+    if not ms: return []
+
+    user_ids = [m["user_id"] for m in ms]
+
+    # Subscriptions filter
+    subs = sb.table("team_subscriptions").select("user_id," + want_col)\
+           .eq("org_id", org_id).eq("project_id", project_id).in_("user_id", user_ids).execute().data or []
+    allowed = {s["user_id"] for s in subs if s.get(want_col)}
+
+    if not allowed:
+        # default behavior: if no explicit subs, include all members in roles
+        allowed = set(user_ids)
+
+    # Resolve emails (contacts -> users_profile -> fallback env)
+    emails: list[str] = []
+    try:
+        cs = sb.table("contacts").select("user_id,email").in_("user_id", list(allowed)).execute().data or []
+        emails.extend([c["email"] for c in cs if c.get("email")])
+    except Exception:
+        pass
+    if not emails:
+        try:
+            up = sb.table("users_profile").select("user_id,email").in_("user_id", list(allowed)).execute().data or []
+            emails.extend([u["email"] for u in up if u.get("email")])
+        except Exception:
+            pass
+
+    test = os.getenv("DIGEST_TEST_EMAIL")
+    if not emails and test:
+        emails = [test]
+
+    return sorted(set([e for e in emails if e]))
+
+
+And change calls to _recipients(...):
+
+# weekly
+recipients = _recipients(sb, org_id, project_id, period="weekly")
+# monthly
+recipients = _recipients(sb, org_id, project_id, period="monthly")
+
+2) Nightly backups @ 02:00 org-local (with 14-day retention)
+
+server/scheduler.py – add a second task to the loop:
+
+import datetime as dt
+from zoneinfo import ZoneInfo
+from .deps import get_service_supabase
+import io, zipfile, json
+
+RETENTION_DAYS = int(float(__import__("os").getenv("BACKUP_RETENTION_DAYS","14")))
+
+async def digest_scheduler(app):
+    sb = get_service_supabase()
+    while True:
+        try:
+            now_utc = dt.datetime.now(dt.timezone.utc)
+            projs = sb.table("projects").select("id,org_id,status,code").neq("status","archived").execute().data or []
+            settings = {r["org_id"]: r for r in (sb.table("org_comms_settings").select("*").execute().data or [])}
+
+            for p in projs:
+                s = settings.get(p["org_id"], {})
+                tz = ZoneInfo(s.get("tz","America/Los_Angeles"))
+                local = now_utc.astimezone(tz)
+
+                # ---------- WEEKLY/MONTHLY DIGEST (already present) ----------
+                # ... (existing weekly/monthly logic remains) ...
+
+                # ---------- NIGHTLY BACKUP 02:00 local ----------
+                if local.hour == 2 and local.minute < 1:
+                    # Build ZIP in-memory: artifacts + manifest (no mem by default)
+                    arts = sb.table("artifacts").select("id,name,storage_bucket,storage_path,created_at")\
+                            .eq("org_id", p["org_id"]).eq("project_id", p["id"]).execute().data or []
+                    buf = io.BytesIO()
+                    zf = zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED)
+                    manifest = {
+                        "org_id": p["org_id"], "project_id": p["id"], "project_code": p.get("code"),
+                        "generated_at": now_utc.isoformat(), "artifacts_count": len(arts)
+                    }
+                    zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+                    storage = sb.storage()
+                    for a in arts:
+                        try:
+                            b = storage.from_(a["storage_bucket"]).download(a["storage_path"])
+                            zf.writestr(f"artifacts/{a['name'] or a['id']}", b)
+                        except Exception as e:
+                            zf.writestr(f"artifacts/_missing_{a['id']}.txt", f"Could not download: {e}")
+                    zf.close(); buf.seek(0)
+
+                    ymd = local.strftime("%Y%m%d")
+                    key = f"org/{p['org_id']}/project/{p['id']}/{ymd}.zip"
+                    try:
+                        sb.storage().from_("backups").upload(key, buf.read(), {"content-type":"application/zip", "upsert": True})
+                    except Exception:
+                        pass
+
+                    # Retention: delete older than N days
+                    try:
+                        lst = sb.storage().from_("backups").list(f"org/{p['org_id']}/project/{p['id']}/")
+                        cutoff = (local - dt.timedelta(days=RETENTION_DAYS)).date()
+                        for obj in lst or []:
+                            # filenames like 20250919.zip
+                            base = (obj.get("name") or "").split(".")[0]
+                            try:
+                                fdate = dt.datetime.strptime(base, "%Y%m%d").date()
+                                if fdate < cutoff:
+                                    sb.storage().from_("backups").remove([f"org/{p['org_id']}/project/{p['id']}/{obj['name']}"])
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+
+        except Exception:
+            pass
+        await asyncio.sleep(INTERVAL)
+
+
+Nothing else to wire—this rides the scheduler we already start at app boot.
+
+3) OCR “needs attention” badge
+3a) Add a tiny Review API
+
+server/routers/review.py
+
+from fastapi import APIRouter, Depends, Query
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/review", tags=["review"])
+
+@router.get("/pending-count")
+def pending_count(kind: str = Query(...), project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    r = sb.table("review_items").select("id", count="exact")\
+        .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+        .eq("kind", kind).eq("status","pending").execute()
+    return {"count": r.count or 0}
+
+
+Mount it:
+
+from .routers import review
+app.include_router(review.router)
+
+3b) Queue the flag during ingestion (if scanned PDF)
+
+Where we added the OCR heuristic earlier, insert:
+
+# when PDF looks scanned / low-text:
+sb_service = get_service_supabase()  # server-side insert (or use user sb if in request scope)
+sb_service.table("review_items").insert({
+  "org_id": org_id, "project_id": project_id,
+  "artifact_id": artifact_id, "kind": "needs_ocr",
+  "severity": "low", "details": {"filename": filename, "reason": "scanned_pdf_low_text"}
+}).execute()
+
+
+(If you already added a helper queue_review(...), implement it as that insert.)
+
+3c) Frontend badge on Documents tab
+
+client/src/components/NavBadge.tsx
+
+import { useEffect, useState } from "react";
+
+export default function NavBadge({ projectId, kind }:{ projectId:string; kind:string }) {
+  const [n,setN] = useState<number>(0);
+  useEffect(()=>{ (async ()=>{
+    try {
+      const r = await fetch(`/api/review/pending-count?project_id=${projectId}&kind=${encodeURIComponent(kind)}`, { credentials: "include" });
+      if (r.ok) setN((await r.json()).count || 0);
+    } catch {}
+  })(); }, [projectId, kind]);
+
+  if (!n) return null;
+  return (
+    <span className="ml-1 inline-flex items-center justify-center text-[10px] leading-none px-1.5 h-4 rounded-full bg-red-600 text-white">{n}</span>
+  );
+}
+
+
+Use it next to your “Documents” nav item:
+
+import NavBadge from "@/components/NavBadge";
+// ...
+<Link to={`/projects/${projectId}/documents`} className="flex items-center">
+  Documents <NavBadge projectId={projectId!} kind="needs_ocr" />
+</Link>
+
+4) Digest “dry run to self” (7 days) toggle in AdminComms
+4a) API endpoints
+
+In server/routers/comms.py add:
+
+from datetime import datetime, timedelta, timezone
+
+@router.post("/dryrun/start")
+def start_dryrun(to_email: str, days: int = 7, ctx: TenantCtx = Depends(ADMIN_OR_OWNER)):
+    sb = get_user_supabase(ctx)
+    until = datetime.now(timezone.utc) + timedelta(days=days)
+    sb.table("org_comms_settings").upsert({
+        "org_id": ctx.org_id,
+        "digest_dry_run_to_email": to_email,
+        "digest_dry_run_until": until.isoformat()
+    }, on_conflict="org_id").execute()
+    return {"ok": True, "until": until.isoformat()}
+
+@router.post("/dryrun/stop")
+def stop_dryrun(ctx: TenantCtx = Depends(ADMIN_OR_OWNER)):
+    sb = get_user_supabase(ctx)
+    sb.table("org_comms_settings").update({
+        "digest_dry_run_to_email": None,
+        "digest_dry_run_until": None
+    }).eq("org_id", ctx.org_id).execute()
+    return {"ok": True}
+
+4b) Admin UI controls
+
+Patch client/src/pages/AdminComms.tsx:
+
+// inside component
+const [dryEmail,setDryEmail] = useState("");
+
+async function startDryRun() {
+  const email = dryEmail || prompt("Send only to this email for 7 days:", "") || "";
+  if (!email) return;
+  await apiPost("/comms/dryrun/start", undefined, { to_email: email, days: "7" });
+  alert("Dry run enabled for 7 days.");
+  await load();
+}
+async function stopDryRun() {
+  await apiPost("/comms/dryrun/stop");
+  alert("Dry run disabled.");
+  await load();
+}
+
+
+Add UI section near the Save button:
+
+<div className="border rounded p-3 space-y-2">
+  <div className="font-medium">Digest Dry-Run</div>
+  <div className="text-sm text-muted-foreground">
+    Sends digests to one address only (no one else) for 7 days.
+  </div>
+  <div className="flex gap-2">
+    <input className="border rounded p-2 flex-1" placeholder="your@email.com"
+           value={dryEmail} onChange={e=>setDryEmail(e.target.value)} />
+    <button className="px-3 py-2 rounded border" onClick={startDryRun}>Start (7 days)</button>
+    <button className="px-3 py-2 rounded border" onClick={stopDryRun}>Stop</button>
+  </div>
+  {s.digest_dry_run_to_email && s.digest_dry_run_until && (
+    <div className="text-xs">
+      Active → {s.digest_dry_run_to_email} until {new Date(s.digest_dry_run_until).toLocaleString()}
+    </div>
+  )}
+</div>
+
+5) Quick validation checklist
+
+Subscriptions:
+
+Insert a row in team_subscriptions with digest_weekly=false for a PM; weekly digest excludes them; set true → included.
+
+Dry Run:
+
+/api/comms/dryrun/start?to_email=you@... → weekly send only to you; /stop ends it.
+
+Backups:
+
+Set SCHEDULER_INTERVAL_SEC=10, adjust local time to 01:59→02:01 org-local; verify object in backups/org/<org>/project/<proj>/YYYYMMDD.zip; older than 14 days auto-removed.
+
+OCR badge:
+
+Upload a low-text scanned PDF; review_items row with kind='needs_ocr' and status='pending'; “Documents” shows red dot; resolving (set status=resolved) removes dot.
+
+That’s all four, wired and ready. Want me to add a tiny Subscriptions admin grid next (toggle weekly/monthly per member), or roll into Wellness Page after this push?

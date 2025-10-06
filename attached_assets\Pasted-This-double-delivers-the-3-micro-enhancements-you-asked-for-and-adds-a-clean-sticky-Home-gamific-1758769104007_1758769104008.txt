@@ -1,0 +1,388 @@
+This double delivers the 3 micro-enhancements you asked for and adds a clean, sticky Home (+ gamification) so users land on a personal “what matters now” view. Everything is copy-paste ready, Brand v2–aware, and dev-safe (new endpoints return safe empties if tables/columns aren’t present).
+
+✅ Enhancement 1 — Server-remembered prefs in more places
+
+Remember user choices for Digest Preview and Change List filters (server-side, not just local).
+
+We shipped /api/user_prefs in v2.16.8. Use it like this:
+
+A) Digest Preview (remember Mute empty)
+
+client/src/pages/DigestPreview.tsx (patch)
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+
+async function getPref(projectId:string|undefined, key:string){ try{
+  const r = await fetch(`/api/user_prefs/get?key=${encodeURIComponent(key)}${projectId?`&project_id=${projectId}`:""}`, {credentials:"include"});
+  const d = await r.json(); return d?.val;
+}catch{return null;}}
+async function setPref(projectId:string|undefined, key:string, val:string){ try{
+  await fetch(`/api/user_prefs/set${projectId?`?project_id=${projectId}`:""}`, {method:"POST",credentials:"include",
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({ key, val })});
+}catch{} }
+
+export default function DigestPreview(){
+  const { projectId } = useParams();
+  const [html,setHtml]=useState("<div class='p-3'>Loading…</div>");
+  const [mute,setMute]=useState(true);
+
+  useEffect(()=>{ (async()=>{
+    const saved = await getPref(projectId, "digest_preview.mute");
+    if (saved=== "0" || saved==="1") setMute(saved==="1");
+  })(); },[projectId]);
+  useEffect(()=>{ (async()=>{
+    await setPref(projectId, "digest_preview.mute", mute? "1":"0");
+    const r = await fetch(`/api/digest/preview_html?project_id=${projectId}&mute_empty=${mute?'1':'0'}`, { credentials:"include" });
+    setHtml(await r.text());
+  })(); },[projectId, mute]);
+
+  async function sendTest(){ /* existing */ }
+
+  return (
+    <div className="brand-card p-3 space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="text-sm font-medium">Digest Preview</div>
+        <div className="flex items-center gap-2">
+          <label className="text-xs flex items-center gap-1">
+            <input type="checkbox" checked={mute} onChange={e=>setMute(e.target.checked)}/> Mute empty sections
+          </label>
+          <button className="brand-btn text-xs" onClick={sendTest}>Send test to me</button>
+        </div>
+      </div>
+      <iframe title="digest" className="w-full h-[70vh] border rounded bg-white" srcDoc={html}/>
+    </div>
+  );
+}
+
+B) Change List (remember filters & sort)
+
+client/src/pages/ChangeList.tsx (patch near state)
+
+import { useEffect, useMemo, useState } from "react";
+import { useParams } from "react-router-dom";
+
+async function getPref(projectId:string|undefined, key:string){ try{
+  const r=await fetch(`/api/user_prefs/get?key=${encodeURIComponent(key)}${projectId?`&project_id=${projectId}`:""}`, {credentials:"include"}); 
+  const d=await r.json(); return d?.val;
+}catch{return null;}}
+async function setPref(projectId:string|undefined, key:string, val:string){ try{
+  await fetch(`/api/user_prefs/set${projectId?`?project_id=${projectId}`:""}`, {method:"POST",credentials:"include",
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({ key, val })});
+}catch{} }
+
+const PREF_KEY = "changes.list.filters";
+
+export default function ChangeList(){
+  const { projectId } = useParams();
+  const [rows,setRows]=useState<any[]>([]);
+  const [area,setArea]=useState(""); const [status,setStatus]=useState("");
+  const [priority,setPriority]=useState(""); const [assignee,setAssignee]=useState("");
+  const [sort,setSort]=useState<"sla"|"due"|"priority">("sla");
+  const [sel,setSel]=useState<Record<string,boolean>>({});
+
+  // Load saved
+  useEffect(()=>{ (async()=>{
+    const v = await getPref(projectId, PREF_KEY);
+    if (!v) return;
+    try{
+      const p = JSON.parse(v);
+      setArea(p.area||""); setStatus(p.status||""); setPriority(p.priority||""); setAssignee(p.assignee||""); setSort(p.sort||"sla");
+    }catch{}
+  })(); },[projectId]);
+
+  // Save prefs
+  useEffect(()=>{ (async()=>{
+    const val = JSON.stringify({area,status,priority,assignee,sort});
+    await setPref(projectId, PREF_KEY, val);
+  })(); },[area,status,priority,assignee,sort,projectId]);
+
+  // ...existing load(), UI...
+}
+
+✅ Enhancement 2 — GuideEditor inline previews for uploaded media
+
+client/src/components/GuideEditor.tsx (add simple markdown preview)
+
+function renderStepPreview(s:string){
+  // very light, safe-ish rendering: images & links; everything else plain text
+  const isImg = /^\!\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/.exec(s);
+  const isLink = /^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/.exec(s);
+  if (isImg) return <img src={isImg[1]} alt="guide-image" className="max-w-full rounded border"/>;
+  if (isLink) return <a href={isLink[2]} target="_blank" rel="noreferrer" className="underline">{isLink[1]}</a>;
+  return <pre className="whitespace-pre-wrap">{s}</pre>;
+}
+
+// Inside the Steps section, beneath each textarea:
+<div className="text-[11px] text-muted-foreground">Preview:</div>
+<div className="p-2 border rounded bg-white/5">{renderStepPreview(s)}</div>
+
+
+This avoids full markdown/XSS, but shows images/links nicely. (When you want richer markdown, we’ll drop in a vetted renderer.)
+
+✅ Enhancement 3 — Updates header badge shows unseen count from server
+A) Backend: store “seen at” in user_prefs
+
+Patch existing notifications router to record seen time and compute unseen count.
+
+server/routers/notifications.py (replace mark_read_all and add unseen_count)
+
+from datetime import datetime, timezone
+from ..deps import get_user_supabase
+
+@router.post("/mark_read_all")
+def mark_read_all(project_id: str | None = Query(None), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        sb.table("user_prefs").upsert({
+            "user_id": ctx.user_id, "project_id": project_id, "key":"notify_seen_at",
+            "scope": "_global", "val": datetime.now(timezone.utc).isoformat()
+        }, on_conflict="user_id,project_id,key,scope").execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+@router.get("/unseen_count")
+def unseen_count(project_id: str | None = Query(None), days:int=14, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    start = (datetime.now(timezone.utc) - timedelta(days=max(1,days))).isoformat()
+    try:
+        pref = sb.table("user_prefs").select("val").eq("user_id",ctx.user_id)\
+               .eq("key","notify_seen_at").eq("scope","_global").eq("project_id",project_id).single().execute().data or {}
+        seen = pref.get("val")
+    except Exception:
+        seen = None
+    def ts(x): 
+        try: return datetime.fromisoformat((x or "").replace("Z","+00:00"))
+        except Exception: return None
+
+    items = list_notifs(project_id, days, ctx).get("items", [])
+    if not seen: return {"count": len(items)}
+    seen_ts = ts(seen)
+    c = sum(1 for i in items if (ts(i.get("created_at")) and ts(i.get("created_at"))>seen_ts))
+    return {"count": c}
+
+
+(If your user_prefs table doesn’t exist yet, this gracefully returns {"count": 0}.)
+
+B) Frontend header badge
+
+client/src/components/BrandedHeader.tsx (replace the badge logic)
+
+const [count,setCount]=useState(0);
+useEffect(()=>{ let t:any;
+  (async function pull(){
+    try{
+      const r = await fetch(`/api/notify/unseen_count?project_id=${projectId||""}`, {credentials:"include"});
+      const d = await r.json(); setCount(d.count||0);
+    }catch{ setCount(0); }
+    t = setTimeout(pull, 60_000);
+  })();
+  return ()=>clearTimeout(t);
+},[projectId]);
+
+async function openDrawer(){
+  setOpenN(true);
+  // do not mark read immediately — only on explicit action
+}
+async function markAllRead(){
+  await fetch(`/api/notify/mark_read_all?project_id=${projectId||""}`, {method:"POST",credentials:"include"});
+  setCount(0); setOpenN(false);
+}
+
+<button className="brand-btn text-xs relative" onClick={openDrawer}>Updates {count? `(${count})`:""}</button>
+<NotificationsDrawer open={openN} onClose={()=>setOpenN(false)}>
+  {/* add a button inside drawer footer to mark read */}
+</NotificationsDrawer>
+
+
+(You can pass markAllRead into the drawer and tie it to the “Mark all read” button.)
+
+🏠 Home & Gamification — What I recommend
+
+My take: you don’t need a separate “portal” if your Dashboard is powerful, but a Home that’s personalized (to-do, catch-up, streaks/badges) is worth it. It becomes the anchor that keeps users in TEAIM post-go-live.
+
+What we add now (minimal, sticky):
+
+Home (“My Home”) that aggregates:
+
+My CRs (assignee) ordered by SLA risk (+ “Nudge myself”)
+
+My Mentions / Comments (area comments mentioning me)
+
+Today / Next meetings (join links)
+
+Pending Sign-offs I initiated (for PMs/Owners)
+
+Badges & streaks (simple, positive reinforcement)
+
+Gamification (keep it classy, not spammy):
+
+Points: +1 daily check-in (wellness), +3 when you close a CR, +2 when you publish a guide, +1 comment promoted to guide, +2 when area summary has no open risks weekly.
+
+Badges:
+
+Guide Author (1st guide), Mentor (5 guides), Closer (10 CRs closed), Reliability (7-day wellness streak), Sherpa (owner digest sent weekly)
+
+We’ll track in a badges and scores table; award best-effort in the places we already touch; manual award endpoint exists if you want to backfill points.
+
+A) Backend — minimal Gamify API
+
+server/routers/gamify.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from datetime import datetime, timezone
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/gamify", tags=["gamify"])
+
+@router.get("/badges")
+def badges(user_id: str | None = None, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    uid = user_id or ctx.user_id
+    try:
+        rows = sb.table("badges").select("badge,awarded_at,points").eq("user_id", uid).order("awarded_at",desc=True).limit(100).execute().data or []
+        score = sb.table("scores").select("points").eq("user_id", uid).single().execute().data or {}
+        return {"items": rows, "score": int(score.get("points") or 0)}
+    except Exception:
+        return {"items": [], "score": 0}
+
+class AwardBody(BaseModel):
+    user_id: str
+    badge: str
+    points: int = 1
+
+@router.post("/award")
+def award(body: AwardBody, ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    sb = get_user_supabase(ctx)
+    try:
+        sb.table("badges").insert({"user_id": body.user_id, "badge": body.badge, "points": body.points, "awarded_at": datetime.now(timezone.utc).isoformat()}).execute()
+        # bump score
+        cur = sb.table("scores").select("points").eq("user_id", body.user_id).single().execute().data or {}
+        pts = int(cur.get("points") or 0) + body.points
+        sb.table("scores").upsert({"user_id": body.user_id, "points": pts}).execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+
+Mount in server/main.py:
+
+from .routers import gamify
+app.include_router(gamify.router)
+
+
+(We can call /api/gamify/award from places like guides.upsert when id is new → award “Guide Author”. Dev-safe if table is missing, it no-ops.)
+
+B) Home page
+
+client/src/pages/Home.tsx (new)
+
+import { useEffect, useState } from "react";
+import { useParams, useNavigate } from "react-router-dom";
+import { getJSON } from "@/lib/authFetch";
+import PageHeading from "@/components/PageHeading";
+
+export default function Home(){
+  const { projectId } = useParams(); const nav=useNavigate();
+  const [mine,setMine]=useState<any[]>([]);   // my CRs
+  const [notes,setNotes]=useState<any[]>([]); // my mentions/comments
+  const [meet,setMeet]=useState<any[]>([]);   // meetings today/next
+  const [badges,setBadges]=useState<{items:any[],score:number}>({items:[],score:0});
+
+  useEffect(()=>{ (async()=>{
+    try{
+      const prof = await (await fetch(`/api/presence/me`, {credentials:"include"})).json();
+      const me = prof?.user_id || "";
+      const cr = await getJSON(`/api/changes/list_advanced?project_id=${projectId}&assignee=${encodeURIComponent(me)}&sort=sla`);
+      setMine(cr.items||[]);
+    }catch{ setMine([]); }
+    try{
+      const n = await getJSON(`/api/notify/list`); 
+      setNotes((n.items||[]).filter((x:any)=> (x.detail||"").toLowerCase().includes("@"))); // simple mention sniff
+    }catch{ setNotes([]); }
+    try{
+      const m = await getJSON(`/api/meetings/recent?project_id=${projectId}&limit=5`); setMeet(m.items||[]);
+    }catch{ setMeet([]); }
+    try{
+      const g = await getJSON(`/api/gamify/badges`); setBadges(g||{items:[],score:0});
+    }catch{ setBadges({items:[],score:0}); }
+  })(); },[projectId]);
+
+  return (
+    <div>
+      <PageHeading title="My Home" crumbs={[{label:"Home"}]} />
+      <div className="grid lg:grid-cols-3 gap-3">
+        <div className="brand-card p-3">
+          <div className="text-xs text-muted-foreground mb-1">My CRs (SLA order)</div>
+          <ul className="text-xs list-disc pl-4">
+            {mine.slice(0,8).map((r:any)=>(<li key={r.id}>
+              <a className="underline" href={`/projects/${projectId}/changes/list`}>{r.title}</a> — {r.area||"—"} • due {r.due_date||"n/a"}
+            </li>))}
+            {!mine.length && <li className="text-muted-foreground">Nothing pending.</li>}
+          </ul>
+        </div>
+        <div className="brand-card p-3">
+          <div className="text-xs text-muted-foreground mb-1">Mentions / Comments</div>
+          <ul className="text-xs list-disc pl-4">
+            {notes.slice(0,8).map((n:any,i:number)=>(<li key={i}>{n.title}: {n.detail}</li>))}
+            {!notes.length && <li className="text-muted-foreground">No new notes.</li>}
+          </ul>
+        </div>
+        <div className="brand-card p-3">
+          <div className="text-xs text-muted-foreground mb-1">Today / Next Meetings</div>
+          <ul className="text-xs list-disc pl-4">
+            {meet.slice(0,5).map((m:any)=>(<li key={m.id}>{new Date(m.starts_at).toLocaleString()} — {m.title||m.id}</li>))}
+            {!meet.length && <li className="text-muted-foreground">No meetings.</li>}
+          </ul>
+        </div>
+      </div>
+
+      <div className="brand-card p-3 mt-3">
+        <div className="text-xs text-muted-foreground mb-1">Badges & Score</div>
+        <div className="text-sm font-medium mb-1">Score: {badges.score}</div>
+        <div className="flex flex-wrap gap-1">
+          {(badges.items||[]).slice(0,12).map((b:any,i:number)=>(
+            <span key={i} className="text-[11px] px-1.5 py-[1px] rounded bg-emerald-500/15 text-emerald-600">{b.badge}</span>
+          ))}
+          {!badges.items?.length && <span className="text-xs text-muted-foreground">No badges yet.</span>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+Route & Access
+
+// client/src/App.jsx
+import Home from "@/pages/Home";
+// …
+<Route path="/projects/:projectId/home" element={<Home/>} />
+
+
+Add a small “Home” link (header or sidebar) for users.
+
+Quick thoughts on gamification & Home vs Dashboard
+
+Keep gamification supportive (not spammy). Badges work best as gentle celebration when PMs/owners do the right thing (close CRs, publish guides). Points should unlock nothing mission-critical—just recognition.
+
+Home is personal scope (my CRs, my mentions, my meetings, my badges).
+Dashboard stays project scope (KPI tiles, changes grid, releases/reports health).
+
+Over time, add weekly owner digest & streak nudges (e.g., “post a daily wellness check”): make it opt-in, transparent, and revocable.
+
+2-Minute Validation
+
+Digest Preview + Change List remember settings server-side
+
+GuideEditor shows inline media previews for uploaded images/links
+
+Header “Updates” shows true unseen count (server time) and clears on mark
+
+Home page gives users a clean “what’s next” view; badges/score surface nicely
+
+Slack/Teams: /area … #guide creates a structured note in the right area

@@ -1,0 +1,172 @@
+You’re down to 4 reds because each test is looking for one extra condition your endpoints (or seed) still don’t satisfy. Do these, in order—each step flips a red.
+
+0) Quick sanity: are we passing userId?
+
+In your Test Runner seed call, you must pass the current user id.
+
+await fetch("/admin/test/seed-v2", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ projectId, userId: currentUserId })   // <= required
+});
+
+
+If userId isn’t passed, the unseen notifications test will stay red.
+
+1) Digest preview (red)
+
+Why it fails: the endpoint filters more than just changes/comments. Common extra filters:
+
+visible = true / published = true
+
+last X days window
+
+requires projects row
+
+Fix (either/or):
+
+Seed: set flags + recent timestamps (you likely already did timestamps).
+
+// when inserting changes/comments
+visible: true, published: true
+
+
+Endpoint guard (safe in dev):
+
+// WHERE project_id = ? AND (visible IS TRUE OR visible IS NULL)
+
+
+Smoke check:
+
+fetch(`/api/digest/preview?projectId=${projectId}`).then(r=>r.json()).then(console.log);
+
+
+Expect at least 1 change + 1 comment.
+
+2) Area ZIP (HCM) (red)
+
+Why it fails: endpoint expects an artifact for HCM with a specific kind:
+
+usually kind IN ('area_zip','area_export_zip') and area_id = HCM.
+
+Fix:
+
+Seed an artifact precisely matching the filter.
+
+await tx.insert(artifacts).values([{
+  id: ids.artZip,
+  projectId,
+  areaId: ids.areaHcm,
+  kind: "area_zip",                 // exact
+  filename: "hcm_area_export.zip",
+  mime: "application/zip",
+  size: 128,
+  storage: "inline",
+  data: Buffer.from("PK").toString("base64"), // minimal ZIP signature
+  createdAt: now
+}]);
+
+
+Endpoint guard (broaden in dev):
+
+-- WHERE project_id = $1 AND area_id = $2 AND kind IN ('area_zip','wb_export_csv')
+
+
+Smoke:
+
+fetch(`/api/artifacts?projectId=${projectId}&areaKey=HCM`).then(r=>r.json()).then(console.log);
+
+3) Notifications unseen count (red)
+
+Why it fails: your query likely scopes to the current user.
+Fix:
+
+Seed the notification with that userId (see step 0).
+
+await tx.insert(notifications).values([{
+  id: ids.notif1, projectId, kind: "digest_ready",
+  seen: false, userId, payload: { areas:["HCM","FIN"] }, createdAt: now
+}]);
+
+
+Endpoint guard (dev-friendly):
+
+-- WHERE project_id = $1 AND (user_id = $2 OR $2 IS NULL) AND seen = false
+
+
+Smoke:
+
+fetch(`/api/notifications/unseen-count?projectId=${projectId}`).then(r=>r.json()).then(console.log);
+
+
+Expect { count: 1 }.
+
+4) Releases ICS (red)
+
+Why it fails: many builds generate ICS from calendar events and ignore the releases row unless there’s a future event.
+
+Fix:
+
+Seed a future event (inside your ICS window, e.g., next 30–60 days).
+
+const starts = dayjs().add(2,"day").toISOString();
+const ends   = dayjs(starts).add(1,"hour").toISOString();
+await tx.insert(calendarEvents).values([{
+  id: ids.cal1, projectId, title:"Stage Gate",
+  startsAt: starts, endsAt: ends, channel: "staging", createdAt: now
+}]);
+
+
+Endpoint: allow events-only ICS in dev:
+
+// SELECT events by project_id AND starts_at BETWEEN now() AND now()+interval '60 days'
+
+
+Smoke:
+
+fetch(`/api/releases/ics?projectId=${projectId}`).then(r=>r.text()).then(t=>console.log(t.slice(0,100)));
+
+
+Expect it to start with BEGIN:VCALENDAR.
+
+5) Add tiny dbg routes (helps instantly pinpoint filters)
+
+If anything’s still red, drop these one-liners and hit them:
+
+// GET /admin/test/dbg/digest
+SELECT count(*) FROM changes WHERE project_id=$1 AND (visible IS TRUE OR visible IS NULL);
+
+// GET /admin/test/dbg/artifacts
+SELECT kind, area_id FROM artifacts WHERE project_id=$1;
+
+// GET /admin/test/dbg/notifications
+SELECT count(*) FROM notifications WHERE project_id=$1 AND seen=false AND (user_id=$2 OR $2 IS NULL);
+
+// GET /admin/test/dbg/events
+SELECT count(*) FROM calendar_events WHERE project_id=$1 AND starts_at BETWEEN now() AND now()+interval '60 days';
+
+6) One-run checklist (do this now)
+
+Ensure the seed call passes { projectId, userId }.
+
+Seed artifacts with kind:'area_zip' for HCM.
+
+Seed notifications with userId (your impersonated dev user).
+
+Seed 1 future calendar event (2–14 days out).
+
+Add the dev-friendly guards above if filters are too strict.
+
+Click Seed & Run.
+
+If you want, give me your file paths for:
+
+digest preview handler,
+
+area ZIP handler,
+
+notifications unseen endpoint,
+
+releases/ics endpoint,
+
+and I’ll return exact patch blocks so you can paste and be done.

@@ -1,0 +1,92 @@
+/* Load brand fonts */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Poppins:wght@500;600;700&display=swap');
+
+:root {
+  --brand-bg: #0b0d10;
+  --brand-surface: #12161b;
+  --brand-text: #e6eef8;
+  --brand-muted: #8fa1b3;
+
+  --brand-primary: #5a73ff;    /* Royal */
+  --brand-accent:  #1de4ff;    /* Neon Aqua */
+  --brand-magenta: #f13cff;    /* Magenta */
+  --brand-orange:  #ff6b35;    /* Enterprise Orange */
+  --brand-warn:    #ffd34f;    /* Yellow */
+  --brand-good:    #19d492;    /* Green */
+
+  --brand-gradient: linear-gradient(90deg, var(--brand-primary), var(--brand-magenta));
+  --brand-glow: none;
+  --brand-ring: 0 0 0 2px rgba(255,193,7,0.5);
+}
+
+/* Brand v2 "on" class flips typography + subtle background */
+.brand-v2 {
+  background: var(--brand-bg);
+  color: var(--brand-text);
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Arial, sans-serif;
+}
+
+.brand-v2 h1, .brand-v2 h2, .brand-v2 h3, .brand-v2 .heading {
+  font-family: Poppins, Inter, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Arial, sans-serif;
+}
+
+.brand-card {
+  background: var(--brand-surface);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 10px;
+}
+
+.brand-chip {
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 999px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.brand-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.55rem 1rem;
+  border-radius: 12px;
+  font-weight: 600;
+  background: var(--brand-orange);      /* your TEAIM accent */
+  border: 1px solid #C65115;            /* darker edge */
+  color: #0B0B0D;                       /* dark text for contrast */
+  box-shadow: none;                     /* kill glow */
+  transition: background .12s ease, border-color .12s ease, transform .06s ease;
+}
+
+.brand-btn:hover {
+  background: #ff752a;                  /* slight brighten */
+  border-color: #d85a1a;
+}
+
+.brand-btn:active {
+  transform: translateY(1px);           /* subtle tactile press */
+}
+
+.brand-btn:focus-visible {
+  outline: 2px solid var(--brand-warn); /* keeps keyboard users visible */
+  outline-offset: 2px;
+  box-shadow: none;
+}
+
+.brand-btn:disabled,
+.brand-btn[aria-busy="true"] {
+  opacity: .65;
+  cursor: not-allowed;
+}
+
+.gradient-text {
+  background: var(--brand-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Focus ring */
+.brand-v2 :focus-visible {
+  outline: none;
+  box-shadow: var(--brand-ring);
+}

@@ -1,0 +1,99 @@
+1) Stop React/Vite from hijacking API routes
+
+Prefix your API with /api and proxy everything under it to FastAPI before the Vite catch-all. Then point the frontend to /api/....
+
+Express proxy (drop-in)
+
+server/routes.ts
+
+import { Router } from "express";
+import { createProxyMiddleware } from "http-proxy-middleware";
+
+const r = Router();
+
+// one proxy for all API calls -> FastAPI
+r.use(
+  "/api",
+  createProxyMiddleware({
+    target: "http://127.0.0.1:8000",
+    changeOrigin: false,
+    pathRewrite: { "^/api": "" }, // /api/ask -> /ask
+    onProxyReq: (proxyReq) => {
+      // avoid gzip issues with multipart
+      proxyReq.setHeader("accept-encoding", "identity");
+    },
+  })
+);
+
+export default r;
+
+
+server/index.ts (ensure order: health → routes → vite catch-all)
+
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+// IMPORTANT: mount routes BEFORE vite/static catch-all
+app.use(require("./routes").default);
+
+// ...then vite dev middleware / static server here...
+
+2) Point the frontend at /api
+
+Update the components you added earlier.
+
+web/src/components/ChatDock.jsx
+
+const res = await fetch('/api/ask', {  // <-- /api
+  method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body: JSON.stringify({ org_id: orgId, project_id: projectId, question: userMsg.content, k: 8 })
+});
+
+
+web/src/components/UploadButton.jsx
+
+const res = await fetch('/api/ingest', { method:'POST', body: fd }); // <-- /api
+
+
+web/src/pages/Library.jsx
+
+fetch(`/api/artifacts?org_id=${encodeURIComponent(orgId)}&project_id=${encodeURIComponent(projectId)}&limit=100`)
+//            ^^^^
+
+
+FastAPI already exposes /ask, /ingest, /artifacts; the proxy maps /api/* → FastAPI.
+
+Sanity tests (copy/paste)
+
+Proxy health
+
+curl -s http://localhost:5000/health
+curl -s http://localhost:5000/api/ | jq   # should show FastAPI health payload
+
+
+Upload from UI
+
+Paste your UUIDs:
+
+org: d915376c-2bd7-4e79-b9c9-aab9d7fcb5a8
+
+project: dced0b98-87b4-46ff-b2a4-2cf8e627e8d2
+
+Upload a small TXT/PDF.
+
+Check DB (Supabase → SQL):
+
+select id, title, chunk_count from artifacts
+where project_id = 'dced0b98-87b4-46ff-b2a4-2cf8e627e8d2'
+order by created_at desc limit 5;
+
+select count(*) from artifact_chunks
+where project_id = 'dced0b98-87b4-46ff-b2a4-2cf8e627e8d2';
+
+
+Library
+Open Library page → should list the file with an “Open” signed link.
+
+Ask Kap
+Ask: “Summarize the latest document.”
+You should get an answer + Sources: with your filename. If it says “need more context,” upload one more file and retry (embeds can take ~a few seconds post-upload).

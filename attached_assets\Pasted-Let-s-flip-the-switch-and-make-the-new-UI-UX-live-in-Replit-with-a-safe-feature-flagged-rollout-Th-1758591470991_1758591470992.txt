@@ -1,0 +1,186 @@
+Let’s flip the switch and make the new UI/UX live in Replit with a safe, feature-flagged rollout. This push (v2.6.3) makes Brand v2 ON by default, adds a tiny in-app Brand v2 toggle, and ensures the brand class is applied at the document level so the new header/sidebar render everywhere.
+
+Paste the snippets below 1:1.
+
+0) Turn the flag on (Replit)
+
+Replit Secrets / .env
+
+VITE_BRAND_V2=1
+
+
+This will make the new UI render by default. You can still toggle it in-page for demos.
+
+1) Brand flag helpers (apply class + toggle)
+
+client/src/lib/brand.ts (replace file)
+
+export function isBrandV2(): boolean {
+  if (typeof window !== "undefined") {
+    const u = new URL(window.location.href);
+    if (u.searchParams.has("brandv2")) {
+      const v = u.searchParams.get("brandv2") === "1";
+      if (v) localStorage.setItem("kap.brandv2","1");
+      else localStorage.removeItem("kap.brandv2");
+      return v;
+    }
+    if (localStorage.getItem("kap.brandv2") === "1") return true;
+  }
+  return import.meta.env.VITE_BRAND_V2 === "1";
+}
+
+export function setBrandV2(on: boolean) {
+  if (on) localStorage.setItem("kap.brandv2","1");
+  else localStorage.removeItem("kap.brandv2");
+  // Re-apply the class and hard refresh to avoid half-applied styles
+  applyBrandClass();
+  location.reload();
+}
+
+export function applyBrandClass() {
+  if (typeof document === "undefined") return;
+  const on = isBrandV2();
+  document.documentElement.classList.toggle("brand-v2", on);
+}
+
+2) Apply brand class at app boot
+
+client/src/main.tsx (add the import + call near top)
+
+import React from "react";
+import ReactDOM from "react-dom/client";
+import App from "./App";
+// ...
+import { applyBrandClass } from "@/lib/brand";
+
+applyBrandClass(); // <-- ensure the brand-v2 class is on <html> before app renders
+
+ReactDOM.createRoot(document.getElementById("root")!).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+
+
+If your main.tsx has a different shape, just run applyBrandClass() before you render <App/>.
+
+3) Add an in-app Brand v2 toggle button (for demos)
+
+client/src/components/BrandedHeader.tsx — add a small toggle pill to the right:
+
+import { isBrandV2, setBrandV2 } from "@/lib/brand";
+// …existing imports…
+
+export default function BrandedHeader(){
+  // …existing code…
+  return (
+    <div className="w-full border-b" style={{borderColor: b.theme_color || "#111111"}}>
+      <BrandTheme color={b.theme_color}/>
+      <div className="flex items-center justify-between p-2">
+        <div className="flex items-center gap-2">
+          {b.customer_logo_path &&
+            <img src={`/branding/logo?which=customer${projectId?`&project_id=${projectId}`:""}`} alt="customer" className="h-6" />}
+          {b.customer_name && <div className="text-sm font-medium">{b.customer_name}</div>}
+        </div>
+
+        {/* center text */}
+        {b.header_text && <div className="text-xs text-muted-foreground">{b.header_text}</div>}
+
+        <div className="flex items-center gap-2">
+          {/* DEMO TOGGLE */}
+          <button
+            className="brand-btn text-xs"
+            onClick={()=> setBrandV2(!isBrandV2())}
+            title="Toggle Brand v2"
+          >
+            {isBrandV2() ? "Brand v2: On" : "Brand v2: Off"}
+          </button>
+
+          {b.vendor_logo_path &&
+            <img src={`/branding/logo?which=vendor${projectId?`&project_id=${projectId}`:""}`} alt="vendor" className="h-6" />}
+          <div className="text-sm font-semibold" style={{color:b.theme_color || "#111111"}}>TEAIM</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+This gives you a quick demo switch without touching env. The class and rebuild apply instantly on refresh.
+
+4) Ensure all brand CSS is loading
+
+You should already have:
+
+client/src/brand/tokens.css (colors/typography)
+
+client/src/brand/micro.css (shimmer/glow)
+
+client/src/brand/print.css (export/PDF styles)
+
+and they’re imported in client/src/index.css:
+
+@import "./brand/tokens.css";
+@import "./brand/micro.css";
+@import "./brand/print.css";
+
+
+Double-check that these lines are present (and in this order or similar).
+
+5) Use SidebarV2 & DashboardV2 automatically when the flag is on
+
+You already wired this, but confirm your App.jsx uses:
+
+import { isBrandV2 } from "@/lib/brand";
+import BrandedHeader from "@/components/BrandedHeader";
+import NotificationDrawer from "@/components/NotificationDrawer";
+import SidebarV2 from "@/components/SidebarV2";
+import DashboardV2 from "@/pages/DashboardV2";
+
+function AppContent(){
+  const brand = isBrandV2();
+  // extract userRole as you fixed earlier
+  return (
+    <div className={brand ? "brand-v2 min-h-screen" : "min-h-screen"}>
+      {brand && <BrandedHeader />}
+      <div className="flex">
+        {brand ? <SidebarV2 /> : <Sidebar /* legacy */ />}
+        <div className="flex-1 p-3">
+          <Routes>
+            <Route path="/projects/:projectId/dashboard"
+              element={ brand ? <DashboardV2/> : <Dashboard /* legacy */ /> } />
+            {/* remaining routes unchanged */}
+          </Routes>
+        </div>
+      </div>
+      {brand && (
+        <div className="fixed right-3 top-3 z-[96]">
+          <NotificationDrawer />
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+With VITE_BRAND_V2=1, the new layout/IA should be the default view in Replit.
+
+6) Quick sanity (dev)
+
+Open any project URL with no query string: the new header + SidebarV2 should render (flag is on by env).
+
+Visit ?brandv2=0 to force legacy UI (for A/B), or click the toggle button to flip.
+
+Branding logos: header should show customer/vendor logos via /branding/logo.
+
+Notification drawer button (bell) opens the new panel; list loads as before.
+
+7) If anything still looks legacy in Replit
+
+Confirm VITE_BRAND_V2=1 is in Replit secrets, not only .env.
+
+Confirm applyBrandClass() runs before <App/> renders.
+
+Make sure no stray CSS overrides .brand-v2 (you can inspect <html class="brand-v2"> in DevTools).
+
+Clear the browser cache (or add ?v=ts to the URL once) if HMR stale styles show.

@@ -1,0 +1,136 @@
+Here’s the fix—surgical and fast.
+
+1) Expand seed contract (project + user-aware)
+
+Update your seed to accept a userId and to insert the minimum rows each test actually reads.
+
+// server/admin/test/seedMinimal.ts
+export async function seedMinimal(projectId: string, userId?: string) {
+  // ...existing code...
+
+  // NEW: ensure a minimal project record exists (if your digest/zip read it)
+  await tx.insert(projects).values([
+    { id: projectId, name: "TEAIM Test Customer", status: "active", createdAt: now }
+  ]).onConflictDoNothing?.();
+
+  // NEW: artifact for ZIP (pretend CSV export file)
+  await tx.insert(artifacts).values([
+    {
+      id: ids.art1,
+      projectId,
+      areaId: ids.areaHcm,
+      kind: "wb_export_csv",
+      filename: "hcm_export.csv",
+      mime: "text/csv",
+      size: 42,
+      storage: "inline",
+      data: Buffer.from("id,name,status\n1,Test,OK\n").toString("base64"),
+      createdAt: now
+    }
+  ]);
+
+  // NEW: notification tied to the current user (so unseen count > 0)
+  await tx.insert(notifications).values([
+    { id: ids.notif1, projectId, kind: "digest_ready", seen: false, userId: userId ?? null, payload: { areas:["HCM","FIN"] }, createdAt: now }
+  ]);
+
+  // NEW: ICS needs at least one calendar event
+  await tx.insert(calendarEvents).values([
+    { id: ids.cal1, projectId, title: "Stage Gate", startsAt: now, endsAt: dayjs(now).add(1,"hour").toISOString(), channel: "staging", createdAt: now }
+  ]);
+}
+
+
+If you don’t have these tables, add them quickly in your Drizzle bootstrap (see next block).
+
+2) Bootstrap the extra tables (Drizzle SQL)
+
+Add to your /admin/test/bootstrap-and-seed DDL block:
+
+create table if not exists projects (
+  id uuid primary key,
+  name varchar(200) not null,
+  status varchar(24) not null default 'active',
+  created_at timestamp default now()
+);
+
+create table if not exists artifacts (
+  id uuid primary key,
+  project_id uuid not null,
+  area_id uuid,
+  kind varchar(48) not null,
+  filename varchar(200) not null,
+  mime varchar(100) not null,
+  size int not null default 0,
+  storage varchar(24) not null default 'inline', -- inline | s3 | disk
+  data text,                                      -- base64 for inline
+  created_at timestamp default now()
+);
+
+-- add user_id so unseen count can be per-user
+alter table if not exists notifications
+  add column if not exists user_id uuid;
+
+create table if not exists calendar_events (
+  id uuid primary key,
+  project_id uuid not null,
+  title varchar(200) not null,
+  starts_at timestamp not null,
+  ends_at timestamp,
+  channel varchar(24) not null default 'staging',
+  created_at timestamp default now()
+);
+
+
+Call the bootstrap once, then seed again passing the current user.
+
+3) Pass userId from the Test Runner
+
+Use the impersonate control’s user-uuid (bottom bar in your screenshot):
+
+// ui/pages/AdminTestRunner.tsx
+await fetch("/admin/test/seed-v2", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ projectId, userId: currentUserId }) // << add userId
+});
+
+
+Server route:
+
+// server/admin/test/index.ts
+testAdminRouter.post("/seed-v2", async (req, res) => {
+  const { projectId, userId } = req.body;
+  const out = await seedMinimal(projectId, userId);
+  res.json({ seeder:"v2", ...out });
+});
+
+4) Make sure each failing test calls the right data
+
+Digest preview: verify it reads changes + comments by project_id within a recent window. If it filters last 7 days, our timestamps are now—we’re good. If it also requires a projects row, we just added one.
+
+Area ZIP (HCM): verify ZIP endpoint looks for artifacts.kind IN ('wb_export_csv','area_zip') scoped by project_id and area_id = HCM. We inserted one for HCM.
+
+Notifications unseen: verify query uses (project_id = ? AND user_id = current_user AND seen = false). We now seed user_id.
+
+Releases ICS: some builds generate ICS from calendar_events. Ensure the endpoint joins releases or just emits ICS from calendar_events by project_id. We inserted one event.
+
+5) Quick validation calls (from browser console)
+// digest
+fetch(`/api/digest/preview?projectId=${projectId}`).then(r=>r.json()).then(console.log);
+
+// zip (should stream). If there’s a JSON mode:
+fetch(`/api/areas/${hcmAreaId}/zip?projectId=${projectId}&dryRun=1`).then(r=>r.json()).then(console.log);
+
+// notifications
+fetch(`/api/notifications/unseen-count?projectId=${projectId}`).then(r=>r.json()).then(console.log);
+
+// ics
+fetch(`/api/releases/ics?projectId=${projectId}`).then(r=>r.text()).then(t=>console.log(t.slice(0,120)));
+
+
+If any returns empty, that tells us exactly which filter to tweak (usually user_id or project_id).
+
+TL;DR
+
+Testing isn’t passing because those four checks require (a) artifacts/files, (b) per-user notifications, (c) a minimal projects row, and (d) calendar events for ICS. We add the four tiny pieces and pass the userId—and the reds flip.

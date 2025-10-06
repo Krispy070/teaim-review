@@ -1,0 +1,328 @@
+Next Big Build v2.12.11 (two sprints in one). It’s all copy-paste ready, Brand v2–aware, and dev-safe (new endpoints degrade gracefully if a table/column is missing).
+
+Landing now:
+
+Request Sign-Off v4.0 → Pending table gets search & pagination, CSV export, and “Resend (custom subject/body)”; expiring badges stay; PM/Lead presets & stage defaults preserved
+
+Stages batch → Apply template per area only (with preview), Shift by weeks control (both start+end), and guardrail warnings before apply
+
+Digests → per-recipient mute empty sections + a reusable Compact Changes Grid component for in-app dashboards; deep links remain pre-filter aware
+
+Wellness Admin → MA (moving average) toggle + legend on trend; per-user modal includes “Open printable PDF” link (HTML w/ brand header)
+
+1) Request Sign-Off v4.0 — pending search, pagination, CSV, custom resend
+1A) Backend: pending list q/page, pending CSV, and resend custom
+
+server/routers/signoff_pending.py (extend)
+
+from fastapi import APIRouter, Depends, Query
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase, get_service_supabase
+from datetime import datetime, timedelta, timezone
+import os, io, csv
+
+router = APIRouter(prefix="/api/signoff", tags=["signoff"])
+
+@router.get("/pending_list")
+def pending_list(
+    project_id: str = Query(...), 
+    stage_id: str | None = None, 
+    within_hours: int = 48,
+    q: str | None = None,
+    page: int = 1, 
+    page_size: int = 50,
+    ctx: TenantCtx = Depends(member_ctx)
+):
+    sb = get_user_supabase(ctx)
+    try:
+        doc_ids=[]
+        if stage_id:
+            d = sb.table("signoff_docs").select("id").eq("org_id", ctx.org_id)\
+                 .eq("project_id", project_id).eq("stage_id", stage_id).limit(1).execute().data or []
+            if not d: return {"items": [], "total": 0}
+            doc_ids=[d[0]["id"]]
+        qbase = sb.table("signoff_doc_tokens").select("token,doc_id,signer_email,created_at,expires_at")\
+                .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+                .is_("used_at","null").is_("revoked_at","null")
+        if doc_ids: qbase = qbase.in_("doc_id", doc_ids)
+        if q: qbase = qbase.ilike("signer_email", f"%{q}%")
+        # count
+        total = qbase.execute().data or []
+        total_count = len(total)
+        # page
+        rows = sorted(total, key=lambda r: r.get("created_at") or "", reverse=True)[(page-1)*page_size: page*page_size]
+        # expiring badge
+        now = datetime.now(timezone.utc)
+        for r in rows:
+            exp = r.get("expires_at")
+            try:
+                if exp:
+                    ed = datetime.fromisoformat(exp.replace("Z","+00:00"))
+                    r["expiring_soon"] = (ed - now) <= timedelta(hours=within_hours)
+                    r["hours_left"] = round(((ed - now).total_seconds())/3600, 1)
+                else:
+                    r["expiring_soon"], r["hours_left"] = False, None
+            except Exception:
+                r["expiring_soon"], r["hours_left"] = False, None
+        return {"items": rows, "total": total_count, "page": page, "page_size": page_size}
+    except Exception:
+        return {"items": [], "total": 0, "page": 1, "page_size": page_size}
+
+@router.get("/pending_export.csv")
+def pending_export(project_id: str = Query(...), stage_id: str | None = None, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        doc_ids=[]
+        if stage_id:
+            d = sb.table("signoff_docs").select("id").eq("org_id", ctx.org_id)\
+                 .eq("project_id", project_id).eq("stage_id", stage_id).limit(1).execute().data or []
+            if not d: 
+                s=io.StringIO(); csv.writer(s).writerow(["token","signer_email","created_at","expires_at"]); s.seek(0)
+                from fastapi.responses import StreamingResponse
+                return StreamingResponse(iter([s.read()]), media_type="text/csv",
+                   headers={"Content-Disposition": 'attachment; filename="pending.csv"'})
+            doc_ids=[d[0]["id"]]
+        qbase = sb.table("signoff_doc_tokens").select("token,signer_email,created_at,expires_at")\
+                .eq("org_id", ctx.org_id).eq("project_id", project_id).is_("used_at","null").is_("revoked_at","null")
+        if doc_ids: qbase=qbase.in_("doc_id", doc_ids)
+        rows = qbase.order("created_at", desc=True).limit(2000).execute().data or []
+    except Exception:
+        rows=[]
+    s=io.StringIO(); w=csv.writer(s); w.writerow(["token","signer_email","created_at","expires_at"])
+    for r in rows: w.writerow([r.get("token"), r.get("signer_email"), r.get("created_at"), r.get("expires_at")])
+    s.seek(0)
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(iter([s.read()]), media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="pending.csv"'})
+
+class ResendBody(BaseModel):
+    tokens: List[str]
+    subject: str | None = None
+    html: str | None = None
+    min_hours_between: int = 12
+
+@router.post("/resend_selected_custom")
+def resend_selected_custom(body: ResendBody, project_id: str = Query(...), ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    sb = get_user_supabase(ctx)
+    base = os.getenv("APP_BASE_URL","").rstrip("/")
+    sent=0
+    try:
+        rows = sb.table("signoff_doc_tokens").select("token,signer_email")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+               .in_("token", body.tokens).is_("used_at","null").is_("revoked_at","null").execute().data or []
+        now = datetime.now(timezone.utc)
+        from ..email.util import mailgun_send_html, send_guard
+        for r in rows:
+            email=r.get("signer_email"); 
+            if not email: continue
+            # throttle
+            try:
+                last = sb.table("comms_send_log").select("created_at")\
+                       .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+                       .eq("kind","signoff_reminder").eq("to_email", email)\
+                       .order("created_at", desc=True).limit(1).execute().data
+                if last:
+                    dt_last = datetime.fromisoformat(last[0]["created_at"].replace("Z","+00:00"))
+                    if (now - dt_last) < timedelta(hours=body.min_hours_between): 
+                        continue
+            except Exception: ...
+            # send with override
+            ok,_ = send_guard(sb, ctx.org_id, project_id, "signoff_reminder", email)
+            if ok:
+                link = f"{base}/signoff/doc/{r['token']}"
+                subj = body.subject or "[Reminder] Sign-off request pending"
+                html = body.html or f"<p>Your sign-off link: <a href='{link}'>Open</a></p>"
+                html = html.replace("{{LINK}}", link)
+                try: mailgun_send_html([email], subj, html); sent+=1
+                except Exception: ...
+        return {"ok": True, "sent": sent}
+    except Exception:
+        return {"ok": False, "sent": sent}
+
+
+Mount in server/main.py:
+
+from .routers import signoff_tokens_admin  # if not already mounted
+app.include_router(signoff_tokens_admin.router)
+
+1B) Frontend: modal pending table with search/page + CSV + custom resend
+
+Patch client/src/components/SignoffRequestModal.tsx (pending section)
+
+Add state + loaders:
+
+const [qTok,setQTok]=useState("");
+const [page,setPage]=useState(1);
+const [pageSize] = useState(50);
+const [total,setTotal]=useState(0);
+
+async function loadPending(){
+  const qs = new URLSearchParams({ project_id, stage_id: stageId, page:String(page), page_size:String(pageSize) });
+  if (qTok.trim()) qs.set("q", qTok.trim());
+  const d = await getJSON(`/api/signoff/pending_list?${qs.toString()}`);
+  setPending(d.items||[]); setTotal(d.total||0);
+}
+useEffect(()=>{ loadPending(); /* eslint-disable-next-line */}, [projectId, stageId, page, qTok]);
+
+
+Controls:
+
+<div className="flex items-center gap-2 text-xs mb-1">
+  <input className="border rounded p-1 text-xs" placeholder="Search email…" value={qTok} onChange={e=>{setPage(1); setQTok(e.target.value)}} />
+  <button className="brand-btn text-[11px]" onClick={()=>downloadGET(`/api/signoff/pending_export.csv?project_id=${projectId}&stage_id=${stageId}`, "pending.csv")}>Export CSV</button>
+  <div className="ml-auto flex items-center gap-1">
+    <button className="brand-btn text-[11px]" disabled={page<=1} onClick={()=>setPage(p=>Math.max(1,p-1))}>Prev</button>
+    <span>{page} / {Math.max(1, Math.ceil(total/pageSize))}</span>
+    <button className="brand-btn text-[11px]" disabled={page*pageSize>=total} onClick={()=>setPage(p=>p+1)}>Next</button>
+  </div>
+</div>
+
+
+Custom resend dialog (simple prompt):
+
+<button className="brand-btn text-[11px]" disabled={!anySel} onClick={async()=>{
+  const subj = prompt("Subject ({{LINK}} placeholder available):","[Reminder] Sign-off request");
+  if (subj===null) return;
+  const html = prompt("HTML body (use {{LINK}} for the token URL):","<p>Please sign: {{LINK}}</p>");
+  if (html===null) return;
+  const tokens = Object.keys(selTok).filter(k=>selTok[k]);
+  await fetch(`/api/signoff/resend_selected_custom?project_id=${projectId}`, {
+    method:"POST", credentials:"include", headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ tokens, subject: subj, html, min_hours_between: 12 })
+  });
+  alert("Custom reminders sent (throttled)");
+}}>Resend (custom)</button>
+
+
+(CSV button uses your downloadGET helper.)
+
+2) Stages — Apply template per area + Shift by weeks + warnings
+
+client/src/components/StageTemplateApply.tsx (optional twin for per-area apply)
+
+Add area prop and only include rows from that area; highlight guardrail violations:
+
+export default function StageTemplateApply({ projectId, stages, area, onClose }:{
+  projectId:string; stages:{id:string; title:string; area?:string; start_date?:string; end_date?:string}[]; area?:string; onClose:()=>void
+}){
+// ...
+const target = useMemo(()=> area ? stages.filter(s=> (s.area||"")===area) : stages, [stages, area]);
+// replace uses of `stages` with `target` in the preview loop
+// add warning color:
+<td className={`p-1 ${p.will_update && (diffDays(p.new_start, p.new_end)||0) < rails.min_days ? 'text-red-500' : ''}`}>
+
+
+Invoke per-area:
+
+{Object.keys(groups).map(area=>(
+  <div key={area}>
+    {/* ...existing toolbar... */}
+    <button className="brand-btn text-xs" onClick={()=> setApplyOpen({area})}>Apply Template (Preview)</button>
+    {applyOpen?.area===area && <StageTemplateApply projectId={projectId} stages={stages} area={area} onClose={()=>setApplyOpen(null)} />}
+  </div>
+))}
+
+
+Shift by weeks (both start+end):
+
+const [shiftWeeks,setShiftWeeks]=useState<number>(0);
+async function shiftAreaWeeks(area:string, weeks:number){
+  const days = weeks*7; if (!days) return;
+  for (const s of groups[area]||[]){
+    const patch:any = {};
+    if (s.start_date) patch.start_date = shiftDate(s.start_date, days);
+    if (s.end_date)   patch.end_date   = shiftDate(s.end_date, days);
+    if (Object.keys(patch).length) await saveField(s.id, patch);
+  }
+  toast({ title:"Shifted", description:`${area}: start/end by ${weeks>0? '+'+weeks: weeks} week(s)` });
+}
+// in toolbar
+<label className="text-[11px]">ΔWeeks</label>
+<input className="border rounded p-1 text-xs w-[60px]" type="number" value={shiftWeeks} onChange={e=>setShiftWeeks(parseInt(e.target.value||'0',10))}/>
+<button className="brand-btn text-xs" onClick={()=>shiftAreaWeeks(area, shiftWeeks)}>Shift by weeks</button>
+
+3) Digests — per-recipient mute empty sections + in-app grid component
+
+Patch server/routers/digest.py (when composing HTML):
+
+Skip empty sections completely (no header) — simply don’t append the list if it’s empty (you already do that for compact list; ensure the base “Actions/Risks/Decisions” headers also follow this rule).
+
+Optional boolean flag (default true):
+
+MUTE_EMPTY = True
+# when building sections:
+if "actions" in wanted and counts.get("actions",0)>0:
+    html += chip("Actions", counts.get("actions",0), "actions/list")
+# same for risks/decisions
+
+
+Reusable in-app grid component
+
+client/src/components/DigestChangesGrid.tsx (new)
+
+import { actionsLink, auditLink } from "@/lib/digestLinks";
+
+export default function DigestChangesGrid({
+  projectId, changes
+}:{ projectId:string; changes:{ table:"actions"|"risks"|"decisions"; id:string; title?:string; owner?:string; area?:string }[] }){
+  if (!changes?.length) return null;
+  const byArea: Record<string, typeof changes> = {};
+  changes.forEach(c=> { const a=c.area||"Unassigned"; byArea[a]=[...(byArea[a]||[]), c]; });
+  return (
+    <div className="brand-card p-3">
+      <div className="text-sm font-medium mb-1">Changes by Area</div>
+      <div className="grid md:grid-cols-2 gap-3">
+        {Object.keys(byArea).map(a=>(
+          <div key={a} className="border rounded p-2">
+            <div className="text-xs font-medium mb-1">{a}</div>
+            <ul className="text-xs list-disc pl-4">
+              {byArea[a].slice(0,8).map(c=>{
+                const href = c.table==="actions" 
+                  ? actionsLink(projectId, c.id, c.owner, c.area) 
+                  : auditLink(projectId, c.table, c.id, c.area);
+                return <li key={`${c.table}-${c.id}`}><a className="underline" href={href}>{c.title || c.id}</a></li>;
+              })}
+            </ul>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
+Drop this on any dashboard to mirror the email’s compact grouping.
+
+4) Wellness Admin — MA toggle + legend; per-user PDF link
+
+Patch client/src/components/AdminWellnessTrend.tsx**
+
+Add MA toggle state + legend:
+
+const [showMA,setShowMA]=useState(true);
+// …
+<div className="flex items-center justify-between">
+  <div className="text-sm font-medium">Responders Trend (last {days}d)</div>
+  <label className="text-xs flex items-center gap-1">
+    <input type="checkbox" checked={showMA} onChange={e=>setShowMA(e.target.checked)}/> Moving average
+  </label>
+</div>
+// …
+{showMA && <polyline fill="none" stroke="#19d492" strokeWidth="1" points={toPts(ma)} />}
+<div className="text-xs text-muted-foreground mt-1">
+  Aqua = daily{showMA?"; Green = 3-pt MA":""} • Gray dotted = prior period
+</div>
+
+
+Per-user modal already has Print HTML link from the previous drop — this is what you use to “Print to PDF” via the browser.
+
+5) 120-second validation
+
+Sign-Off v4.0: pending list search/paginate; Export CSV; Resend (custom subject/body); expiring-soon badges; remind/set-expiry for selected
+
+Stages: per-area Apply Template (Preview); Shift by weeks tool; guardrails highlight; global/area save & undo work together
+
+Digests: empty sections muted; Compact Changes Grid component ready for dashboards; deep links keep opening tabs/filters and scroll/glow rows
+
+Wellness: trend chart MA toggle + legend; admin gets Top Responders HTML/CSV; per-user modal “Print HTML” → PDF

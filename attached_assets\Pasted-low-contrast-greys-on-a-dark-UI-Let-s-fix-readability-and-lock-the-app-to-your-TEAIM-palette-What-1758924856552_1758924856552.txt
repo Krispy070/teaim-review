@@ -1,0 +1,235 @@
+low-contrast greys on a dark UI. Let’s fix readability and lock the app to your TEAIM palette.
+
+What I’m doing
+
+Map your brand colors into CSS variables.
+
+Replace the too-dim greys with accessible neutrals tuned for dark backgrounds.
+
+Update header + dashboard primitives (cards, badges, icons, text) to use tokens so the whole app lifts immediately.
+
+1) Brand tokens (drop in once)
+
+Add this to your global CSS (e.g., src/styles.css or app.css). It uses your palette and derives readable text scales for dark UI.
+
+:root {
+  /* Brand (from TEAIM Brand Book v2) */
+  --brand-charcoal: #1C1C1E;
+  --brand-orange:   #F26B1D; /* AI accent */
+  --brand-gold:     #FFC933;
+  --brand-success:  #2ECC71;
+  --brand-warn:     #FFC107;
+  --brand-error:    #E74C3C;
+  --brand-white:    #FFFFFF;
+  --brand-midgray:  #7D7D7D; /* for light themes / borders only on dark */
+
+  /* Dark UI surfaces (accessible) */
+  --ui-bg:        #0E0F12;             /* main app background (slightly darker than charcoal) */
+  --ui-panel:     #121319;             /* panel / card surface */
+  --ui-panel-2:   #171922;             /* elevated card */
+  --ui-border:    #2C2F3A;             /* card borders (visible on dark) */
+  --ui-divider:   #252832;
+
+  /* Text (accessible on dark) */
+  --text-strong:  #FFFFFF;             /* primary headings */
+  --text:         #E9ECF1;             /* body text */
+  --text-soft:    #C7CCD7;             /* secondary */
+  --text-muted:   #A7ADBD;             /* tertiary */
+  --text-dim:     #8C93A3;             /* placeholders only */
+
+  /* Action & state */
+  --accent:       var(--brand-orange);  /* primary CTAs, highlights */
+  --accent-2:     var(--brand-gold);    /* secondary highlight */
+  --success:      var(--brand-success);
+  --warn:         var(--brand-warn);
+  --error:        var(--brand-error);
+
+  /* Pills / badges backgrounds (transparent tints for dark) */
+  --pill-accent:  rgba(242,107,29,0.18);
+  --pill-gold:    rgba(255,201,51,0.18);
+  --pill-success: rgba(46,204,113,0.18);
+  --pill-warn:    rgba(255,193,7,0.18);
+  --pill-error:   rgba(231,76,60,0.18);
+
+  /* Focus outline for keyboard nav */
+  --focus:        rgba(255,201,51,0.65);
+}
+
+/* Base dark theme application */
+html, body {
+  background: var(--ui-bg);
+  color: var(--text);
+}
+
+/* Generic building blocks */
+.card {
+  background: var(--ui-panel);
+  border: 1px solid var(--ui-border);
+  border-radius: 14px;
+}
+
+.card--elevated { background: var(--ui-panel-2); }
+
+.k-badge {
+  display: inline-flex; align-items:center; gap:.5ch;
+  padding:.25rem .5rem; border-radius:10px; font-size:12px; line-height:1;
+  border:1px solid transparent;
+}
+.k-badge--accent  { background: var(--pill-accent);  color: var(--brand-orange);   border-color: rgba(242,107,29,0.35); }
+.k-badge--gold    { background: var(--pill-gold);    color: var(--brand-gold);     border-color: rgba(255,201,51,0.35); }
+.k-badge--success { background: var(--pill-success); color: var(--success);         border-color: rgba(46,204,113,0.35); }
+.k-badge--warn    { background: var(--pill-warn);    color: var(--warn);            border-color: rgba(255,193,7,0.35); }
+.k-badge--error   { background: var(--pill-error);   color: var(--error);           border-color: rgba(231,76,60,0.35); }
+
+.k-btn {
+  display:inline-flex; align-items:center; gap:.6ch;
+  padding:.55rem .9rem; border-radius:12px; font-weight:600;
+  border:1px solid var(--ui-border); background: var(--ui-panel-2); color: var(--text-strong);
+}
+.k-btn:hover { background:#1B1E28; border-color:#3A3E4E; }
+.k-btn--primary { background: var(--brand-orange); border-color: #C65115; color:#0B0B0D; }
+.k-btn--primary:hover { filter: brightness(1.05); }
+.k-link { color: var(--brand-gold); text-decoration:none; }
+.k-link:hover { text-decoration:underline; }
+
+/* Icon color system */
+.icon { color: var(--text-soft); }
+.icon--active { color: var(--brand-orange); }
+
+/* Headings */
+h1,h2,h3 { color: var(--text-strong); }
+.subtle { color: var(--text-muted); }
+
+
+Why this works: your previous grey (#7D7D7D) on a near-black background fails contrast. The new text scale uses brighter neutrals so labels, icons, and small UI copy pass WCAG on dark while keeping your brand feel. (Palette per brand book: charcoal, orange, gold, green, yellow, red, etc. 
+
+TEAIM_Brand_Book_v2
+
+)
+
+2) Header wired to tokens (clean, legible)
+
+Update your header container to consume those tokens and bump contrast on icons/text.
+
+<header className="sticky top-0 z-50 w-full border-b" style={{ 
+  background: 'color-mix(in oklab, var(--ui-bg), black 5%)',
+  borderColor: 'var(--ui-border)',
+  backdropFilter: 'saturate(140%) blur(6px)'
+}}>
+  <div className="mx-auto flex h-16 max-w-[1320px] items-center justify-between gap-4 px-4">
+    {/* Left: TEAIM */}
+    <a href="/" className="flex items-center gap-2">
+      <img src={brand.teaimLogoUrl} alt="TEAIM" className="h-7 w-auto" />
+    </a>
+
+    {/* Center: Customer */}
+    <div className="min-w-0 text-center">
+      <img src={project.customerLogoUrl} alt={project.customerName} className="h-8 max-w-[240px] mx-auto object-contain" />
+      <div className="text-[11px]" style={{color:'var(--text-muted)'}}>Workday Implementation Hub</div>
+    </div>
+
+    {/* Right: Implementor + ENV + notif + avatar */}
+    <div className="flex items-center gap-3">
+      {project.implementorLogoUrl && (
+        <img src={project.implementorLogoUrl} alt="Implementor" className="h-6 w-auto opacity-90" />
+      )}
+      <span className="k-badge k-badge--gold" title="Environment">
+        {process.env.NODE_ENV === 'production' ? 'PROD' : 'DEV'}
+      </span>
+      <button className="grid h-8 w-8 place-items-center rounded-full border" style={{borderColor:'var(--ui-border)', color:'var(--text)'}} title="Notifications">🔔</button>
+      <div className="h-8 w-8 rounded-full" style={{background:'#2E3340'}} />
+    </div>
+  </div>
+</header>
+
+3) Dashboard readability upgrades
+
+Target the exact areas in your screenshot:
+
+Left nav
+
+.nav { color: var(--text-soft); }
+.nav .active { color: var(--text-strong); }
+.nav .section-label { color: var(--text-muted); letter-spacing: .02em; }
+
+
+Top KPIs
+
+.kpi { background: var(--ui-panel); border:1px solid var(--ui-border); border-radius:14px; }
+.kpi .value { color: var(--text-strong); font-weight:700; font-size:20px; }
+.kpi--risk .value { color: var(--error); }
+.kpi--actions .value { color: var(--brand-gold); }
+.kpi--signoffs .value { color: var(--text-strong); }
+.kpi--wellness .value { color: var(--success); }
+
+
+Timeline bars
+
+.timeline .bar-bg { background:#222634; }
+.timeline .bar-fill { background: var(--brand-orange); }
+.timeline .tick { background: var(--ui-border); }
+
+
+Cards (Team Wellness, Overdue, AI Suggestions)
+
+.card h3 { color: var(--text-strong); font-weight:700; }
+.card .label { color: var(--text-muted); }
+.card .item { color: var(--text); }
+.card .tag--overdue { @apply k-badge k-badge--error; }
+
+
+Buttons
+
+“Accept / Tweak” → use .k-btn--primary for Accept, .k-btn for Tweak.
+
+Icons
+
+Add .icon to all inline SVGs; set active states with .icon--active.
+
+4) Tailwind (optional mapping)
+
+If you’re using Tailwind, add these to tailwind.config.js for utility ergonomics:
+
+theme: {
+  extend: {
+    colors: {
+      bg: 'var(--ui-bg)',
+      panel: 'var(--ui-panel)',
+      panel2: 'var(--ui-panel-2)',
+      border: 'var(--ui-border)',
+      text: {
+        DEFAULT: 'var(--text)',
+        strong: 'var(--text-strong)',
+        soft: 'var(--text-soft)',
+        muted: 'var(--text-muted)',
+      },
+      brand: {
+        orange: 'var(--brand-orange)',
+        gold: 'var(--brand-gold)',
+        success: 'var(--brand-success)',
+        warn: 'var(--brand-warn)',
+        error: 'var(--brand-error)',
+      }
+    },
+    borderRadius: { xl: '14px', '2xl': '16px' }
+  }
+}
+
+
+Then update components with classes like:
+
+<div class="card text-text border-border bg-panel">...</div>
+<button class="k-btn">Tweak</button>
+<button class="k-btn k-btn--primary">Accept</button>
+
+Quick win checklist (do these now)
+
+Apply the CSS tokens (Step 1).
+
+Swap header to the tokenized version (Step 2).
+
+Change any text-gray-500/400/300 to text-text or text-soft.
+
+Set all icons to class="icon" (and icon--active where relevant).
+
+Ensure card borders are var(--ui-border) and not a near-invisible grey.

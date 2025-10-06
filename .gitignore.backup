@@ -1,0 +1,38 @@
+# secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+# dependencies / builds / caches
+node_modules/
+dist/
+build/
+coverage/
+.next/
+.out/
+.vercel/
+.turbo/
+.cache/
+# artifacts
+*.log
+*.map
+*.zip
+*.tar*
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.mp4
+*.mov
+# vcs/os junk
+.DS_Store
+Thumbs.db
+
+# attached assets (can be large)
+attached_assets/
+
+# attached assets (can be large)
+attached_assets/
+attached_assets/

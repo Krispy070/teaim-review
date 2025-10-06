@@ -1,0 +1,374 @@
+1) Drop-in replacement seeder (covers all failing tests)
+
+File: server/admin/test/seedMinimal.ts
+(If your path differs, keep the filename; import path in your route can change.)
+
+// server/admin/test/seedMinimal.ts
+// Purpose: Idempotent "minimum viable dataset" seeder so /admin/test passes.
+// Works with knex/pg via a simple db client that exposes .transaction(fn)
+// If you use Prisma, swap the tx(...) calls to your Prisma client as noted below.
+
+import { v4 as uuid } from "uuid";
+import dayjs from "dayjs";
+import { db } from "../../db"; // adjust import to your db client
+
+type Inserted = {
+  areas: number;
+  workbooks: number;
+  reports: number;
+  changes: number;
+  comments: number;
+  releases: number;
+  notifications: number;
+  signoffs: number;
+};
+
+export async function seedMinimal(projectId: string) {
+  const now = dayjs();
+
+  // Pre-generate IDs for deterministic linking
+  const ids = {
+    org: uuid(),
+    vendor: uuid(),
+    customer: uuid(),
+    areas: { hcm: uuid(), fin: uuid() },
+    wbs: { hcm: uuid(), fin: uuid() },
+    rpts: { hcm: uuid(), fin: uuid() },
+    changes: { a: uuid(), b: uuid() },
+    comments: { a: uuid(), b: uuid() },
+    release: uuid(),
+    notif: uuid(),
+    signoffValid: uuid(),
+    // DO NOT insert invalid token; the negative test uses a hard-coded bad token
+  };
+
+  const inserted: Inserted = {
+    areas: 0,
+    workbooks: 0,
+    reports: 0,
+    changes: 0,
+    comments: 0,
+    releases: 0,
+    notifications: 0,
+    signoffs: 0,
+  };
+
+  await db.transaction(async (tx: any) => {
+    // ---- Clean existing test data for this project (idempotent) ----
+    // Order matters for FKs
+    await tx("notifications").where({ project_id: projectId }).del();
+    await tx("releases").where({ project_id: projectId }).del();
+    await tx("comments").where({ project_id: projectId }).del();
+    await tx("changes").where({ project_id: projectId }).del();
+    await tx("reports").where({ project_id: projectId }).del();
+    await tx("workbooks").where({ project_id: projectId }).del();
+    await tx("areas").where({ project_id: projectId }).del();
+
+    // Optional org/vendor/customer rows if your schema uses them
+    // Use onConflict(...).ignore() if available; otherwise soft-insert in try/catch.
+    try {
+      await tx("orgs")
+        .insert({ id: ids.org, name: "TEAIM Test Org", created_at: now.toISOString() })
+        .onConflict?.("id")
+        .ignore?.();
+    } catch {}
+    try {
+      await tx("vendors")
+        .insert({ id: ids.vendor, name: "TEAIM Test Vendor", org_id: ids.org, created_at: now.toISOString() })
+        .onConflict?.("id")
+        .ignore?.();
+    } catch {}
+    try {
+      await tx("customers")
+        .insert({ id: ids.customer, name: "Project TEAIM Test Customer", org_id: ids.org, created_at: now.toISOString() })
+        .onConflict?.("id")
+        .ignore?.();
+    } catch {}
+
+    // ---- Areas (HCM, FIN) ----
+    inserted.areas += await tx("areas")
+      .insert([
+        { id: ids.areas.hcm, project_id: projectId, key: "HCM", name: "HCM", status: "active", created_at: now.toISOString() },
+        { id: ids.areas.fin, project_id: projectId, key: "FIN", name: "Financials", status: "active", created_at: now.toISOString() },
+      ]).returning?.("id").then((rows: any[]) => rows.length) ?? 2;
+
+    // ---- Workbooks (one per area) ----
+    inserted.workbooks += await tx("workbooks")
+      .insert([
+        { id: ids.wbs.hcm, project_id: projectId, area_id: ids.areas.hcm, title: "HCM Master Workbook", metrics: { items: 12, open: 4, closed: 8 }, created_at: now.toISOString() },
+        { id: ids.wbs.fin, project_id: projectId, area_id: ids.areas.fin, title: "FIN Master Workbook", metrics: { items: 9,  open: 3, closed: 6 }, created_at: now.toISOString() },
+      ]).returning?.("id").then((rows: any[]) => rows.length) ?? 2;
+
+    // ---- Reports (for "Workbook export CSV") ----
+    inserted.reports += await tx("reports")
+      .insert([
+        { id: ids.rpts.hcm, project_id: projectId, area_id: ids.areas.hcm, type: "wb_export_csv", title: "HCM Export", payload: { rows: 12 }, created_at: now.toISOString() },
+        { id: ids.rpts.fin, project_id: projectId, area_id: ids.areas.fin, type: "wb_export_csv", title: "FIN Export", payload: { rows: 9  }, created_at: now.toISOString() },
+      ]).returning?.("id").then((rows: any[]) => rows.length) ?? 2;
+
+    // ---- Changes (for Digest + ZIP) ----
+    inserted.changes += await tx("changes")
+      .insert([
+        { id: ids.changes.a, project_id: projectId, area_id: ids.areas.hcm, kind: "update", summary: "Updated HCM position sync", created_at: now.subtract(1, "day").toISOString() },
+        { id: ids.changes.b, project_id: projectId, area_id: ids.areas.fin, kind: "add",    summary: "Added GL segment validation", created_at: now.subtract(2, "day").toISOString() },
+      ]).returning?.("id").then((rows: any[]) => rows.length) ?? 2;
+
+    // ---- Comments (for Digest) ----
+    inserted.comments += await tx("comments")
+      .insert([
+        { id: ids.comments.a, project_id: projectId, area_id: ids.areas.hcm, body: "Please verify job catalog mapping.", author: "System", created_at: now.toISOString() },
+        { id: ids.comments.b, project_id: projectId, area_id: ids.areas.fin, body: "Need sign-off on journal import.",  author: "System", created_at: now.toISOString() },
+      ]).returning?.("id").then((rows: any[]) => rows.length) ?? 2;
+
+    // ---- Release (ICS) ----
+    inserted.releases += await tx("releases")
+      .insert([
+        { id: ids.release, project_id: projectId, kind: "ics", channel: "staging", tag: "v0.1.0-test", created_at: now.toISOString() },
+      ]).returning?.("id").then((rows: any[]) => rows.length) ?? 1;
+
+    // ---- Notifications (unseen count) ----
+    inserted.notifications += await tx("notifications")
+      .insert([
+        { id: ids.notif, project_id: projectId, kind: "digest_ready", seen: false, payload: { areas: ["HCM", "FIN"] }, created_at: now.toISOString() },
+      ]).returning?.("id").then((rows: any[]) => rows.length) ?? 1;
+
+    // ---- Sign-off token (valid case) ----
+    inserted.signoffs += await tx("signoffs")
+      .insert([
+        { token: ids.signoffValid, project_id: projectId, status: "issued", expires_at: now.add(3, "day").toISOString(), created_at: now.toISOString() },
+      ]).returning?.("token").then((rows: any[]) => rows.length) ?? 1;
+  });
+
+  return { ok: true, inserted };
+}
+
+// --- Prisma swap (notes) ---
+// Replace the tx("table").insert(...) with prisma.table.createMany({ data: [...] })
+// Replace where(...).del() with prisma.table.deleteMany({ where: { project_id } })
+
+
+Wire it to your admin test route (if not already):
+
+// server/admin/test/index.ts
+import { seedMinimal } from "./seedMinimal";
+
+app.post("/admin/test/seed", async (req, res) => {
+  const projectId = req.body?.projectId;
+  if (!projectId) return res.status(400).json({ ok: false, error: "projectId required" });
+
+  try {
+    const out = await seedMinimal(projectId);
+    return res.json(out);
+  } catch (e: any) {
+    console.error("Seed error:", e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
+Runner UI call (example fetch if your Test Runner calls an API):
+
+await fetch("/admin/test/seed", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ projectId }),
+});
+
+
+Expected result in your Test Runner after “Seed & Run”:
+
+Areas summary_all ✅
+
+Workbooks metrics ✅
+
+Workbooks export CSV ✅
+
+Digest preview HTML ✅
+
+Area export ZIP (HCM) ✅
+
+Notifications unseen count ✅
+
+Releases ICS ✅
+
+Sign-off invalid token (negative) ✅ (your negative still uses a hard-coded bad token)
+
+If any still red, the table names/columns differ—shoot me the exact names the tests read and I’ll tweak the seed to match precisely.
+
+2) Header redesign (polished, 3-logo layout, enterprise feel)
+
+Left: TEAIM brand (small/stable)
+
+Center: Customer logo dominant (+ optional tagline)
+
+Right: Implementor logo, ENV pill (DEV/STAGE/PROD), bell, avatar
+
+Single 64px bar, sticky, subtle shadow, max-width container (1320px)
+
+Component: ui/components/HeaderBar.tsx
+
+import React from "react";
+
+type Logo = { src?: string; alt: string; href?: string };
+type Env = "DEV" | "STAGE" | "PROD";
+
+export function HeaderBar({
+  teaim,
+  customer,
+  implementor,
+  projectName,
+  tagline,
+  env = "DEV",
+  onPickProject,
+  onBellClick,
+  onAvatarClick,
+}: {
+  teaim: Logo;
+  customer: Logo;
+  implementor?: Logo;
+  projectName?: string;
+  tagline?: string;
+  env?: Env;
+  onPickProject?: () => void;
+  onBellClick?: () => void;
+  onAvatarClick?: () => void;
+}) {
+  return (
+    <header className="sticky top-0 z-50 w-full border-b border-zinc-800 bg-[var(--ui-surface)]/95 backdrop-blur">
+      <div className="mx-auto flex h-16 max-w-[1320px] items-center gap-4 px-4">
+        {/* Left: TEAIM brand */}
+        <a href={teaim.href || "#"} className="flex items-center gap-2 shrink-0">
+          {teaim.src ? (
+            <img src={teaim.src} alt={teaim.alt} className="h-6 w-auto" />
+          ) : (
+            <span className="text-lg font-semibold tracking-wide text-[var(--ui-text-strong)]">TEAIM</span>
+          )}
+        </a>
+
+        {/* Center: Customer logo + project + tagline */}
+        <div className="mx-auto min-w-0">
+          <div className="flex items-center justify-center gap-3">
+            {customer?.src ? (
+              <img
+                src={customer.src}
+                alt={customer.alt}
+                className="h-7 max-w-[240px] w-auto object-contain"
+              />
+            ) : (
+              <span className="truncate text-sm text-[var(--ui-text-muted)]">{customer.alt}</span>
+            )}
+            {projectName && (
+              <button
+                onClick={onPickProject}
+                className="truncate rounded-xl border border-[var(--ui-border)] px-3 py-1 text-xs text-[var(--ui-text)] hover:bg-[var(--ui-hover)]"
+                title="Switch project"
+              >
+                {projectName}
+              </button>
+            )}
+          </div>
+          {tagline && (
+            <div className="mt-1 text-center text-[11px] text-[var(--ui-text-muted)] truncate">
+              {tagline}
+            </div>
+          )}
+        </div>
+
+        {/* Right: Implementor + env + bell + avatar */}
+        <div className="flex items-center gap-3">
+          {implementor?.src && (
+            <img
+              src={implementor.src}
+              alt={implementor.alt}
+              className="h-6 w-auto opacity-80"
+              title={implementor.alt}
+            />
+          )}
+
+          <span
+            className={[
+              "rounded-lg px-2 py-0.5 text-[11px] font-medium border",
+              env === "PROD" && "bg-[var(--env-prod-bg)] text-[var(--env-prod-text)] border-[var(--env-prod-border)]",
+              env === "STAGE" && "bg-[var(--env-stage-bg)] text-[var(--env-stage-text)] border-[var(--env-stage-border)]",
+              env === "DEV" && "bg-[var(--env-dev-bg)] text-[var(--env-dev-text)] border-[var(--env-dev-border)]",
+            ]
+              .filter(Boolean)
+              .join(" ")}
+          >
+            {env}
+          </span>
+
+          <button
+            onClick={onBellClick}
+            className="grid h-7 w-7 place-items-center rounded-full border border-[var(--ui-border)] text-[var(--ui-text)] hover:bg-[var(--ui-hover)]"
+            title="Notifications"
+          >
+            🔔
+          </button>
+
+          <button
+            onClick={onAvatarClick}
+            className="h-7 w-7 overflow-hidden rounded-full bg-[var(--ui-neutral-700)]"
+            title="Account"
+          />
+        </div>
+      </div>
+    </header>
+  );
+}
+
+
+Theme tokens for your new logo/colors (put in global CSS, e.g. src/styles.css or Tailwind :root):
+
+:root {
+  /* Core surface & text */
+  --ui-surface: #0B0B10;           /* page chrome */
+  --ui-text: #E8E9F1;
+  --ui-text-strong: #FFFFFF;
+  --ui-text-muted: #A9ACB8;
+  --ui-border: #2B2E3A;
+  --ui-hover: rgba(255,255,255,0.04);
+  --ui-neutral-700: #3A3D4A;
+
+  /* Brand palette (swap to your new scheme) */
+  --brand-primary: #7A4BFF;        /* primary accent (your new purple?) */
+  --brand-accent:  #25FFD2;        /* neon accent */
+  --brand-warn:    #FFB020;
+
+  /* Env pills */
+  --env-dev-bg:    rgba(60,150,255,0.18);
+  --env-dev-text:  #A8CEFF;
+  --env-dev-border:#2A6DBA;
+
+  --env-stage-bg:    rgba(255,170,0,0.18);
+  --env-stage-text:  #FFD48A;
+  --env-stage-border:#9C6A00;
+
+  --env-prod-bg:    rgba(0,200,130,0.18);
+  --env-prod-text:  #95F3D2;
+  --env-prod-border:#0E7E59;
+}
+
+
+Use it:
+
+<HeaderBar
+  teaim={{ src: brand.teaimLogoUrl, alt: "TEAIM", href: "/" }}
+  customer={{ src: project.customerLogoUrl, alt: project.customerName }}
+  implementor={{ src: project.implementorLogoUrl, alt: "Implementor" }}
+  projectName={project.name}
+  tagline="AI in Your Team. Power in Your Project."
+  env={process.env.NODE_ENV === "production" ? "PROD" : "DEV"}
+  onPickProject={() => setProjectPickerOpen(true)}
+  onBellClick={() => openNotifications()}
+  onAvatarClick={() => openAccountMenu()}
+/>
+
+
+Housekeeping (to de-clutter):
+
+Move “Access / Publish / Theme / Brand v2 / Pick project” controls into a kebab menu or System Health page.
+
+Keep one toolbar (no stacked bars).
+
+Constrain page content to max-w-[1320px] and center; enterprise apps breathe.

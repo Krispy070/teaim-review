@@ -1,0 +1,286 @@
+1) Server: psycopg fallback for vector search + artifacts list
+A) New file: /server/db.py
+# /server/db.py
+import os
+import psycopg
+from pgvector.psycopg import register_vector
+
+def get_conn():
+    dsn = os.environ.get("SUPABASE_DB_URL")
+    if not dsn:
+        raise RuntimeError("SUPABASE_DB_URL not set (get it from Supabase: Settings → Database → Connection string)")
+    conn = psycopg.connect(dsn, autocommit=True)
+    register_vector(conn)
+    return conn
+
+
+Add secret in Replit: SUPABASE_DB_URL (the direct connection string, not the anon/service key; Supabase → Settings → Database → “Connection string → URI”).
+
+B) Patch: /server/rag.py (try RPC, then psycopg)
+# /server/rag.py
+import os
+from openai import OpenAI
+from .supabase_client import sb
+from .db import get_conn
+
+oai = OpenAI()
+EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-large")
+CHAT_MODEL  = os.getenv("CHAT_MODEL", "gpt-4.1-mini")
+
+def embed_texts(texts):
+    resp = oai.embeddings.create(model=EMBED_MODEL, input=texts)
+    return [d.embedding for d in resp.data]
+
+def _rpc_search(org_id, project_id, q_emb, k):
+    # Named args RPC
+    return sb.rpc("search_chunks", {
+        "k": k, "p_org": org_id, "p_project": project_id, "q": q_emb
+    }).execute().data
+
+def _psycopg_fallback(org_id, project_id, q_emb, k):
+    # Direct SQL with pgvector; requires SUPABASE_DB_URL
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            select c.content, a.title, a.id
+            from artifact_chunks c
+            join artifacts a on a.id = c.artifact_id
+            where c.org_id = %s and c.project_id = %s
+            order by c.embedding <#> %s
+            limit %s
+            """,
+            (org_id, project_id, q_emb, k),
+        )
+        rows = cur.fetchall()
+        return [{"content": r[0], "title": r[1], "artifact_id": str(r[2])} for r in rows]
+
+def answer_with_citations(org_id: str, project_id: str, question: str, k: int = 8):
+    q_emb = embed_texts([question])[0]
+    res = []
+    # Try RPC first, then fallback
+    try:
+        res = _rpc_search(org_id, project_id, q_emb, k) or []
+    except Exception:
+        try:
+            res = _psycopg_fallback(org_id, project_id, q_emb, k)
+        except Exception:
+            res = []
+    context = "\n\n".join([f"[Artifact: {r['title']}] \n{r['content']}" for r in (res or [])])
+    sys = ("You are Kap, a seasoned Workday program director. "
+           "Answer ONLY from the provided context. Cite sources as [Artifact: Title]. "
+           "If insufficient, say you need more context and suggest next steps.")
+    u = f"Question: {question}\n\nContext:\n{context[:20000]}"
+    comp = oai.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[{"role":"system","content":sys},{"role":"user","content":u}],
+        temperature=0.2
+    )
+    return comp.choices[0].message.content, res
+
+C) Patch: /server/main.py – add an artifacts listing with signed URLs
+# add near imports
+from fastapi import Query
+from typing import Optional
+
+# ...existing code...
+
+@app.get("/artifacts")
+def list_artifacts(org_id: str = Query(...), project_id: str = Query(...), limit: int = 50):
+    # list artifacts and include signed download URLs
+    rows = sb.table("artifacts")\
+        .select("id,title,path,mime_type,chunk_count,created_at")\
+        .eq("org_id", org_id).eq("project_id", project_id)\
+        .order("created_at", desc=True).limit(limit).execute().data or []
+    out = []
+    for r in rows:
+        # 60-min signed URL
+        try:
+            signed = sb.storage.from_(BUCKET).create_signed_url(r["path"], 3600)
+            r["signed_url"] = signed.get("signedURL") or signed.get("signed_url")
+        except Exception:
+            r["signed_url"] = None
+        out.append(r)
+    return {"artifacts": out}
+
+2) Frontend: Router + Library page + hover SOW descriptions
+A) Router setup: /web/src/main.jsx
+import React from 'react'
+import { createRoot } from 'react-dom/client'
+import { BrowserRouter } from 'react-router-dom'
+import App from './App'
+
+createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </React.StrictMode>
+)
+
+
+Install router:
+
+npm --prefix web i react-router-dom
+
+B) Library page: /web/src/pages/Library.jsx
+import React, { useEffect, useState } from 'react'
+
+export default function Library({ orgId, projectId }) {
+  const [items, setItems] = useState([])
+  const [loading, setLoading] = useState(false)
+  const [err, setErr] = useState('')
+
+  useEffect(() => {
+    if (!orgId || !projectId) return
+    setLoading(true)
+    fetch(`/artifacts?org_id=${encodeURIComponent(orgId)}&project_id=${encodeURIComponent(projectId)}&limit=100`)
+      .then(r => r.json())
+      .then(js => setItems(js.artifacts || []))
+      .catch(e => setErr('Failed to load artifacts'))
+      .finally(() => setLoading(false))
+  }, [orgId, projectId])
+
+  return (
+    <div className="rounded-2xl border p-4 space-y-3">
+      <div className="font-semibold text-slate-700">Document Library</div>
+      {loading && <div className="text-sm text-slate-500">Loading…</div>}
+      {err && <div className="text-sm text-rose-600">{err}</div>}
+      <div className="divide-y">
+        {items.map(a => (
+          <div key={a.id} className="py-2 flex items-center justify-between">
+            <div>
+              <div className="font-medium">{a.title || '(untitled)'}</div>
+              <div className="text-xs text-slate-500">{a.mime_type} • chunks: {a.chunk_count}</div>
+            </div>
+            {a.signed_url
+              ? <a className="text-sm px-3 py-1 border rounded" href={a.signed_url} target="_blank" rel="noreferrer">Open</a>
+              : <span className="text-xs text-slate-400">no link</span>
+            }
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+C) Add routes & SOW hover: /web/src/App.jsx
+
+Here’s a minimal skeleton that:
+
+Keeps your existing mock as the Dashboard route,
+
+Adds Library route,
+
+Adds simple hover descriptions for workstreams (replace with parsed SOW later).
+
+import React, { useState } from 'react'
+import { Routes, Route, Link, useLocation } from 'react-router-dom'
+import ChatDock from './components/ChatDock'
+import Library from './pages/Library'
+// Import your existing mock component:
+import Mock from '../../../Case Vault Workday Hub — Interactive Wireframe Mockup (react)'
+
+const sowMeta = {
+  HCM: 'Core HR data model, BP routing, positions & organizations.',
+  Payroll: 'Gross-to-net, taxes, retro, parallel runs, pay calc rules.',
+  Finance: 'Ledger, journals, COA mapping, postings & reconciliation.',
+  Integrations: 'Source→Target, transport, frequency, error handling.',
+  Security: 'Roles, domains, SoD, provisioning and audit.',
+  Reporting: 'Operational & analytics reports, dashboards.',
+  Cutover: 'Freeze plan, conversion, blackout, go-live criteria.'
+}
+
+export default function App(){
+  const [orgId, setOrgId] = useState('')        // paste UUIDs here or via header inputs
+  const [projectId, setProjectId] = useState('')
+  const loc = useLocation()
+
+  return (
+    <div className="min-h-screen">
+      <header className="sticky top-0 z-10 bg-white/90 border-b">
+        <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+          <nav className="flex gap-2 text-sm">
+            <Link className={navCls(loc,'/')} to="/">Dashboard</Link>
+            <Link className={navCls(loc,'/library')} to="/library">Library</Link>
+            {/* add other routes as we split the mock into pages */}
+          </nav>
+          <div className="flex items-center gap-2">
+            <input className="px-2 py-1 border rounded-full text-sm w-40" placeholder="org_id (UUID)" value={orgId} onChange={e=>setOrgId(e.target.value)} />
+            <input className="px-2 py-1 border rounded-full text-sm w-48" placeholder="project_id (UUID)" value={projectId} onChange={e=>setProjectId(e.target.value)} />
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-7xl mx-auto px-4 py-6 space-y-6">
+        <Routes>
+          <Route path="/" element={<WithSOWTooltips Component={Mock} meta={sowMeta} />} />
+          <Route path="/library" element={<Library orgId={orgId} projectId={projectId} />} />
+        </Routes>
+      </main>
+
+      <ChatDock />
+    </div>
+  )
+}
+
+function navCls(loc, path){ return `px-3 py-1.5 rounded-full ${loc.pathname===path?'bg-slate-900 text-white':'hover:bg-slate-200'}` }
+
+// wraps your mock and adds simple title-tooltips for workstream labels by DOM query
+function WithSOWTooltips({ Component, meta }) {
+  // naive enhancement: rely on title attributes where we render WS labels; for now,
+  // add a legend card so hover info is available immediately
+  return (
+    <>
+      <Component />
+      <div className="rounded-2xl border p-4">
+        <div className="font-semibold text-slate-700 mb-2">Workstream Descriptions (from SOW)</div>
+        <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3 text-sm">
+          {Object.entries(meta).map(([k,v])=>(
+            <div key={k} className="p-3 rounded-xl border" title={v}>
+              <span className="font-semibold">{k}</span>
+              <div className="text-slate-600 mt-1">{v}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </>
+  )
+}
+
+3) Secrets check (one new)
+
+Already set:
+
+OPENAI_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, BUCKET
+
+Add:
+
+SUPABASE_DB_URL (direct connection string from Settings → Database → Connection string → URI)
+
+4) Quick smoke test
+
+Restart the app (Express) so it spawns FastAPI again.
+
+Ensure FastAPI logs show it started.
+
+In the header, paste the org_id and project_id UUIDs you created earlier.
+
+Upload Document (small PDF/TXT). After ~10–20s:
+
+artifacts shows a new row (DB → SQL check optional),
+
+artifact_chunks count > 0.
+
+Go to Library → you should see the file and an Open link (signed URL).
+
+Ask Kap in the chat dock: “Summarize the latest document” → get answer + citations.
+
+If RPC still flakes, the psycopg fallback will carry the search until PostgREST cache settles.
+
+On your two UX notes
+
+Nav links not changing pages: solved via React Router above. We’ll continue splitting tabs into routes as we productize.
+
+Hover SOW descriptions: added a simple legend card; when we parse the SOW on ingest, we’ll store those in a workstreams table and feed tooltips from the backend.
+
+Library for full documents: done via /artifacts with signed URLs.

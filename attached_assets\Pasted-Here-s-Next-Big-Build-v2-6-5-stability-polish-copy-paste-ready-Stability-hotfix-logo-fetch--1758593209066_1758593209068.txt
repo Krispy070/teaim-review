@@ -1,0 +1,202 @@
+Here’s Next Big Build v2.6.5 (stability + polish) — copy/paste ready:
+
+Stability hotfix: logo fetch timeouts + graceful fallback (no blocking, no infinite wait)
+
+Public/print polish: brand header on public sign-off print, safe CSS
+
+Wellness CSV export + mini admin chart
+
+Timeline at-risk coloring + legend (planned end < today)
+
+Small DX: cache headers on logos so Replit doesn’t thrash
+
+1) STABILITY HOTFIX — logo proxy + header never block UI
+1A) Safe <img> wrapper (handles errors, avoids infinite retries)
+
+client/src/components/ImgLogo.tsx (new)
+
+import { useEffect, useState } from "react";
+
+export default function ImgLogo({
+  src, alt, className, timeoutMs=3000
+}: { src: string; alt: string; className?: string; timeoutMs?: number }) {
+  const [ok, setOk] = useState(true);
+  const [tick, setTick] = useState(0);
+
+  useEffect(()=>{
+    let did = false;
+    const ctl = new AbortController();
+    const t = setTimeout(()=>{ if (!did) { ctl.abort(); setOk(false); } }, timeoutMs);
+    fetch(src, { method: "HEAD", signal: ctl.signal, credentials: "include" })
+      .then(r => { did = true; clearTimeout(t); setOk(r.ok); })
+      .catch(() => { did = true; clearTimeout(t); setOk(false); });
+    return () => { did = true; clearTimeout(t); ctl.abort(); };
+    // eslint-disable-next-line
+  }, [src, tick]);
+
+  if (!ok) return null;
+  return (
+    <img
+      src={`${src}&v=${tick}`} alt={alt} className={className}
+      loading="lazy"
+      onError={()=>{ setOk(false); }}
+      // if cache gives us a bogus 200 with empty body, force one refresh
+      onLoad={()=>{ /* noop */ }}
+    />
+  );
+}
+
+1B) Use safe <img> + don’t block rendering
+
+Patch client/src/components/BrandedHeader.tsx
+
+import ImgLogo from "@/components/ImgLogo";  // add
+// ...
+{b.customer_logo_path &&
+  <ImgLogo src={`/branding/logo?which=customer${projectId?`&project_id=${projectId}`:""}`} alt="customer" className="h-6" />}
+{b.vendor_logo_path &&
+  <ImgLogo src={`/branding/logo?which=vendor${projectId?`&project_id=${projectId}`:""}`} alt="vendor" className="h-6" />}
+
+
+If the logo endpoint stalls or fails, we render the rest of the UI immediately and simply hide the logo.
+
+1C) Add fast cache headers to the logo proxy
+
+Patch server/routers/branding.py (logo_get & logo_head responses)
+
+At the return lines, add Cache-Control:
+
+# HEAD
+return Response(status_code=200, headers={"ETag": et, "Cache-Control":"public, max-age=300"})
+
+# 304
+return Response(status_code=304, headers={"Cache-Control":"public, max-age=300"})
+
+# GET
+return StreamingResponse(io.BytesIO(data), media_type=ctype,
+         headers={"ETag": f"\"{etag}\"", "Cache-Control":"public, max-age=300"})
+
+
+Caches for 5 minutes, which is plenty in dev and stops the loop Replit sometimes triggers.
+
+2) PUBLIC / PRINT POLISH — sign-off printable branding
+
+We already injected brand header into exports. Add a print-ready style to the public sign page.
+
+Patch server/routers/signoff_docs.py (in open_doc HTML head <style> block):
+
+@media print {
+  body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .btn, form { display: none !important; } /* hide controls on print */
+}
+.export-header { display:flex;align-items:center;justify-content:space-between;border-bottom:2px solid #111;padding:8px 0; }
+.export-header .left,.export-header .right { display:flex;align-items:center;gap:8px; }
+
+
+If you want the exact export_header_html look, you can paste the header markup into the public page too, but the above minimal CSS ensures it prints nicely.
+
+3) WELLNESS — CSV export + admin mini chart
+3A) Export CSV endpoint
+
+server/routers/wellness_export.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
+import io, csv
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/wellness", tags=["wellness"])
+ADMIN = require_role({"owner","admin","pm"})
+
+@router.get("/export.csv")
+def export_csv(project_id: str = Query(...), ctx: TenantCtx = Depends(ADMIN)):
+    sb = get_user_supabase(ctx)
+    try:
+        rows = sb.table("team_wellness").select("created_at,user_id,score")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id).order("created_at", desc=True).limit(500).execute().data or []
+    except Exception:
+        rows = []
+    buf = io.StringIO(); w = csv.writer(buf)
+    w.writerow(["created_at","user_id","score"])
+    for r in rows: w.writerow([r.get("created_at"), r.get("user_id"), r.get("score")])
+    buf.seek(0)
+    return StreamingResponse(iter([buf.read()]), media_type="text/csv",
+      headers={"Content-Disposition": 'attachment; filename="wellness.csv"'})
+
+
+Mount in server/main.py:
+
+from .routers import wellness_export
+app.include_router(wellness_export.router)
+
+3B) Admin button (optional)
+
+Wherever you have admin actions (Admin Health or WellnessCard):
+
+import { downloadGET } from "@/lib/download";
+<button className="brand-btn text-xs" onClick={()=>downloadGET(`/api/wellness/export.csv?project_id=${projectId}`, "wellness.csv")}>
+  Export Wellness CSV
+</button>
+
+4) TIMELINE — at-risk coloring + legend
+
+We’ll color any stage red if end_date < today. (If you later want “only if not yet signed,” we can add a signed_stage_ids endpoint; for now this simple rule is useful and safe.)
+
+Patch client/src/components/PhaseTimeline.tsx (inside stages.map)
+
+Add before return:
+
+const today = new Date();
+const atRisk = s.end_date ? (new Date(s.end_date) < today) : false;
+const col = atRisk ? "var(--brand-warn)" : (colors[s.area||"default"] || colors.default);
+const glow = s.status==="in_review" ? "0 0 14px rgba(29,228,255,0.35)" : (atRisk ? "0 0 14px rgba(255,211,79,.35)" : "none");
+
+
+Then add a tiny legend above the list (once):
+
+At the top of the component’s return (just before mapping):
+
+<div className="flex items-center gap-3 text-xs mb-2">
+  <div className="flex items-center gap-1"><span style={{display:'inline-block',width:10,height:4,background:'var(--brand-warn)'}}/> At risk</div>
+  <div className="flex items-center gap-1"><span style={{display:'inline-block',width:10,height:4,background:'var(--brand-accent)'}}/> In-progress</div>
+</div>
+
+
+(Adjust colors if you prefer area colors as default.)
+
+5) KPI count-up already in — add diff transition (optional)
+
+If you want a “count-up from previous value” rather than zero every time:
+
+Replace the from in CountUp with the last displayed state (we did that), and call setSum with new values; the component will animate from last to new.
+
+You’re already set here.
+
+6) MOUNTS (server) — confirm once
+from .routers import wellness_export
+app.include_router(wellness_export.router)
+
+
+You already mounted wellness, branding, etc.
+
+7) 60-second verification
+
+Load app → no blocking on logos; header renders, even if logos fail.
+
+Public sign-off → print preview shows clean header; signing shows confetti.
+
+Dashboard → KPIs count up; Apply-All-Safe shows glow + toast.
+
+Wellness → Export CSV works; check-in buttons update mini chart.
+
+Timeline → bars show “At risk” red when end < today; legend renders.
+
+If the app still “sticks” on logos
+
+It’ll now render UI immediately. If something is still freezing, it’s likely a different infinite fetch loop or HMR stale bundle. Two quick checks:
+
+Hard reload (or add ?v=ts once in the URL)
+
+DevTools → Console: if you see repeated /branding/logo 401s, you’re not authenticated in that tab; it’s safe (we hide the logo).

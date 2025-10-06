@@ -1,0 +1,376 @@
+Heard. We’ll lock in the Digest system next: weekly (and optional monthly) digests + quiet hours + daily caps, with dedupe, a Comms Settings admin UI, and a rock-solid scheduler. Paste-ready below.
+
+0) SQL — settings, logging, and dedupe
+
+Run in Supabase SQL:
+
+-- Extend comms settings
+alter table public.org_comms_settings
+  add column if not exists weekly_enabled boolean default true,
+  add column if not exists weekly_day int default 4,  -- 0=Mon, 4=Fri
+  add column if not exists weekly_hour int default 9, -- 09:00 local
+  add column if not exists monthly_enabled boolean default false,
+  add column if not exists monthly_day int default 1, -- 1st of month
+  add column if not exists monthly_hour int default 9;
+
+-- Add dedupe key for sends (one per org/project/kind/period)
+alter table public.comms_send_log
+  add column if not exists period_key text;
+
+create index if not exists idx_sendlog_period
+  on public.comms_send_log(org_id, project_id, kind, period_key);
+
+-- Refresh PostgREST
+select pg_notify('pgrst','reload schema');
+
+1) Comms Settings API (get + upsert)
+
+server/routers/comms.py
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/comms", tags=["comms"])
+ADMIN_OR_OWNER = require_role({"owner","admin"})
+
+class CommsSettings(BaseModel):
+    tz: str = "America/Los_Angeles"
+    quiet_start: str = "21:00:00+00:00"
+    quiet_end: str = "07:00:00+00:00"
+    daily_send_cap: int = 200
+    weekly_enabled: bool = True
+    weekly_day: int = 4
+    weekly_hour: int = 9
+    monthly_enabled: bool = False
+    monthly_day: int = 1
+    monthly_hour: int = 9
+
+@router.get("/settings")
+def get_settings(ctx: TenantCtx = Depends(ADMIN_OR_OWNER)):
+    sb = get_user_supabase(ctx)
+    r = sb.table("org_comms_settings").select("*").eq("org_id", ctx.org_id).single().execute()
+    if r.data: return r.data
+    return CommsSettings().model_dump()
+
+@router.post("/settings")
+def upsert_settings(body: CommsSettings, ctx: TenantCtx = Depends(ADMIN_OR_OWNER)):
+    sb = get_user_supabase(ctx)
+    sb.table("org_comms_settings").upsert({
+        "org_id": ctx.org_id, **body.model_dump()
+    }, on_conflict="org_id").execute()
+    return {"ok": True}
+
+
+Mount in server/main.py:
+
+from .routers import comms
+app.include_router(comms.router)
+
+2) Weekly/Monthly Digest — API + scheduler (final form)
+
+We’ll reuse your existing /api/digest/send-weekly and add:
+
+Preview endpoint (HTML)
+
+Monthly endpoint
+
+Scheduler that triggers using local TZ and dedup via period_key
+
+2a) Digest helpers
+
+server/routers/digest.py (replace/extend yours)
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from datetime import datetime, timedelta, timezone, date
+import os
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+from ..email.util import mailgun_send_html, send_guard, log_send
+
+router = APIRouter(prefix="/api/digest", tags=["digest"])
+PM_PLUS = require_role({"owner","admin","pm","lead"})
+
+def _window(days=7):
+   end = datetime.now(timezone.utc)
+   start = end - timedelta(days=days)
+   return start, end
+
+def _iso_week_key(local_dt: datetime) -> str:
+   y, w, _ = local_dt.isocalendar()
+   return f"wk:{y}-{w:02d}"
+
+def _month_key(local_dt: datetime) -> str:
+   return f"mo:{local_dt.year}-{local_dt.month:02d}"
+
+def _get_local_now(sb, org_id: str) -> tuple[datetime, dict]:
+   s = sb.table("org_comms_settings").select("*").eq("org_id", org_id).single().execute().data or {}
+   from zoneinfo import ZoneInfo
+   tz = ZoneInfo(s.get("tz", "America/Los_Angeles"))
+   now_utc = datetime.now(timezone.utc)
+   return now_utc.astimezone(tz), s
+
+def _compose_counts(sb, org_id: str, project_id: str, days=7):
+   start, end = _window(days)
+   def cnt(table):
+       r = sb.table(table).select("id", count="exact")\
+            .eq("org_id", org_id).eq("project_id", project_id)\
+            .gte("updated_at", start.isoformat()).lte("updated_at", end.isoformat()).execute()
+       return r.count or 0
+   return {
+       "actions":   cnt("actions"),
+       "risks":     cnt("risks"),
+       "decisions": cnt("decisions"),
+   }
+
+def _overdue_signoffs(sb, org_id: str, project_id: str):
+   return sb.table("project_stages").select("title,requested_at")\
+            .eq("org_id", org_id).eq("project_id", project_id)\
+            .eq("status","in_review").execute().data or []
+
+def _digest_html(project_code: str, counts: dict, overdue: list[dict]) -> str:
+   items = "".join([f"<li>{o['title']} (requested {o['requested_at']})</li>" for o in overdue])
+   return f"""
+   <h3>Digest — {project_code}</h3>
+   <ul>
+     <li>Actions: {counts.get('actions',0)}</li>
+     <li>Risks: {counts.get('risks',0)}</li>
+     <li>Decisions: {counts.get('decisions',0)}</li>
+   </ul>
+   <p>Overdue Sign-Offs:</p>
+   <ul>{items or '<li>None</li>'}</ul>
+   """
+
+def _recipients(sb, org_id: str, project_id: str):
+   # TODO: Replace with your contact/subscription matrix lookup.
+   test = os.getenv("DIGEST_TEST_EMAIL")
+   return [test] if test else []
+
+def _send_digest(sb, org_id: str, project_id: str, period_key: str):
+   proj = sb.table("projects").select("code").eq("id", project_id).single().execute().data
+   counts = _compose_counts(sb, org_id, project_id, days=7)
+   overdue = _overdue_signoffs(sb, org_id, project_id)
+   html = _digest_html(proj["code"], counts, overdue)
+
+   recipients = _recipients(sb, org_id, project_id)
+   sent = []
+   for email in recipients:
+       ok, reason = send_guard(sb, org_id, project_id, "digest", email)
+       if not ok: continue
+       mailgun_send_html(email, f"Weekly Digest — {proj['code']}", html)
+       sb.table("comms_send_log").insert({
+           "org_id": org_id, "project_id": project_id,
+           "kind": "digest", "to_email": email, "period_key": period_key
+       }).execute()
+       sent.append(email)
+   return {"sent": sent, "counts": counts, "overdue": overdue}
+
+2b) Manual send/preview endpoints
+@router.get("/preview")
+def preview(project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    proj = sb.table("projects").select("code").eq("id", project_id).single().execute().data
+    counts = _compose_counts(sb, ctx.org_id, project_id, days=7)
+    overdue = _overdue_signoffs(sb, ctx.org_id, project_id)
+    html = _digest_html(proj["code"], counts, overdue)
+    return {"html": html, "counts": counts, "overdue": overdue}
+
+@router.post("/send-weekly")
+def send_weekly(project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    local_now, s = _get_local_now(sb, ctx.org_id)
+    period_key = _iso_week_key(local_now)
+    # dedupe
+    existing = sb.table("comms_send_log").select("id", count="exact")\
+       .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+       .eq("kind","digest").eq("period_key", period_key).execute()
+    if (existing.count or 0) > 0:
+        return {"ok": True, "already_sent": True, "period_key": period_key}
+    out = _send_digest(sb, ctx.org_id, project_id, period_key)
+    return {"ok": True, "period_key": period_key, **out}
+
+@router.post("/send-monthly")
+def send_monthly(project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    local_now, s = _get_local_now(sb, ctx.org_id)
+    period_key = _month_key(local_now)
+    existing = sb.table("comms_send_log").select("id", count="exact")\
+       .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+       .eq("kind","digest").eq("period_key", period_key).execute()
+    if (existing.count or 0) > 0:
+        return {"ok": True, "already_sent": True, "period_key": period_key}
+    out = _send_digest(sb, ctx.org_id, project_id, period_key)
+    return {"ok": True, "period_key": period_key, **out}
+
+
+(Ensure app.include_router(digest.router) is in main.py.)
+
+2c) Scheduler task
+
+server/scheduler.py (update/replace)
+
+import asyncio, datetime as dt
+from zoneinfo import ZoneInfo
+from .deps import get_service_supabase
+from .routers.digest import _iso_week_key, _month_key, _send_digest
+
+INTERVAL = int(float(__import__("os").getenv("SCHEDULER_INTERVAL_SEC","60")))  # 1 min
+
+async def digest_scheduler(app):
+    sb = get_service_supabase()
+    while True:
+        try:
+            now_utc = dt.datetime.now(dt.timezone.utc)
+            proj = sb.table("projects").select("id,org_id,status").neq("status","archived").execute().data or []
+            # pull org settings once
+            settings = {r["org_id"]: r for r in (sb.table("org_comms_settings").select("*").execute().data or [])}
+
+            for p in proj:
+                s = settings.get(p["org_id"], {})
+                tz = ZoneInfo(s.get("tz","America/Los_Angeles"))
+                local = now_utc.astimezone(tz)
+
+                # --- weekly ---
+                if s.get("weekly_enabled", True):
+                    wday = int(s.get("weekly_day", 4))   # 0=Mon
+                    whour= int(s.get("weekly_hour", 9))
+                    if local.weekday()==wday and local.hour==whour and local.minute<1:
+                        period_key = _iso_week_key(local)
+                        # dedupe
+                        sent = sb.table("comms_send_log").select("id", count="exact")\
+                            .eq("org_id", p["org_id"]).eq("project_id", p["id"])\
+                            .eq("kind","digest").eq("period_key", period_key).execute()
+                        if (sent.count or 0)==0:
+                            # call send with service key (note: send_guard will still enforce caps/quiet hours)
+                            _send_digest(sb, p["org_id"], p["id"], period_key)
+
+                # --- monthly ---
+                if s.get("monthly_enabled", False):
+                    mday = int(s.get("monthly_day", 1))
+                    mhour= int(s.get("monthly_hour", 9))
+                    if local.day==mday and local.hour==mhour and local.minute<1:
+                        period_key = _month_key(local)
+                        sent = sb.table("comms_send_log").select("id", count="exact")\
+                            .eq("org_id", p["org_id"]).eq("project_id", p["id"])\
+                            .eq("kind","digest").eq("period_key", period_key).execute()
+                        if (sent.count or 0)==0:
+                            _send_digest(sb, p["org_id"], p["id"], period_key)
+
+        except Exception:
+            pass
+        await asyncio.sleep(INTERVAL)
+
+
+Start it in server/main.py:
+
+import asyncio
+from .scheduler import digest_scheduler
+
+@app.on_event("startup")
+async def _start_sched():
+    asyncio.create_task(digest_scheduler(app))
+
+3) Admin → Comms Settings (minimal UI)
+
+client/src/pages/AdminComms.tsx
+
+import { useEffect, useState } from "react";
+import { apiGet, apiPost } from "@/lib/api";
+
+export default function AdminComms(){
+  const [s,setS] = useState<any>(null);
+  const [saving,setSaving]=useState(false);
+
+  async function load(){ setS(await apiGet("/comms/settings")); }
+  useEffect(()=>{ load(); },[]);
+
+  async function save(){
+    setSaving(true);
+    await apiPost("/comms/settings", s);
+    setSaving(false);
+  }
+  if (!s) return <div className="p-6">Loading…</div>;
+
+  return (
+    <div className="p-6 space-y-4 max-w-xl">
+      <h1 className="text-xl font-semibold">Comms Settings</h1>
+
+      <div className="grid gap-3">
+        <label className="text-sm">Timezone
+          <input className="border rounded p-2 w-full" value={s.tz} onChange={e=>setS({...s,tz:e.target.value})} placeholder="America/Phoenix" />
+        </label>
+        <div className="grid grid-cols-2 gap-3">
+          <label className="text-sm">Quiet start
+            <input className="border rounded p-2 w-full" value={s.quiet_start} onChange={e=>setS({...s,quiet_start:e.target.value})}/>
+          </label>
+          <label className="text-sm">Quiet end
+            <input className="border rounded p-2 w-full" value={s.quiet_end} onChange={e=>setS({...s,quiet_end:e.target.value})}/>
+          </label>
+        </div>
+        <label className="text-sm">Daily cap
+          <input type="number" className="border rounded p-2 w-full" value={s.daily_send_cap} onChange={e=>setS({...s,daily_send_cap:parseInt(e.target.value||"0")})}/>
+        </label>
+
+        <div className="grid grid-cols-3 gap-3">
+          <label className="text-sm flex items-center gap-2">
+            <input type="checkbox" checked={!!s.weekly_enabled} onChange={e=>setS({...s,weekly_enabled:e.target.checked})}/> Weekly
+          </label>
+          <label className="text-sm">Day(0-6)
+            <input type="number" className="border rounded p-2 w-full" value={s.weekly_day} onChange={e=>setS({...s,weekly_day:parseInt(e.target.value||"0")})}/>
+          </label>
+          <label className="text-sm">Hour(0-23)
+            <input type="number" className="border rounded p-2 w-full" value={s.weekly_hour} onChange={e=>setS({...s,weekly_hour:parseInt(e.target.value||"0")})}/>
+          </label>
+        </div>
+
+        <div className="grid grid-cols-3 gap-3">
+          <label className="text-sm flex items-center gap-2">
+            <input type="checkbox" checked={!!s.monthly_enabled} onChange={e=>setS({...s,monthly_enabled:e.target.checked})}/> Monthly
+          </label>
+          <label className="text-sm">Day(1-28)
+            <input type="number" className="border rounded p-2 w-full" value={s.monthly_day} onChange={e=>setS({...s,monthly_day:parseInt(e.target.value||"1")})}/>
+          </label>
+          <label className="text-sm">Hour(0-23)
+            <input type="number" className="border rounded p-2 w-full" value={s.monthly_hour} onChange={e=>setS({...s,monthly_hour:parseInt(e.target.value||"0")})}/>
+          </label>
+        </div>
+      </div>
+
+      <button className="px-3 py-2 rounded bg-black text-white" disabled={saving} onClick={save}>
+        {saving ? "Saving…" : "Save"}
+      </button>
+    </div>
+  );
+}
+
+
+Route & nav (admin-only):
+
+{ path: "/admin/comms", element: <AdminComms/> }
+
+4) Quick tests
+
+Preview JSON (for on-screen check):
+
+curl -s -H "X-Dev-User: <UUID>" -H "X-Dev-Org: <UUID>" -H "X-Dev-Role: admin" \
+  "http://localhost:5000/api/digest/preview?project_id=<PROJ_UUID>" | jq .
+
+
+Manual weekly send (deduped by week):
+
+curl -s -X POST -H "X-Dev-User: <UUID>" -H "X-Dev-Org: <UUID>" -H "X-Dev-Role: admin" \
+  "http://localhost:5000/api/digest/send-weekly?project_id=<PROJ_UUID>"
+
+
+Scheduler sanity:
+
+Set SCHEDULER_INTERVAL_SEC=10
+
+In Comms Settings: set weekly to today’s weekday/hour ~1 min ahead
+
+Watch comms_send_log populate with period_key = wk:YYYY-WW.
+
+If you want the digest to target specific roles/subscriptions next, I’ll add a recipients query wired to your Team Subscriptions matrix. For now this ships with a safe DIGEST_TEST_EMAIL until you flip it live.

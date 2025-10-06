@@ -1,0 +1,271 @@
+next up I’m adding:
+
+Corrections pipeline (supersede-with-history + strike-through),
+
+Ingest worker glue (LLM → staging_tests with dedupe),
+
+Dev bootstrap adds (DDL),
+
+UI hooks to mark a line as wrong and fix it.
+
+I’m staying Drizzle + FastAPI + React, same style as your stack.
+
+1) Data model: corrections & supersede history
+Drizzle models — server/db/schema/corrections.ts
+import { pgTable, uuid, varchar, jsonb, timestamp } from "drizzle-orm/pg-core";
+
+export const corrections = pgTable("corrections", {
+  id: uuid("id").primaryKey().notNull(),
+  projectId: uuid("project_id").notNull().index(),
+  transcriptId: uuid("transcript_id").notNull().index(),
+  itemType: varchar("item_type", { length: 32 }).notNull(), // "test" | "action" | "risk" | ...
+  itemId: uuid("item_id").notNull().index(),
+  reason: varchar("reason", { length: 300 }),
+  diff: jsonb("diff").$type<any>().notNull(),               // { before: {...}, after: {...} }
+  createdBy: uuid("created_by"),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export const supersedes = pgTable("supersedes", {
+  id: uuid("id").primaryKey().notNull(),
+  projectId: uuid("project_id").notNull().index(),
+  itemType: varchar("item_type", { length: 32 }).notNull(), // same types as above
+  oldId: uuid("old_id").notNull().index(),
+  newId: uuid("new_id").notNull().index(),
+  reason: varchar("reason", { length: 300 }),
+  createdBy: uuid("created_by"),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+Dev bootstrap DDL (add to your existing bootstrap SQL)
+create table if not exists corrections (
+  id uuid primary key,
+  project_id uuid not null,
+  transcript_id uuid not null,
+  item_type varchar(32) not null,
+  item_id uuid not null,
+  reason varchar(300),
+  diff jsonb not null,
+  created_by uuid,
+  created_at timestamp default now()
+);
+create index if not exists idx_corr_proj_item on corrections(project_id, item_id);
+
+create table if not exists supersedes (
+  id uuid primary key,
+  project_id uuid not null,
+  item_type varchar(32) not null,
+  old_id uuid not null,
+  new_id uuid not null,
+  reason varchar(300),
+  created_by uuid,
+  created_at timestamp default now()
+);
+create index if not exists idx_super_proj_old on supersedes(project_id, old_id);
+
+2) FastAPI: correction endpoint (generic + test-aware)
+server/routers/corrections.py
+from fastapi import APIRouter, Body, HTTPException
+from pydantic import BaseModel
+from uuid import uuid4
+from db import pg
+
+router = APIRouter(prefix="/api", tags=["corrections"])
+
+class CorrectionBody(BaseModel):
+    projectId: str
+    transcriptId: str
+    itemType: str        # "test"
+    itemId: str          # library item id (tests_library.id)
+    reason: str | None = None
+    fields: dict         # fields to change (e.g., {"title": "...", "gherkin": "..."} )
+    createdBy: str | None = None
+
+@router.post("/corrections")
+def apply_correction(body: CorrectionBody):
+    if body.itemType != "test":
+        raise HTTPException(400, "Only itemType='test' supported in this phase")
+
+    # 1) Load current library test
+    cur = pg.one("select * from tests_library where project_id=%s and id=%s",
+                 (body.projectId, body.itemId))
+    if not cur:
+        raise HTTPException(404, "Test not found")
+
+    # 2) Prepare new record (version +1)
+    new_id = str(uuid4())
+    new_ver = cur["version"] + 1
+    after = { **cur,
+              "id": new_id,
+              "version": new_ver,
+              "title": body.fields.get("title", cur["title"]),
+              "gherkin": body.fields.get("gherkin", cur["gherkin"]),
+              "steps": body.fields.get("steps", cur["steps"]),
+              "priority": body.fields.get("priority", cur["priority"]),
+              "type": body.fields.get("type", cur["type"]),
+              "tags": body.fields.get("tags", cur["tags"])
+            }
+
+    # 3) Insert new version
+    pg.exec("""
+      insert into tests_library
+        (id, project_id, area_key, bp_code, title, version, gherkin, steps,
+         priority, type, tags, source_transcript_id, created_by, dedupe_key)
+      values
+        (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (new_id, cur["project_id"], cur["area_key"], cur["bp_code"],
+          after["title"], new_ver, after["gherkin"], pg.json(after["steps"]),
+          after["priority"], after["type"], pg.json(after["tags"]),
+          body.transcriptId, body.createdBy, cur["dedupe_key"]))
+
+    # 4) Write history + supersede
+    pg.exec("""insert into tests_history (id, test_id, version, diff, committed_by)
+               values (%s, %s, %s, %s::jsonb, %s)""",
+            (str(uuid4()), new_id, new_ver,
+             pg.json({"reason": body.reason, "correction": body.fields, "fromTranscript": body.transcriptId}), body.createdBy))
+
+    pg.exec("""insert into corrections (id, project_id, transcript_id, item_type, item_id, reason, diff, created_by)
+               values (%s,%s,%s,%s,%s,%s,%s::jsonb,%s)""",
+            (str(uuid4()), body.projectId, body.transcriptId, "test", body.itemId,
+             body.reason, pg.json({"before": cur, "after": after}), body.createdBy))
+
+    pg.exec("""insert into supersedes (id, project_id, item_type, old_id, new_id, reason, created_by)
+               values (%s,%s,%s,%s,%s,%s,%s)""",
+            (str(uuid4()), body.projectId, "test", body.itemId, new_id, body.reason, body.createdBy))
+
+    return {"ok": True, "newId": new_id, "version": new_ver}
+
+
+Mount it in server/main.py:
+
+from routers.corrections import router as corrections_router
+app.include_router(corrections_router)
+
+3) Ingest worker glue: LLM → staging tests (dedupe)
+Worker pseudo (TypeScript) — workers/extractTests.ts
+import { createHash } from "crypto";
+import { OpenAI } from "openai";
+import dayjs from "dayjs";
+import { db } from "../db"; // your drizzle instance
+import { stagingTests } from "../server/db/schema/tests";
+
+const oai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+function makeKey(t:any) {
+  const base = `${(t.areaKey||"")}|${(t.bpCode||"")}|${t.title}`.toLowerCase();
+  return createHash("sha1").update(base).digest("hex");
+}
+
+export async function extractTestsFromTranscript(projectId: string, transcriptId: string, text: string) {
+  const sys = "You extract test cases from transcripts. Output valid JSON only.";
+  const user = `Transcript:\n${text}\n\nRules: whenever a change/process/capability is discussed, produce at least one test.`;
+  const toolSchema = /* the JSON schema we defined earlier */;
+
+  const resp = await oai.chat.completions.create({
+    model: "gpt-4o-mini",
+    temperature: 0.2,
+    messages: [{ role: "system", content: sys }, { role: "user", content: user }],
+    response_format: { type: "json_object" }
+  });
+
+  const parsed = JSON.parse(resp.choices[0].message.content || "{}");
+  const tests = Array.isArray(parsed.tests) ? parsed.tests : [];
+
+  for (const t of tests) {
+    const dedupeKey = t.dedupeKey || makeKey(t);
+    const rec = {
+      id: crypto.randomUUID(),
+      projectId,
+      transcriptId,
+      dedupeKey,
+      title: t.title,
+      gherkin: t.gherkin || "",
+      steps: t.steps || [],
+      areaKey: t.areaKey || null,
+      bpCode: t.bpCode || null,
+      priority: t.priority || "P2",
+      type: t.type || "happy",
+      ownerHint: t.ownerHint || null,
+      tags: t.tags || [],
+      trace: t.trace && t.trace.length ? t.trace : [t.title],
+      confidence: Math.round((t.confidence ?? 0.75) * 100),
+      createdAt: dayjs().toISOString(),
+    };
+
+    // upsert by (projectId, dedupeKey)
+    await db.execute(`
+      insert into staging_tests (id, project_id, transcript_id, dedupe_key, title, gherkin, steps,
+                                 area_key, bp_code, priority, type, owner_hint, tags, trace, confidence, created_at)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15, now())
+      on conflict (project_id, dedupe_key)
+      do update set title=excluded.title, gherkin=excluded.gherkin, steps=excluded.steps,
+                    area_key=excluded.area_key, bp_code=excluded.bp_code, priority=excluded.priority,
+                    type=excluded.type, owner_hint=excluded.owner_hint, tags=excluded.tags,
+                    trace=excluded.trace, confidence=excluded.confidence
+    `, [
+      rec.id, rec.projectId, rec.transcriptId, rec.dedupeKey, rec.title, rec.gherkin, JSON.stringify(rec.steps),
+      rec.areaKey, rec.bpCode, rec.priority, rec.type, rec.ownerHint, JSON.stringify(rec.tags),
+      JSON.stringify(rec.trace), rec.confidence
+    ]);
+  }
+
+  return { ok: true, count: tests.length };
+}
+
+4) UI hooks
+A) “Mark line as wrong → correction” (minimal)
+
+On your transcript review page, add a context action next to each extracted test row (or in the transcript margin):
+
+async function correctTest(projectId: string, transcriptId: string, testId: string, fields: Partial<any>) {
+  const res = await fetch("/api/corrections", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      projectId, transcriptId,
+      itemType: "test", itemId: testId,
+      reason: "Transcript correction",
+      fields,
+      createdBy: me?.id
+    })
+  });
+  const json = await res.json();
+  if (!json.ok) return toast.error("Correction failed");
+  toast.success(`Corrected (v${json.version})`);
+  // Optionally refresh tests library list
+}
+
+
+UI affordance example:
+
+On a library test row: “✏️ Correct from transcript” opens a drawer with the current fields; save calls correctTest(...).
+
+In the transcript text: highlight → “Propose Correction” pre-fills fields and calls same function.
+
+B) Tests review panel already added (commit Approved/Edited/Rejected)
+5) Ingest route (wire it)
+
+When your webhook receives a transcript:
+
+Save raw → transcripts table (or your existing container).
+
+Call extractTestsFromTranscript(projectId, transcriptId, normalizedText).
+
+Notify PM: “N new test candidates ready for review”.
+
+Pseudo FastAPI:
+
+@ingest.post("/ingest/transcript")
+def ingest_transcript(body: IngestBody):
+    # save transcript ...
+    # normalize text ...
+    # queue worker or call directly
+    # return { transcriptId }
+
+6) QA / smoke
+
+Worker smoke: run extractTestsFromTranscript on a small transcript; confirm staging_tests rows appear.
+
+Review UI: approve one item → tests_library v1, history row written.
+
+Correction: adjust that test via /api/corrections → v2 created, supersede + history written.

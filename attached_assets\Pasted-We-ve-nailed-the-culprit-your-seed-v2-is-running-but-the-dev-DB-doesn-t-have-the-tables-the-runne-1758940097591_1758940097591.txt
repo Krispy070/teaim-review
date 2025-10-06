@@ -1,0 +1,303 @@
+We’ve nailed the culprit: your seed-v2 is running, but the dev DB doesn’t have the tables (the runner shows: “Database tables don’t exist in development environment”). So every insert is a no-op.
+
+Here’s the fastest path to green checks. Pick ONE of the three options below based on your stack. I’m giving you complete, paste-ready files.
+
+Option A — Knex migration (recommended if you’re already using Knex)
+
+Create: server/migrations/20250927_init_teaim_core.ts
+
+import { Knex } from "knex";
+
+export async function up(knex: Knex): Promise<void> {
+  if (!(await knex.schema.hasTable("areas"))) {
+    await knex.schema.createTable("areas", (t) => {
+      t.uuid("id").primary();
+      t.uuid("project_id").index();
+      t.string("key").index();
+      t.string("name");
+      t.string("status").defaultTo("active");
+      t.timestamp("created_at").defaultTo(knex.fn.now());
+    });
+  }
+
+  if (!(await knex.schema.hasTable("workbooks"))) {
+    await knex.schema.createTable("workbooks", (t) => {
+      t.uuid("id").primary();
+      t.uuid("project_id").index();
+      t.uuid("area_id").index();
+      t.string("title");
+      t.jsonb("metrics").defaultTo(knex.raw("'{}'::jsonb"));
+      t.timestamp("created_at").defaultTo(knex.fn.now());
+    });
+  }
+
+  if (!(await knex.schema.hasTable("reports"))) {
+    await knex.schema.createTable("reports", (t) => {
+      t.uuid("id").primary();
+      t.uuid("project_id").index();
+      t.uuid("area_id").index();
+      t.string("type").index();               // e.g. wb_export_csv
+      t.string("title");
+      t.jsonb("payload").defaultTo(knex.raw("'{}'::jsonb"));
+      t.timestamp("created_at").defaultTo(knex.fn.now());
+    });
+  }
+
+  if (!(await knex.schema.hasTable("changes"))) {
+    await knex.schema.createTable("changes", (t) => {
+      t.uuid("id").primary();
+      t.uuid("project_id").index();
+      t.uuid("area_id").index();
+      t.string("kind");                        // add | update | remove
+      t.string("summary");
+      t.timestamp("created_at").defaultTo(knex.fn.now());
+    });
+  }
+
+  if (!(await knex.schema.hasTable("comments"))) {
+    await knex.schema.createTable("comments", (t) => {
+      t.uuid("id").primary();
+      t.uuid("project_id").index();
+      t.uuid("area_id").index();
+      t.text("body");
+      t.string("author");
+      t.timestamp("created_at").defaultTo(knex.fn.now());
+    });
+  }
+
+  if (!(await knex.schema.hasTable("releases"))) {
+    await knex.schema.createTable("releases", (t) => {
+      t.uuid("id").primary();
+      t.uuid("project_id").index();
+      t.string("kind").index();                // ics
+      t.string("channel").index();             // staging/prod
+      t.string("tag");
+      t.timestamp("created_at").defaultTo(knex.fn.now());
+    });
+  }
+
+  if (!(await knex.schema.hasTable("notifications"))) {
+    await knex.schema.createTable("notifications", (t) => {
+      t.uuid("id").primary();
+      t.uuid("project_id").index();
+      t.string("kind").index();                // digest_ready
+      t.boolean("seen").defaultTo(false);
+      t.jsonb("payload").defaultTo(knex.raw("'{}'::jsonb"));
+      t.timestamp("created_at").defaultTo(knex.fn.now());
+    });
+  }
+
+  if (!(await knex.schema.hasTable("signoffs"))) {
+    await knex.schema.createTable("signoffs", (t) => {
+      t.string("token").primary();
+      t.uuid("project_id").index();
+      t.string("status").defaultTo("issued");
+      t.timestamp("expires_at");
+      t.timestamp("created_at").defaultTo(knex.fn.now());
+    });
+  }
+}
+
+export async function down(knex: Knex): Promise<void> {
+  await knex.schema.dropTableIfExists("signoffs");
+  await knex.schema.dropTableIfExists("notifications");
+  await knex.schema.dropTableIfExists("releases");
+  await knex.schema.dropTableIfExists("comments");
+  await knex.schema.dropTableIfExists("changes");
+  await knex.schema.dropTableIfExists("reports");
+  await knex.schema.dropTableIfExists("workbooks");
+  await knex.schema.dropTableIfExists("areas");
+}
+
+
+Run:
+
+# from your server directory
+npx knex migrate:latest
+
+
+Then hit Seed & Run. You should see non-zero counts.
+
+Option B — Bootstrap endpoint (one-time dev create + seed)
+
+If you don’t want to run migrations in Replit dev, add this route and call it once.
+
+Create: server/admin/test/bootstrap.ts
+
+import { Router } from "express";
+import { db } from "../../db";
+import { seedMinimal } from "./seedMinimal";
+
+export const bootstrapRouter = Router();
+
+const ensure = async (name: string, def: (t: any) => void) => {
+  const exists = await db.schema.hasTable(name);
+  if (!exists) await db.schema.createTable(name, def);
+};
+
+bootstrapRouter.post("/bootstrap-and-seed", async (req, res) => {
+  const projectId = req.body?.projectId;
+  if (!projectId) return res.status(400).json({ ok:false, error:"projectId required" });
+
+  try {
+    await ensure("areas", (t:any)=>{ t.uuid("id").primary(); t.uuid("project_id").index(); t.string("key"); t.string("name"); t.string("status").defaultTo("active"); t.timestamp("created_at").defaultTo(db.fn.now()); });
+    await ensure("workbooks", (t:any)=>{ t.uuid("id").primary(); t.uuid("project_id").index(); t.uuid("area_id").index(); t.string("title"); t.jsonb("metrics").defaultTo(db.raw("'{}'::jsonb")); t.timestamp("created_at").defaultTo(db.fn.now()); });
+    await ensure("reports", (t:any)=>{ t.uuid("id").primary(); t.uuid("project_id").index(); t.uuid("area_id").index(); t.string("type").index(); t.string("title"); t.jsonb("payload").defaultTo(db.raw("'{}'::jsonb")); t.timestamp("created_at").defaultTo(db.fn.now()); });
+    await ensure("changes", (t:any)=>{ t.uuid("id").primary(); t.uuid("project_id").index(); t.uuid("area_id").index(); t.string("kind"); t.string("summary"); t.timestamp("created_at").defaultTo(db.fn.now()); });
+    await ensure("comments", (t:any)=>{ t.uuid("id").primary(); t.uuid("project_id").index(); t.uuid("area_id").index(); t.text("body"); t.string("author"); t.timestamp("created_at").defaultTo(db.fn.now()); });
+    await ensure("releases", (t:any)=>{ t.uuid("id").primary(); t.uuid("project_id").index(); t.string("kind").index(); t.string("channel").index(); t.string("tag"); t.timestamp("created_at").defaultTo(db.fn.now()); });
+    await ensure("notifications", (t:any)=>{ t.uuid("id").primary(); t.uuid("project_id").index(); t.string("kind").index(); t.boolean("seen").defaultTo(false); t.jsonb("payload").defaultTo(db.raw("'{}'::jsonb")); t.timestamp("created_at").defaultTo(db.fn.now()); });
+    await ensure("signoffs", (t:any)=>{ t.string("token").primary(); t.uuid("project_id").index(); t.string("status").defaultTo("issued"); t.timestamp("expires_at"); t.timestamp("created_at").defaultTo(db.fn.now()); });
+
+    const out = await seedMinimal(projectId);
+    return res.json({ ok:true, action:"bootstrap-and-seed", out });
+  } catch (e:any) {
+    return res.status(500).json({ ok:false, error: e?.message || String(e) });
+  }
+});
+
+
+Mount:
+
+// server/index.ts
+import { bootstrapRouter } from "./admin/test/bootstrap";
+app.use("/admin/test", bootstrapRouter);
+
+
+Call once (DevTools Console in the app):
+
+await fetch("/admin/test/bootstrap-and-seed", {
+  method: "POST",
+  headers: {"Content-Type":"application/json"},
+  body: JSON.stringify({ projectId: "e1ec6ad0-a4e8-45dd-87b0-e123776ffe6e" })
+}).then(r=>r.json())
+
+
+Then click Seed & Run → counts should be > 0 and reds flip.
+
+Option C — Prisma schema (if you’re Prisma-first)
+
+Edit prisma/schema.prisma and add these models:
+
+model areas {
+  id         String   @id @default(uuid())
+  project_id String   @index
+  key        String?
+  name       String?
+  status     String   @default("active")
+  created_at DateTime @default(now())
+}
+
+model workbooks {
+  id         String   @id @default(uuid())
+  project_id String   @index
+  area_id    String   @index
+  title      String?
+  metrics    Json     @default("{}")
+  created_at DateTime @default(now())
+}
+
+model reports {
+  id         String   @id @default(uuid())
+  project_id String   @index
+  area_id    String   @index
+  type       String?
+  title      String?
+  payload    Json     @default("{}")
+  created_at DateTime @default(now())
+}
+
+model changes {
+  id         String   @id @default(uuid())
+  project_id String   @index
+  area_id    String   @index
+  kind       String?
+  summary    String?
+  created_at DateTime @default(now())
+}
+
+model comments {
+  id         String   @id @default(uuid())
+  project_id String   @index
+  area_id    String   @index
+  body       String?
+  author     String?
+  created_at DateTime @default(now())
+}
+
+model releases {
+  id         String   @id @default(uuid())
+  project_id String   @index
+  kind       String?
+  channel    String?
+  tag        String?
+  created_at DateTime @default(now())
+}
+
+model notifications {
+  id         String   @id @default(uuid())
+  project_id String   @index
+  kind       String?
+  seen       Boolean  @default(false)
+  payload    Json     @default("{}")
+  created_at DateTime @default(now())
+}
+
+model signoffs {
+  token      String   @id
+  project_id String   @index
+  status     String   @default("issued")
+  expires_at DateTime?
+  created_at DateTime @default(now())
+}
+
+
+Apply:
+
+npx prisma migrate dev --name init_teaim_core
+# or in dev-only environments:
+npx prisma db push
+
+
+Then Seed & Run.
+
+Quick sanity checklist (do right now)
+
+In server boot logs, print DB target:
+
+console.log("[DB]", process.env.DATABASE_URL);
+
+
+Hit our debug helper (if you added earlier):
+
+GET /admin/test/debug
+
+
+It should return areasTotal (0 before seed, >0 after).
+
+Re-run Seed & Run and confirm the green panel shows numeric counts (not strings), and no “tables don’t exist” warning.
+
+Expected after fix
+
+Seed Response (v2):
+
+{
+  "seeder": "v2",
+  "ok": true,
+  "projectId": "e1ec6ad0-a4e8-45dd-87b0-e123776ffe6e",
+  "inserted": {
+    "areas": 2,
+    "workbooks": 2,
+    "reports": 2,
+    "changes": 2,
+    "comments": 2,
+    "releases": 1,
+    "notifications": 1,
+    "signoffs": 1
+  }
+}
+
+
+Test Runner: 7/8 green (the invalid-token negative stays red by design).
+
+If you tell me which of A/B/C you’re using (Knex, Bootstrap, or Prisma), I’ll hand you the tiny follow-up patch for your repo paths so this is copy-paste exact.

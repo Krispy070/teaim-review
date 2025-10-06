@@ -1,0 +1,419 @@
+Next Big Build v2.12.4 (two sprints in one) that sharpens PM speed and polish. Everything is copy-paste ready, Brand v2–aware, and dev-safe (new endpoints fail gracefully if tables are missing).
+
+What lands now:
+
+Request Sign-Off v3.4 — global member search, multi-area chips, CC Leads/PMs presets remembered per project, optional Doc link and message to include in the email (no double email)
+
+Stages Editor “Undo All” — snapshot on load, per-row Revert last (already shipped) + Undo all changes since load + “Saved HH:MM” stamp
+
+Digest deep links with pre-filters — Actions List/Audit Timeline open filter panels with owner/area pre-applied, then scroll to row
+
+Wellness Admin “compare periods” — last 7/30 vs prior period with up/down deltas + CSV
+
+v2.12.4 — Sign-Off v3.4 + Stages Undo All + Digest pre-filters + Wellness compare
+1) Request Sign-Off v3.4 (multi-area, remembered presets, Doc link)
+1A) Backend — batch endpoint supports cc_all_pms and sends one rich email (with token link + message + optional doc link)
+
+Patch server/routers/stages_request_sign.py (extend your existing file)
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+from typing import List, Optional
+import os
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase, get_service_supabase
+from ..routers.signoff_docs_gen import DraftReq
+
+router = APIRouter(prefix="/api/stages", tags=["stages"])
+PM_PLUS = require_role({"owner","admin","pm"})
+
+class RequestBatch(BaseModel):
+    stage_id: str
+    emails: List[str] = Field(min_items=1)
+    cc: Optional[List[str]] = None
+    cc_all_leads: bool = False
+    cc_all_pms: bool = False
+    title: Optional[str] = "Stage Sign-Off"
+    area: Optional[str] = None
+    message: Optional[str] = None
+    doc_link: Optional[str] = None
+    expires_hours: int = 120
+
+@router.post("/request_signoff_batch")
+def request_signoff_batch(body: RequestBatch, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx); sbs = get_service_supabase()
+
+    # 1) find or create sign-off doc tied to stage
+    d = sbs.table("signoff_docs").select("id,status")\
+        .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("stage_id", body.stage_id).limit(1).execute().data
+    if not d:
+        draft = DraftReq(stage_id=body.stage_id, area=body.area, title=body.title or "Stage Sign-Off",
+                         summary=body.message or "Please review and acknowledge completion of this stage.",
+                         bullets=[], acceptance="I acknowledge and approve the above.", footer="Signed electronically via TEAIM")
+        from ..routers.signoff_docs_gen import generate_from_prompt
+        _ = generate_from_prompt(draft, project_id, ctx)
+        d = sbs.table("signoff_docs").select("id,status")\
+            .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("stage_id", body.stage_id).limit(1).execute().data
+        if not d: raise HTTPException(500, "Failed to create sign-off draft")
+    doc_id = d[0]["id"]
+
+    # 2) prepare CC presets (leads/PMs → emails)
+    cc_list = set([e.strip() for e in (body.cc or []) if e.strip()])
+    try:
+        mem = sb.table("project_members").select("user_id,role")\
+            .eq("org_id", ctx.org_id).eq("project_id", project_id).execute().data or []
+        prof = sb.table("users_profile").select("user_id,email").execute().data or []
+        email_map = {p["user_id"]: p.get("email") for p in prof if p.get("user_id")}
+        if body.cc_all_leads:
+            for m in mem:
+                if (m.get("role") or "").lower()=="lead":
+                    em = email_map.get(m["user_id"]); 
+                    if em: cc_list.add(em)
+        if body.cc_all_pms:
+            for m in mem:
+                if (m.get("role") or "").lower()=="pm":
+                    em = email_map.get(m["user_id"]); 
+                    if em: cc_list.add(em)
+    except Exception:
+        pass
+
+    # 3) generate token per primary recipient and send one rich email with link+message
+    from ..email.util import mailgun_send_html, send_guard
+    base = os.getenv("APP_BASE_URL","").rstrip("/")
+    sent=[]
+    for email in body.emails:
+        try:
+            # token for each primary recipient
+            tok = sbs.table("signoff_doc_tokens").insert({
+                "org_id": ctx.org_id, "project_id": project_id, "doc_id": doc_id,
+                "signer_email": email, "expires_at": None, "used_at": None
+            }).execute().data
+        except Exception:
+            tok = None
+
+        link = f"{base}/signoff/doc/{tok[0]['token']}" if tok and tok[0].get("token") else f"{base}/projects/{project_id}/signoff/docs"
+        ok, reason = send_guard(sb, ctx.org_id, project_id, "signoff", email)
+        if ok:
+            html = f"<p>Please review and sign <b>{body.title or 'Stage Sign-Off'}</b>.</p><p><a href='{link}'>Open Document</a></p>"
+            if body.doc_link: html += f"<p>Reference: <a href='{body.doc_link}'>{body.doc_link}</a></p>"
+            if body.message: html += f"<p>{body.message}</p>"
+            try: mailgun_send_html(email, f"Please review & sign: {body.title}", html, cc=list(cc_list) if cc_list else None)
+            except Exception: ...
+            sent.append(email)
+
+    # 4) audit
+    try:
+        sbs.table("audit_events").insert({
+            "org_id": ctx.org_id, "project_id": project_id, "actor_id": ctx.user_id,
+            "kind": "stage.request_signoff",
+            "details": {"stage_id": body.stage_id, "emails": body.emails, "cc": sorted(list(cc_list)), "title": body.title}
+        }).execute()
+    except Exception: ...
+
+    return {"ok": True, "sent": sent, "cc": sorted(list(cc_list))}
+
+
+Dev-safe note: if Mailgun isn’t configured, endpoint still returns ok and logs the action.
+
+1C) Frontend — modal remembers CC presets per project, supports multi-area chips & Doc link
+
+client/src/components/SignoffRequestModal.tsx (replace)
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { getJSON } from "@/lib/authFetch";
+
+const DEFAULT_AREAS = ["HCM","Payroll","Financials","Time","Integrations","Security","Reporting","Cutover"];
+
+export default function SignoffRequestModal({
+  projectId, stageId, stageTitle, stageArea, onClose
+}:{
+  projectId: string; stageId: string; stageTitle?: string; stageArea?: string; onClose: ()=>void
+}){
+  const [members,setMembers]=useState<{user_id:string;email:string;role?:string;can_sign_all?:boolean;sign_areas?:string[]}[]>([]);
+  const [signers,setSigners]=useState<typeof members>([]);
+
+  const [q,setQ]=useState("");
+  const [areas,setAreas]=useState<string[]>(stageArea?[stageArea]:[]);
+  const [picked,setPicked]=useState<string[]>([]);
+  const [cc,setCc]=useState<string>("");
+  const [ccAllLeads,setCcAllLeads]=useState(false);
+  const [ccAllPMs,setCcAllPMs]=useState(false);
+  const [docLink,setDocLink]=useState("");
+  const [msg,setMsg]=useState<string>("");
+  const [busy,setBusy]=useState(false);
+  const inputRef = useRef<HTMLInputElement|null>(null);
+
+  const storeKeyStage = `kap.stageReq.${projectId}.${stageId}`;
+  const storeKeyProj  = `kap.signoff.ccPresets.${projectId}`;
+
+  useEffect(()=>{ inputRef.current?.focus(); },[]);
+
+  // Load members, signers, last used selections (per-stage) + presets (per-project)
+  useEffect(()=>{ (async()=>{
+    try{
+      const m = await getJSON(`/api/members/all?project_id=${projectId}`); setMembers(m.items||[]);
+      const d = await getJSON(`/api/members/signers?project_id=${projectId}${stageArea?`&area=${encodeURIComponent(stageArea)}`:""}`); setSigners(d.items||[]);
+    }catch{ setMembers([]); setSigners([]); }
+    try{
+      const savedStage = JSON.parse(localStorage.getItem(storeKeyStage) || "{}");
+      if (savedStage.emails) setPicked(savedStage.emails);
+      if (savedStage.cc) setCc(savedStage.cc);
+      if (savedStage.areas) setAreas(savedStage.areas);
+      if (savedStage.message) setMsg(savedStage.message);
+      if (savedStage.docLink) setDocLink(savedStage.docLink);
+    }catch{}
+    try{
+      const presets = JSON.parse(localStorage.getItem(storeKeyProj) || "{}");
+      if (presets.ccAllLeads) setCcAllLeads(true);
+      if (presets.ccAllPMs) setCcAllPMs(true);
+    }catch{}
+  })(); },[projectId, stageArea, storeKeyStage, storeKeyProj]);
+
+  const hits = useMemo(()=>{
+    const allowedByArea = (p:any)=> p.can_sign_all || areas.length===0 || areas.some(a => (p.sign_areas||[]).includes(a));
+    const pool = members.map(m=>{
+      const s = signers.find(x=>x.user_id===m.user_id);
+      const allowed = (s?.allowed || m.can_sign_all || areas.length===0 || (m.sign_areas||[]).some(a=>areas.includes(a)));
+      return {...m, allowed};
+    });
+    const qq = q.toLowerCase();
+    return pool.filter(p=>{
+      const matchQ = !qq || (p.email||"").toLowerCase().includes(qq) || (p.role||"").toLowerCase().includes(qq);
+      const matchArea = allowedByArea(p);
+      return matchQ && matchArea;
+    }).sort((a,b)=> (a.allowed===b.allowed) ? ((a.role||"").localeCompare(b.role||"")) : (a.allowed? -1 : 1));
+  },[members, signers, q, areas]);
+
+  function toggle(email:string){
+    setPicked(p => p.includes(email) ? p.filter(x=>x!==email) : [...p, email]);
+  }
+
+  function applyPreset(which:"leads"|"pms"){
+    const wanted = which==="leads" ? ["lead"] : ["pm"];
+    const emails = hits.filter(h=> wanted.includes((h.role||"").toLowerCase()) ).map(h=>h.email);
+    setPicked(prev => Array.from(new Set([ ...prev, ...emails ])));
+    // remember presets per project
+    const saved = JSON.parse(localStorage.getItem(storeKeyProj) || "{}");
+    localStorage.setItem(storeKeyProj, JSON.stringify({...saved, ccAllLeads: which==="leads" ? true : !!saved.ccAllLeads, ccAllPMs: which==="pms" ? true : !!saved.ccAllPMs}));
+    which==="leads"? setCcAllLeads(true) : setCcAllPMs(true);
+  }
+
+  function toggleArea(a:string){
+    setAreas(prev => prev.includes(a) ? prev.filter(x=>x!==a) : [...prev, a]);
+  }
+
+  async function send(){
+    if (!picked.length) return alert("Pick at least one recipient");
+    const ccList = cc.split(",").map(x=>x.trim()).filter(Boolean);
+    setBusy(true);
+    try{
+      await fetch(`/api/stages/request_signoff_batch?project_id=${projectId}`, {
+        method:"POST", credentials:"include", headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          stage_id: stageId, emails: picked, cc: ccList,
+          cc_all_leads: ccAllLeads, cc_all_pms: ccAllPMs,
+          title: stageTitle, area: areas[0] || stageArea || "", message: msg, doc_link: docLink
+        })
+      });
+      localStorage.setItem(storeKeyStage, JSON.stringify({ emails:picked, cc, areas, message:msg, docLink }));
+      onClose(); alert(`Request sent to ${picked.length} recipient(s)`);
+    }catch(e:any){ alert(String(e?.message||e)); setBusy(false); }
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-[200]" onClick={onClose}>
+      <div className="mx-auto mt-[8vh] w-[760px] max-w-[96%] bg-white dark:bg-neutral-900 rounded shadow-xl border"
+           onClick={e=>e.stopPropagation()}>
+        <div className="p-3 border-b">
+          <div className="text-sm font-medium">Request Sign-Off</div>
+          <div className="text-xs text-muted-foreground">{stageTitle}{stageArea?` • ${stageArea}`:""}</div>
+        </div>
+        <div className="p-3 space-y-2">
+          <div className="flex items-center gap-2">
+            <input ref={inputRef} className="border rounded p-2 w-full text-sm"
+                   placeholder="Search recipients (email or role)…" value={q} onChange={e=>setQ(e.target.value)} />
+            <div className="flex items-center gap-2">
+              {DEFAULT_AREAS.map(a=>(
+                <button key={a} className={`brand-btn text-[11px] ${areas.includes(a)?'pulse-once':''}`} onClick={()=>toggleArea(a)}>{a}</button>
+              ))}
+              <button className="brand-btn text-[11px]" onClick={()=>setAreas([])}>All</button>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 text-xs">
+            <button className="brand-btn text-xs" onClick={()=>applyPreset("leads")}>+ Leads</button>
+            <button className="brand-btn text-xs" onClick={()=>applyPreset("pms")}>+ PMs</button>
+          </div>
+
+          <div className="max-h-[32vh] overflow-auto border rounded">
+            {hits.map(h=>(
+              <label key={h.email} className="flex items-center gap-2 px-2 py-1 hover:bg-black/5 dark:hover:bg-white/5">
+                <input type="checkbox" checked={picked.includes(h.email)} onChange={()=>toggle(h.email)} />
+                <span className="text-sm">{h.email}</span>
+                <span className="text-[11px] text-muted-foreground ml-auto">
+                  {h.role || ""} {h.can_sign_all ? "• signer(all)" : h.sign_areas?.length ? `• signer(${h.sign_areas.join(",")})`:""}
+                </span>
+              </label>
+            ))}
+            {!hits.length && <div className="p-2 text-xs text-muted-foreground">No matches</div>}
+          </div>
+
+          <div className="grid md:grid-cols-2 gap-2">
+            <input className="border rounded p-2 text-sm" placeholder="CC (comma-separated)" value={cc} onChange={e=>setCc(e.target.value)} />
+            <div className="flex items-center gap-2 text-xs">
+              <label className="flex items-center gap-1"><input type="checkbox" checked={ccAllLeads} onChange={e=>setCcAllLeads(e.target.checked)}/> CC all leads</label>
+              <label className="flex items-center gap-1"><input type="checkbox" checked={ccAllPMs} onChange={e=>setCcAllPMs(e.target.checked)}/> CC all PMs</label>
+            </div>
+          </div>
+
+          <input className="border rounded p-2 w-full text-sm" placeholder="Optional document link (reference URL)" value={docLink} onChange={e=>setDocLink(e.target.value)} />
+          <textarea className="border rounded p-2 w-full text-sm" rows={3} placeholder="Optional message…" value={msg} onChange={e=>setMsg(e.target.value)} />
+        </div>
+
+        <div className="p-3 border-t flex justify-end gap-2">
+          <button className="brand-btn text-xs" onClick={onClose}>Cancel</button>
+          <button className="brand-btn text-xs swoosh" onClick={send} disabled={busy || picked.length===0}>
+            {busy?"Sending…":`Send (${picked.length})`}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+2) Stages Editor — Undo All + saved stamp
+
+client/src/pages/Stages.tsx (augment)
+
+At top:
+
+const [snapshot,setSnapshot] = useState<Record<string,{start_date?:string;end_date?:string}>>({});
+const [savedAt,setSavedAt] = useState<string>("");
+
+useEffect(()=>{  // take snapshot on initial load or reload
+  const snap: Record<string,{start_date?:string;end_date?:string}> = {};
+  (stages||[]).forEach(s=> snap[s.id] = { start_date:s.start_date, end_date:s.end_date });
+  setSnapshot(snap);
+  setSavedAt(new Date().toLocaleTimeString());
+},[stages.length]);  // run when rows initially available
+
+
+Add Undo All button near the page header:
+
+<div className="flex items-center justify-between mb-2">
+  <div className="text-xl font-semibold heading">Stages</div>
+  <div className="flex items-center gap-2">
+    <span className="text-xs text-muted-foreground">Saved {savedAt || "—"}</span>
+    <button className="brand-btn text-xs" onClick={async ()=>{
+      for (const s of stages){
+        const prev = snapshot[s.id]; if (!prev) continue;
+        if (s.start_date!==prev.start_date || s.end_date!==prev.end_date){
+          await saveField(s.id, prev);
+        }
+      }
+      setSavedAt(new Date().toLocaleTimeString());
+      toast({ title:"Reverted", description:"All stages restored to initial state" });
+    }}>Undo All</button>
+  </div>
+</div>
+
+
+Your existing saveField and toast are reused. You already implemented Revert last per row.
+
+3) Digest links → open filters & scroll to row
+
+You already added anchor scroll code. Ensure filter state opens:
+
+Actions List: check #openFilters=1&owner=...&area=...&id=...
+
+Audit Timeline: check #openFilters=1&tab=risks&id=...
+
+client/src/pages/ActionsList.tsx (ensure):
+
+const params = new URLSearchParams((loc.hash || "").replace(/^#/, ""));
+useEffect(()=>{
+  if (params.get("openFilters")==="1") setFiltersOpen(true);
+  const of = params.get("owner") || ""; if (of) setOwnerFilter(of);
+  const ar = params.get("area") || ""; if (ar) setAreaFilter(ar);
+  const anchorId = params.get("id") || (loc.hash.startsWith("#id=") ? loc.hash.slice(4) : "");
+  if (anchorId){
+    const el = document.querySelector(`[data-action-id="${anchorId}"]`) as HTMLElement|null;
+    if (el){ el.scrollIntoView({behavior:"smooth",block:"center"}); el.classList.add("pulse-once"); setTimeout(()=>el.classList.remove("pulse-once"), 1500); }
+  }
+},[loc.key]);
+
+
+client/src/pages/AdminAuditTimeline.tsx similarly opens tab + filter and scrolls to anchor node.
+
+4) Wellness Admin — compare periods & CSV
+4A) Backend compare endpoint (total responders)
+
+server/routers/wellness_compare.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from datetime import datetime, timedelta, timezone
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/wellness", tags=["wellness"])
+
+@router.get("/compare")
+def compare(project_id: str = Query(...), days: int = 30,
+            ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    sb = get_user_supabase(ctx)
+    days = 7 if days==7 else 30
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days-1)
+    prev_start = start - timedelta(days=days)
+    prev_end = start - timedelta(days=1)
+    try:
+      rows = sb.table("team_wellness").select("created_at")\
+             .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+             .gte("created_at", start.isoformat()).execute().data or []
+      prev = sb.table("team_wellness").select("created_at")\
+             .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+             .gte("created_at", prev_start.isoformat()).lte("created_at", prev_end.isoformat()).execute().data or []
+    except Exception:
+      rows, prev = [], []
+    cur = len(rows); prv = len(prev)
+    delta = cur - prv
+    pct = (delta / prv * 100.0) if prv>0 else None
+    return {"current": cur, "previous": prv, "delta": delta, "pct": pct}
+
+
+Mount in server/main.py:
+
+from .routers import wellness_compare
+app.include_router(wellness_compare.router)
+
+4B) UI — small compare widget near AdminWellnessTrend
+
+client/src/components/AdminWellnessTrend.tsx (append after SVG):
+
+import { useEffect, useState } from "react";
+// ...
+const [cmp,setCmp]=useState<{current:number,previous:number,delta:number,pct:number|null} | null>(null);
+useEffect(()=>{ (async()=>{
+  try{ const d = await getJSON(`/api/wellness/compare?project_id=${projectId}&days=${days}`); setCmp(d); }catch{ setCmp(null); }
+})(); },[projectId, days]);
+
+{cmp && (
+  <div className="text-xs mt-1">
+    Checkins: <b>{cmp.current}</b> vs {cmp.previous}{" "}
+    <span className={`${cmp.delta>0?'text-[var(--brand-good)]':cmp.delta<0?'text-red-400':'text-muted-foreground'}`}>
+      {cmp.delta>0?`(+${cmp.delta})`: cmp.delta<0?`(${cmp.delta})`:"(+0)"} {cmp.pct!=null?`(${cmp.pct.toFixed(1)}%)`:""}
+    </span>
+  </div>
+)}
+
+5) 90-second verification
+
+Request Sign-Off v3.3: search members, multi-area chips, CC Leads/PMs presets remembered per project; optional doc link; single rich email with token link & message
+
+Stages: Undo All restores stage dates to snapshot; keyboard date edits preserve duration (forward/back), per-field undo still works
+
+Digests: links open filters (owner/area) and scroll to the exact row
+
+Wellness: trend line plus compare (7/30 vs prior) and Top Responders CSV; per-user sparkline/date-range modal still works

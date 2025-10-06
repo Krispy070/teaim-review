@@ -1,0 +1,298 @@
+1) Email Dropbox (ingest transcripts & docs)
+Flow (secure + simple)
+
+Address: ingest@yourdomain.com (provider: Mailgun/SendGrid/SES — any is fine)
+
+Routing rule: Subject must include a project code #proj:WD-ACME (or we drop to “Unrouted” queue)
+
+Security: allowlist sender domains (client + partner), require DKIM/DMARC=pass, AV scan, MIME/type allowlist
+
+Attachments: PDF/DOCX/TXT/EML/VTT/SRT (OCR later if needed)
+
+Endpoint
+
+POST /email/inbound (provider webhook → your FastAPI)
+
+# /server/email.py
+from fastapi import APIRouter, Request
+from .parsing import extract_text
+from .chunking import chunk_text
+from .rag import embed_texts
+from .mem_agent import extract_memories
+from .db import get_conn, insert_artifact, insert_chunks, update_artifact_chunk_count, insert_summary
+
+router = APIRouter()
+
+@router.post("/email/inbound")
+async def email_inbound(req: Request):
+    payload = await req.form()  # provider-specific; for dev we’ll also accept JSON
+    raw_subject = payload.get("subject","")
+    from_addr   = payload.get("from","")
+    # 1) security checks (allowlist, dkim/dmarc headers)
+    # 2) project code
+    proj = parse_tag(raw_subject, "proj")  # -> "WD-ACME" or None
+    if not proj: return {"ok": False, "error":"missing #proj:TAG"}
+
+    org_id, project_id = lookup_project(proj)  # you already have project UUIDs
+    attachments = collect_attachments(payload)  # bytes + filename + content_type
+
+    results = []
+    for att in attachments:
+        # unique key per file
+        key = f"{project_id}/{uuid4().hex}_{sanitize(att.name)}"
+        # store in bucket
+        sb.storage.from_(BUCKET).upload(path=key, file=att.data,
+               file_options={"content-type": att.type or "application/octet-stream"}, upsert=False)
+
+        # persist artifact via psycopg (bypass PostgREST hiccups)
+        with get_conn() as conn:
+            art_id = insert_artifact(conn, org_id, project_id, key, att.type, att.name, source="email")
+
+            text = extract_text(att.name, att.data, att.type)
+            chunks = chunk_text(text, 1200, 200)
+            embs = embed_texts(chunks) if chunks else []
+            rows = [{"chunk_index": i, "content": c, "embedding": e} for i,(c,e) in enumerate(zip(chunks, embs))]
+            if rows: insert_chunks(conn, org_id, project_id, art_id, rows)
+            update_artifact_chunk_count(conn, art_id, len(rows))
+            insert_summary(conn, org_id, project_id, art_id, text[:2000])
+
+            # memory extraction → decisions/risks/actions/semantic/procedural
+            mem = extract_memories(text)
+            write_mem_entries(conn, org_id, project_id, art_id, mem)  # helper like you did for artifacts
+
+        # classification → what pages to update
+        route_update_from_text(org_id, project_id, art_id, text, mem)
+
+        results.append({"artifact_id": art_id, "key": key})
+
+    return {"ok": True, "results": results}
+
+Classification → push into the right places
+
+route_update_from_text(...) does:
+
+Actions: owner/verb/date → actions rows; mark “pending”
+
+Decisions → append to summaries/mem_entries(decision)
+
+Risks → summaries.risks (severity); flag red if High
+
+Reporting asks → mem_entries(semantic) tagged reporting
+
+Training mentions → mem_entries(procedural) + add to Training backlog
+
+Integrations → detect “X → Workday” etc., add/update Integration cards
+
+Workstream tagging → map to area (HCM/Payroll/etc.) by keywords
+
+Everything is queued to the dashboard: KPIs rise, red flags, pending list, Integrations list, etc.
+You already have the dashboard endpoints; they just count these rows.
+
+Dev-mode JSON test (no provider needed)
+
+POST /email/inbound-dev with:
+
+{
+  "subject": "Standup minutes #proj:WD-ACME",
+  "from": "sam@client.com",
+  "attachments": [{
+    "filename": "2025-09-18-standup.txt",
+    "content_type": "text/plain",
+    "data_b64": "..."  // base64 of small sample text
+  }]
+}
+
+Provider wiring (later)
+
+Mailgun/SendGrid/SES inbound → set the webhook to /api/email/inbound
+
+Verify HMAC signatures where provider supports it
+
+2) Follow-up & Onboarding Workflows (your 9-step PMO playbook)
+
+Goal: turn the 9 steps into a guided workflow that emails, collects responses, and populates the hub automatically.
+
+Data model
+create table if not exists onboarding_steps (
+  id uuid primary key default gen_random_uuid(),
+  key text unique,                -- e.g., 'metrics', 'team', 'logistics', ...
+  name text,
+  description text,
+  order_idx int
+);
+
+create table if not exists onboarding_instances (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid not null,
+  project_id uuid not null,
+  step_key text not null,            -- references onboarding_steps.key
+  status text check (status in ('pending','sent','reminded','received','approved')) default 'pending',
+  due_date date,
+  last_email_at timestamptz,
+  response_json jsonb,               -- captured answers
+  created_at timestamptz default now()
+);
+
+create table if not exists email_templates (
+  id uuid primary key default gen_random_uuid(),
+  key text unique,                    -- 'metrics_request', 'team_roster', ...
+  subject text,
+  body text                           -- handle {{client_name}}, {{project_code}}, etc.
+);
+
+Steps we’ll ship first (your 9)
+
+Metrics for Success (3 KPIs + mindset affirmation)
+
+Team (roster: names, roles, contact, workstream ownership)
+
+Logistics & Comms (meeting cadence, channels, links)
+
+Data & Reporting (systems, owners, initial reports)
+
+Training (preferred approach + audiences)
+
+Integrations & Tech (source/target, transports, owners)
+
+Testing (entry/exit criteria, defect severity rules)
+
+OCM (impacts, comms, champions)
+
+Financials (budget, hours reporting)
+
+How it runs
+
+Seed onboarding_steps and email_templates
+
+PM clicks “Start Onboarding” → creates onboarding_instances rows with due dates (e.g., next 5 business days)
+
+Scheduler (FastAPI BackgroundTasks or APScheduler) sends step emails on schedule
+
+Each email contains a secure link to a simple form (hosted by you) that posts responses to /onboarding/respond
+
+When a response arrives:
+
+parse & normalize → insert into the right tables (e.g., roster → workstreams owners, metrics → dashboard header, comms cadence → Logistics card)
+
+mark the step received/approved
+
+generate follow-up actions if required (e.g., “Upload initial data extracts”)
+
+Endpoints
+@app.post("/onboarding/start")
+def start_onboarding(org_id: str, project_id: str, start_date: str = None):
+    # create instances with due dates & queue first sends
+    ...
+
+@app.post("/onboarding/send")
+def send_step(org_id: str, project_id: str, step_key: str):
+    # render email_templates[step_key] with project variables, send via provider
+    ...
+
+@app.post("/onboarding/respond")
+def onboarding_respond(org_id: str, project_id: str, step_key: str, answers: dict):
+    # persist response_json; normalize into hub:
+    # - metrics → dashboard header store
+    # - team → create team roster & owners; seed Action items
+    # - logistics → meeting links + cadence
+    # - data/reporting → mem_entries + initial “reporting asks”
+    # - etc.
+    # mark instance received/approved
+    return {"ok": True}
+
+Email templates (short & effective)
+
+metrics_request.subject
+
+Aligning success metrics for {{project_code}}
+
+
+metrics_request.body
+
+Hi {{first_name}},
+
+To keep {{project_code}} focused, please share your top 3 measures of success.
+1)
+2)
+3)
+
+Optional: Any risks you already foresee?
+
+Reply to this email or use this secure link:
+{{secure_link}}
+
+Thanks!
+— TEAIM PMO
+
+
+(We’ll keep one template per step. For replies, the email dropbox will capture and route them too.)
+
+Nudges & escalations
+
+T+48h: gentle nudge
+
+T+96h: escalate to sponsor
+
+All configured per-project in “Comms Cadence”
+
+3) Review Queue (human-in-the-loop)
+
+A small admin UI to approve AI-extracted items before publishing:
+
+Queue: new actions/risks/decisions/reporting asks from email intake
+
+Buttons: Approve / Edit / Discard
+
+Once approved → they appear on the dashboard (Pending, Red Flags, KPIs)
+
+Backend: POST /review/approve writes to final tables; an is_published flag on extracted records works too.
+
+4) Testing scripts (copy/paste)
+A) Email dropbox dev test
+BASE="http://localhost:5000/api"
+ORG="d915376c-2bd7-4e79-b9c9-aab9d7fcb5a8"
+PROJ="dced0b98-87b4-46ff-b2a4-2cf8e627e8d2"
+
+cat > /tmp/minutes.txt <<'TXT'
+ACME Payroll WG – Minutes
+Decision: adopt retro policy v2.
+Risk: payroll calendar slippage (High).
+Action: Jane Doe to deliver retro doc by 2025-09-21.
+ADP → Workday daily SFTP; Workday → GL weekly API.
+TXT
+
+curl -s -X POST "$BASE/email/inbound-dev" -H "Content-Type: application/json" -d @- <<JSON
+{
+  "subject": "Payroll WG minutes #proj:WD-ACME",
+  "from": "lead@client.com",
+  "attachments":[{"filename":"2025-09-18-minutes.txt","content_type":"text/plain","data_b64":"$(base64 -w0 /tmp/minutes.txt)"}]
+}
+JSON
+
+B) Onboarding start + respond
+# Start the 9-step series
+curl -s -X POST "$BASE/onboarding/start" -H "Content-Type: application/json" -d \
+'{"org_id":"'$ORG'","project_id":"'$PROJ'"}'
+
+# Simulate a client response for Metrics for Success
+curl -s -X POST "$BASE/onboarding/respond" -H "Content-Type: application/json" -d @- <<JSON
+{"org_id":"$ORG","project_id":"$PROJ","step_key":"metrics",
+ "answers":{"kpis":["Go-live 07/01","Payroll accuracy 99.5%","Adoption 90%"]}}
+JSON
+
+
+Expected: dashboard header shows the 3 metrics; Pending/Red Flags updated from the minutes.
+
+Implementation order (fastest win)
+
+/email/inbound + dev variant + classification to dashboard/areas
+
+/onboarding tables + start/respond endpoints + 3 core templates (Metrics, Team, Logistics)
+
+Review Queue page (approve AI-extracted items)
+
+Provider wiring (Mailgun/SendGrid) + HMAC verify
+
+Scheduler for nudges
+
+If you want, I’ll drop the exact FastAPI route stubs for /email/inbound-dev, /onboarding/start, /onboarding/respond, and the 3 initial templates so you can paste and run today.

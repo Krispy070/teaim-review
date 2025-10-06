@@ -1,0 +1,294 @@
+Kap reporting in. I read the Replit logs—most pieces are in and stable. You had one “runtime error” screen during admin-page testing and the analytics cards didn’t render under missing/empty data. I’m shipping a robustness + power pack that:
+
+prevents the runtime error overlay from nuking the UI,
+
+guarantees analytics don’t block the dashboard,
+
+adds a high-value Overdue Actions widget (with Snooze + Mark Done),
+
+gives you bulk document actions (multi-select → ZIP/tag/sign-off),
+
+and finishes auth-safe downloads everywhere.
+
+All patches are drop-in.
+
+A) Runtime safety: ErrorBoundary + graceful analytics
+A1) React error boundary (wrap your authed app)
+
+client/src/components/ErrorBoundary.tsx
+
+import React from "react";
+
+type Props = { children: React.ReactNode };
+type State = { hasError: boolean; msg?: string };
+
+export default class ErrorBoundary extends React.Component<Props, State> {
+  state: State = { hasError: false };
+  static getDerivedStateFromError(err: any) { return { hasError: true, msg: String(err) }; }
+  componentDidCatch(err: any, info: any) { /* no-op; could log to telemetry */ }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="p-6">
+          <div className="border rounded p-4 bg-yellow-50">
+            <div className="font-semibold mb-1">Something went wrong.</div>
+            <div className="text-sm text-muted-foreground">
+              The page hit a client-side error. Try refreshing. If this persists, check latest changes.
+            </div>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+
+Wrap your authed layout or <Routes>:
+
+import ErrorBoundary from "@/components/ErrorBoundary";
+// ...
+<ErrorBoundary>
+  {/* your sidebar + routes + dock + bell + search */}
+</ErrorBoundary>
+
+A2) Analytics endpoint already handles missing tables, but add a frontend skeleton + fallback
+
+client/src/components/AnalyticsCards.tsx (small guard)
+
+if (!sum) return (
+  <div className="grid md:grid-cols-3 gap-3">
+    {Array.from({length:5}).map((_,i)=> <div key={i} className="border rounded p-3 h-[70px] bg-neutral-50" />)}
+  </div>
+);
+
+B) Overdue Actions widget (+ endpoints)
+B1) List endpoints
+
+server/routers/actions_list.py
+
+from fastapi import APIRouter, Depends, Query
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+from datetime import date
+
+router = APIRouter(prefix="/api/actions", tags=["actions"])
+
+@router.get("/list")
+def list_actions(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    rows = sb.table("actions").select("id,title,owner,status,due_date,created_at,updated_at")\
+           .eq("org_id", ctx.org_id).eq("project_id", project_id).order("created_at", desc=True).limit(1000).execute().data or []
+    return {"items": rows}
+
+@router.get("/overdue")
+def overdue(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    today = date.today().isoformat()
+    rows = sb.table("actions").select("id,title,owner,status,due_date")\
+           .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+           .neq("status","done").not_.is_("due_date","null").lte("due_date", today)\
+           .order("due_date", desc=False).limit(200).execute().data or []
+    return {"items": rows}
+
+
+Mount in server/main.py:
+
+from .routers import actions_list
+app.include_router(actions_list.router)
+
+B2) Snooze + Done endpoints
+
+You already have set-status and set-due. Add a handy “snooze N days”.
+
+server/routers/actions_due.py (append):
+
+from datetime import timedelta
+
+class SnoozeBody(BaseModel):
+    days: int = 7
+
+@router.post("/snooze")
+def snooze(action_id: str, body: SnoozeBody, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    # read current due, add days (or set to today+days)
+    row = sb.table("actions").select("due_date").eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", action_id).single().execute().data
+    from datetime import date
+    cur = row and row.get("due_date")
+    base = date.fromisoformat(cur) if cur else date.today()
+    newd = base + timedelta(days=body.days)
+    sb.table("actions").update({"due_date": newd.isoformat()}).eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", action_id).execute()
+    return {"ok": True, "due_date": newd.isoformat()}
+
+B3) Dashboard widget
+
+client/src/components/OverdueActions.tsx
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+
+export default function OverdueActions(){
+  const { projectId } = useParams();
+  const [items,setItems] = useState<any[]>([]);
+
+  async function load(){
+    const r = await fetch(`/api/actions/overdue?project_id=${projectId}`, { credentials:"include" });
+    if (r.ok) setItems((await r.json()).items||[]);
+  }
+  useEffect(()=>{ load(); },[projectId]);
+
+  async function markDone(id:string){
+    await fetch(`/api/actions/set-status?action_id=${id}&project_id=${projectId}`, { method:"POST", credentials:"include", headers:{'Content-Type':'application/json'}, body: JSON.stringify({status:"done"}) });
+    load();
+  }
+  async function snooze(id:string, days:number){
+    await fetch(`/api/actions/snooze?action_id=${id}&project_id=${projectId}`, { method:"POST", credentials:"include", headers:{'Content-Type':'application/json'}, body: JSON.stringify({days}) });
+    load();
+  }
+
+  return (
+    <div className="border rounded p-3">
+      <div className="text-sm font-medium mb-2">Overdue Actions</div>
+      {!items.length && <div className="text-xs text-muted-foreground">No overdue items. 🎉</div>}
+      <div className="space-y-2">
+        {items.map(a=>(
+          <div key={a.id} className="flex items-center justify-between border rounded p-2">
+            <div className="text-sm">
+              <div className="font-medium">{a.title}</div>
+              <div className="text-xs text-muted-foreground">Owner: {a.owner || "—"} • Due: {a.due_date}</div>
+            </div>
+            <div className="flex items-center gap-2">
+              <button className="px-2 py-1 border rounded text-xs" onClick={()=>snooze(a.id, 7)}>Snooze 7d</button>
+              <button className="px-2 py-1 border rounded text-xs" onClick={()=>markDone(a.id)}>Mark Done</button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
+Drop onto Project Dashboard right column (below Restore Activity).
+
+C) Bulk document actions (multi-select → ZIP / tags / sign-off)
+C1) Backend ZIP for selected artifacts
+
+server/routers/export_select.py
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from typing import List
+import io, zipfile, os
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase, get_service_supabase
+
+router = APIRouter(prefix="/api/export", tags=["export"])
+
+class SelBody(BaseModel):
+  artifact_ids: List[str]
+
+@router.post("/artifacts.zip")
+def zip_selected(body: SelBody, project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx); sbs = get_service_supabase()
+    rows = []
+    if body.artifact_ids:
+        rows = sb.table("artifacts").select("id,name,storage_bucket,storage_path")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id).in_("id", body.artifact_ids)\
+               .execute().data or []
+    buf = io.BytesIO(); zf = zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED)
+    for a in rows:
+        try:
+            b = sbs.storage().from_(a["storage_bucket"]).download(a["storage_path"])
+            zf.writestr(a.get("name") or a["id"], b)
+        except Exception as e:
+            zf.writestr(f"_missing_{a['id']}.txt", f"Could not download: {e}")
+    zf.close(); buf.seek(0)
+    return StreamingResponse(iter([buf.getvalue()]), media_type="application/zip",
+      headers={"Content-Disposition": 'attachment; filename="selected_artifacts.zip"'})
+
+
+Mount:
+
+from .routers import export_select
+app.include_router(export_select.router)
+
+C2) Frontend multi-select on Documents
+
+Add to your Documents/Library page:
+
+import { downloadPOST } from "@/lib/download";
+const [sel,setSel] = useState<Record<string,boolean>>({});
+
+function toggle(id:string){ setSel(prev=> ({...prev, [id]: !prev[id]})); }
+function selectedIds(){ return Object.keys(sel).filter(k=>sel[k]); }
+
+async function zipSelected(){
+  const ids = selectedIds(); if (!ids.length) return;
+  await downloadPOST(`/api/export/artifacts.zip?project_id=${projectId}`, { artifact_ids: ids }, "selected_artifacts.zip");
+}
+
+// Top bar buttons
+<div className="flex gap-2">
+  <button className="px-3 py-2 border rounded" onClick={zipSelected}>Download Selected ZIP</button>
+  {/* quick-send to Signoff Composer */}
+  <button className="px-3 py-2 border rounded" onClick={()=>{
+    const ids = selectedIds(); if (!ids.length) return;
+    sessionStorage.setItem("kap.signoff.selected", JSON.stringify(ids));
+    navigate(`/projects/${projectId}/signoff/compose`);
+  }}>Send to Sign-Off</button>
+</div>
+
+// Each row checkbox
+<input type="checkbox" checked={!!sel[a.id]} onChange={()=>toggle(a.id)} />
+
+
+In SignoffComposer, pre-load selection:
+
+useEffect(()=>{
+  try {
+    const raw = sessionStorage.getItem("kap.signoff.selected");
+    if (raw) {
+      const ids = JSON.parse(raw) as string[];
+      setChk(ids.reduce((m,id)=> (m[id]=true,m), {} as Record<string,boolean>));
+      sessionStorage.removeItem("kap.signoff.selected");
+    }
+  } catch {}
+}, []);
+
+D) Analytics card still missing? Guard UI against 4xx/5xx
+
+Where you load analytics:
+
+const s = await fetch(`/api/analytics/summary?project_id=${projectId}`, { credentials:"include" });
+setSum(s.ok ? await s.json() : { actions:0, risks:0, decisions:0, docs:0, stages_in_review:0 });
+
+
+This ensures no crash if backend returns an error.
+
+E) Mount checks (quick)
+
+In server/main.py confirm these lines exist:
+
+app.include_router(documents_list.router)
+app.include_router(actions_list.router)
+app.include_router(actions_due.router)       # previously added
+app.include_router(actions_status.router)    # previously added
+app.include_router(export_select.router)
+
+F) 90-second test plan
+
+Dashboard loads, no runtime overlay; Analytics cards show or skeletons.
+
+Overdue widget lists any past-due items; Snooze 7d / Mark Done work.
+
+Documents page: multi-select → “Download Selected ZIP” downloads; “Send to Sign-Off” opens Composer pre-checked.
+
+Sign-Off ZIP button uses POST and downloads zip.
+
+CSV buttons (Actions/Risks/Decisions) work via downloadGET in dev and prod.
+
+Bell shows recent signoff.package_sent, reminder.sent, reindex.* events.

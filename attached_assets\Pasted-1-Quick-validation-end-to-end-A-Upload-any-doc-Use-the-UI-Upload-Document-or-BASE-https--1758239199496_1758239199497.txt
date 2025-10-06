@@ -1,0 +1,168 @@
+1) Quick validation (end-to-end)
+
+A) Upload any doc
+
+Use the UI Upload Document or:
+
+BASE="https://<YOUR-REPLIT-URL>/api"
+ORG="<ORG_UUID>"
+PROJ="<PROJ_UUID>"
+
+echo "WG Minutes: Decision: adopt retro v2. Risk: SFTP cert expiry (High). Action: Sam deliver SFTP cert by 2025-09-22. ADP → Workday daily SFTP." > /tmp/min.txt
+curl -s -X POST "$BASE/ingest-sync" \
+  -F "org_id=$ORG" -F "project_id=$PROJ" \
+  -F "file=@/tmp/min.txt"
+
+
+B) Open the Dashboard
+
+You should see:
+
+Pending Items: “Deliver SFTP cert … (owner/date)”
+
+Red Flags: “SFTP cert expiry (High)”
+
+Integrations: “ADP → Workday”
+
+Functional Areas: Payroll/HCM tiles (if mentioned)
+
+C) Check the review queue
+
+High-confidence (≥0.8) items publish immediately. Lower confidence goes to the queue:
+
+curl -s "$BASE/review/pending?org_id=$ORG&project_id=$PROJ"
+
+
+If you haven’t added the tiny review API yet, I included it in section 3 (drop-in).
+
+D) Ask Kap
+
+In the Chat Dock, ask “Summarize the latest upload and list any exit criteria.”
+
+You’ll get an answer with Sources.
+
+2) Control the classifier without touching code
+
+Set these in Replit → Secrets (or export in shell) to tune behavior:
+
+CHAT_MODEL — the LLM for classification (e.g., gpt-4.1-mini)
+
+CLASSIFY_MIN_CONF — publish threshold (default 0.8). Example: 0.75
+
+CLASSIFY_MAX_TOKENS — cap input text (we already truncate sensibly)
+
+DISABLE_CLASSIFY — set to true to temporarily skip model calls (pure storage mode)
+
+After changing, cold restart the Repl so Python picks up the env.
+
+3) (Optional) Minimal Review API (paste-and-go)
+
+If you don’t already have these, add them so you can approve anything < threshold:
+
+# /server/review_api.py
+from fastapi import APIRouter, Body, Query
+from .supabase_client import sb
+from .updater import publish_action, publish_risk, publish_decision, publish_integration, publish_workstream
+
+router = APIRouter()
+
+@router.get("/review/pending")
+def pending(org_id: str, project_id: str, limit: int = 50):
+    rows = sb.table("extracted_items").select("*")\
+      .eq("org_id", org_id).eq("project_id", project_id)\
+      .eq("is_published", False).order("created_at", desc=True).limit(limit).execute().data or []
+    return {"items": rows}
+
+@router.post("/review/approve")
+def approve(org_id: str = Body(...), project_id: str = Body(...),
+            id: int = Body(...), publish: bool = Body(True), edit_payload: dict | None = Body(None)):
+    rows = sb.table("extracted_items").select("*").eq("id", id).limit(1).execute().data
+    if not rows: return {"ok": False, "error":"not found"}
+    it = rows[0]; obj = edit_payload or it["payload"]; t = it["item_type"]; art = it.get("artifact_id")
+    if publish:
+        if t=="action": publish_action(org_id, project_id, art, obj)
+        elif t=="risk": publish_risk(org_id, project_id, art, obj)
+        elif t=="decision": publish_decision(org_id, project_id, art, obj)
+        elif t=="integration": publish_integration(org_id, project_id, obj)
+        elif t=="workstream": publish_workstream(org_id, project_id, obj, 99)
+        # add others as you wish
+        sb.table("extracted_items").update({"is_published":True}).eq("id", id).execute()
+        return {"ok": True, "published": t}
+    else:
+        sb.table("extracted_items").delete().eq("id", id).execute()
+        return {"ok": True, "discarded": t}
+
+
+Mount it in main.py:
+
+from .review_api import router as review_router
+app.include_router(review_router, prefix="")
+
+
+Approve one item
+
+# List
+curl -s "$BASE/review/pending?org_id=$ORG&project_id=$PROJ" | jq .
+# Approve item by id:
+curl -s -X POST "$BASE/review/approve" -H "Content-Type: application/json" -d '{"org_id":"'"$ORG"'","project_id":"'"$PROJ"'","id":123,"publish":true}'
+
+4) Backfill: classify existing artifacts you already uploaded
+
+If you want to reclassify older docs, add a tiny endpoint:
+
+# /server/reclassify_api.py
+from fastapi import APIRouter, Body
+from .supabase_client import sb
+from .classifier import classify_text
+from .updater import apply_updates
+from .parsing import extract_text
+import requests
+
+router = APIRouter()
+
+@router.post("/reclassify/latest")
+def reclassify(org_id: str = Body(...), project_id: str = Body(...), limit: int = Body(10), project_code: str = Body("WD-ACME")):
+    arts = sb.table("artifacts").select("id,path,title,mime_type").eq("org_id",org_id).eq("project_id",project_id).order("created_at", desc=True).limit(limit).execute().data or []
+    count = 0
+    for a in arts:
+        # download from storage
+        res = sb.storage.from_("project-artifacts").create_signed_url(a["path"], 600)
+        url = res.get("signedURL") or res.get("signed_url")
+        data = requests.get(url, timeout=20).content
+        text = extract_text(a["title"], data, a["mime_type"])
+        upd = classify_text(text, project_code)
+        apply_updates(org_id, project_id, a["id"], project_code, upd)
+        count += 1
+    return {"ok": True, "reclassified": count}
+
+
+Mount it, then:
+
+curl -s -X POST "$BASE/reclassify/latest" -H "Content-Type: application/json" \
+  -d '{"org_id":"'"$ORG"'","project_id":"'"$PROJ"'","limit":5,"project_code":"WD-ACME"}'
+
+5) Mailgun → same flow, no extra work
+
+Your Mailgun webhook already ends with “store → extract_text → classify_text → apply_updates”. That means emailing minutes/attachments to ingest@teaim.app will drive the same updates as a manual upload.
+
+6) Troubleshooting in 90 seconds
+
+No dashboard changes: hit /review/pending—items might be below confidence threshold. Approve one and refresh.
+
+500 on dashboard: we replaced raw error banners; check server logs for any Supabase 404 (run grants + notify pgrst).
+
+Costs/timeouts: set CLASSIFY_MAX_TOKENS lower; keep files under 10–20 MB; skip huge scans/PDF images unless OCR enabled.
+
+Idempotency: email path uses Message-Id; upload path is by artifact id (no duplicates if you don’t re-upload).
+
+7) What you’ll see in practice
+
+Minutes → Pending action, risk, decision instantly.
+
+SOW → Workstreams grid fills; Integrations hints; Team placeholders.
+
+Status report → fresh decisions/risks; reporting asks.
+
+Specs → Integrations & Tech list grows with transport/frequency.
+
+That’s the “read any doc → update the project” loop you expected—now it’s truly there and under your control. If you want, I can add a tiny React Review page so you don’t need curl to approve items; otherwise the API above is enough to demo today.

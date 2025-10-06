@@ -1,0 +1,166 @@
+Counts are 0 with the warning: “Database tables don’t exist in development environment.”
+→ Your dev server is pointing at a DB that doesn’t have the core tables (areas, workbooks, reports, changes, comments, releases, notifications, signoffs). The seeder purposely “no-ops” instead of crashing.
+
+Let’s fix dev once and move on.
+
+Fix Path A (best): run your real migrations in DEV
+
+If you already have migrations:
+
+# whichever you use
+npm run knex:migrate:latest
+# or
+npx prisma migrate deploy
+# or
+npx prisma db push  # if using Prisma without migration files in dev
+
+
+Then hit Seed & Run again — you should see non-zero counts.
+
+Fix Path B (drop-in bootstrap for DEV)
+
+If you don’t have migrations wired (or dev is ephemeral), add a Bootstrap DB endpoint that creates the minimal tables the Test Runner needs, then calls the seeder.
+
+1) Route: server/admin/test/bootstrap.ts
+import { Router } from "express";
+import { db } from "../../db";
+import { seedMinimal } from "./seedMinimal";
+
+export const bootstrapRouter = Router();
+
+bootstrapRouter.post("/bootstrap-and-seed", async (req, res) => {
+  const projectId = req.body?.projectId;
+  if (!projectId) return res.status(400).json({ ok:false, error:"projectId required" });
+
+  const ensure = async (name: string, def: (t: any) => void) => {
+    const exists = await db.schema.hasTable(name);
+    if (!exists) {
+      await db.schema.createTable(name, def);
+    }
+  };
+
+  try {
+    // Minimal schemas matching what tests read/write
+    await ensure("areas", (t:any) => {
+      t.uuid("id").primary();
+      t.uuid("project_id").index();
+      t.string("key").index();
+      t.string("name");
+      t.string("status").defaultTo("active");
+      t.timestamp("created_at").defaultTo(db.fn.now());
+    });
+
+    await ensure("workbooks", (t:any) => {
+      t.uuid("id").primary();
+      t.uuid("project_id").index();
+      t.uuid("area_id").index();
+      t.string("title");
+      t.jsonb("metrics").defaultTo(db.raw("'{}'::jsonb"));
+      t.timestamp("created_at").defaultTo(db.fn.now());
+    });
+
+    await ensure("reports", (t:any) => {
+      t.uuid("id").primary();
+      t.uuid("project_id").index();
+      t.uuid("area_id").index();
+      t.string("type").index();       // e.g., wb_export_csv
+      t.string("title");
+      t.jsonb("payload").defaultTo(db.raw("'{}'::jsonb"));
+      t.timestamp("created_at").defaultTo(db.fn.now());
+    });
+
+    await ensure("changes", (t:any) => {
+      t.uuid("id").primary();
+      t.uuid("project_id").index();
+      t.uuid("area_id").index();
+      t.string("kind");               // add | update | remove
+      t.string("summary");
+      t.timestamp("created_at").defaultTo(db.fn.now());
+    });
+
+    await ensure("comments", (t:any) => {
+      t.uuid("id").primary();
+      t.uuid("project_id").index();
+      t.uuid("area_id").index();
+      t.text("body");
+      t.string("author");
+      t.timestamp("created_at").defaultTo(db.fn.now());
+    });
+
+    await ensure("releases", (t:any) => {
+      t.uuid("id").primary();
+      t.uuid("project_id").index();
+      t.string("kind").index();       // ics
+      t.string("channel").index();    // staging/prod
+      t.string("tag");
+      t.timestamp("created_at").defaultTo(db.fn.now());
+    });
+
+    await ensure("notifications", (t:any) => {
+      t.uuid("id").primary();
+      t.uuid("project_id").index();
+      t.string("kind").index();       // digest_ready
+      t.boolean("seen").defaultTo(false);
+      t.jsonb("payload").defaultTo(db.raw("'{}'::jsonb"));
+      t.timestamp("created_at").defaultTo(db.fn.now());
+    });
+
+    await ensure("signoffs", (t:any) => {
+      t.string("token").primary();
+      t.uuid("project_id").index();
+      t.string("status").defaultTo("issued");
+      t.timestamp("expires_at");
+      t.timestamp("created_at").defaultTo(db.fn.now());
+    });
+
+    // seed now that tables exist
+    const out = await seedMinimal(projectId);
+    return res.json({ ok:true, action:"bootstrap-and-seed", out });
+  } catch (e:any) {
+    return res.status(500).json({ ok:false, error: e?.message || String(e) });
+  }
+});
+
+2) Mount the route
+// server/index.ts
+import { bootstrapRouter } from "./admin/test/bootstrap";
+app.use("/admin/test", bootstrapRouter);
+
+3) Call it once from your Test Runner (or DevTools console)
+await fetch("/admin/test/bootstrap-and-seed", {
+  method:"POST",
+  headers:{ "Content-Type":"application/json" },
+  body: JSON.stringify({ projectId: "e1ec6ad0-a4e8-45dd-87b0-e123776ffe6e" })
+}).then(r=>r.json())
+
+
+You should get { ok:true, action:"bootstrap-and-seed", out:{ ok:true, inserted:{ ...non-zero... }}}.
+Then click Seed & Run → your reds should flip.
+
+Sanity checks (2 minutes)
+
+Print the DB target at server boot:
+
+console.log("[DB]", process.env.DATABASE_URL);
+
+
+Hit a tiny debug:
+
+app.get("/admin/test/debug", async (_req,res)=>{
+  const [{ now }] = await db.raw("select now()");
+  const areas = await db("areas").count("* as c").first().catch(()=>({c:0}));
+  res.json({ ok:true, now, areas: Number(areas?.c||0) });
+});
+
+
+Ensure Test Runner now calls /admin/test/seed-v2 (you should see seeder:"v2" and numeric counts in the green panel).
+
+Why this happened
+
+You’ve likely got:
+
+A different dev DB (ephemeral / empty), or
+
+Migrations never ran in this environment.
+
+The bootstrap endpoint gets you moving instantly. Later, we’ll wire proper migrations so dev/test/prod stay in lockstep.

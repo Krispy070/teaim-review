@@ -1,0 +1,223 @@
+Next Big Build v2.6.4 so the new UI/UX not only shows, but sings:
+
+Auto-branded exports (Sign-Off Package + Digests use your logos/theme without extra work)
+
+Dashboard count-ups (animated KPI numbers)
+
+“Apply All Safe” success glow (+ toast)
+
+Wellness Check-in (1–5 submit + instant graph update)
+
+Timeline tooltips (hover to see dates + ±days delta)
+
+All changes are brand-flag aware and safe in dev (graceful fallbacks). Paste 1:1.
+
+0) Micro-interaction CSS additions
+
+client/src/brand/micro.css (append)
+
+/* KPI count-up: no extra CSS needed (JS-driven), but success glow for actions */
+@keyframes appliedGlow {
+  0% { box-shadow: 0 0 0 rgba(25,212,146,0); }
+  40% { box-shadow: 0 0 22px rgba(25,212,146,.45); }
+  100% { box-shadow: 0 0 0 rgba(25,212,146,0); }
+}
+.applied-glow {
+  animation: appliedGlow 1.6s ease-in-out 1;
+}
+
+1) Auto-branded exports
+
+You already created server/brand/export_header.py. We’ll wire it into Sign-Off Package preview/zip and Digests.
+
+1A) Sign-Off Package: prepend brand header
+
+Patch server/routers/signoff_package.py (imports near top)
+
+from ..brand.export_header import export_header_html
+
+
+In preview(...) right after you compute proj_code and before returning:
+
+org = sb.table("org_branding").select("*").eq("org_id", ctx.org_id).single().execute().data or {}
+html_out = export_header_html(org, proj_code) + _html_package(proj_code, body.stage_title, body, lists, arts)
+return {"ok": True, "html": html_out}
+
+
+In zip_package(...) just before writing README.html:
+
+org = sb.table("org_branding").select("*").eq("org_id", ctx.org_id).single().execute().data or {}
+html_out = export_header_html(org, proj_code) + html_out  # prepend brand header
+
+
+(If you already prepend _branding_header, keep one; export_header_html is consistent across exports.)
+
+1B) Digest preview/send: prepend brand header
+
+Patch server/routers/digest.py (imports)
+
+from ..brand.export_header import export_header_html
+
+
+In /preview and in weekly/monthly send where you build html:
+
+org = sb.table("org_branding").select("*").eq("org_id", ctx.org_id).single().execute().data or {}
+html = export_header_html(org, code) + _digest_html_filtered(code, counts, wanted)
+
+2) KPI Count-Up (animated numbers)
+
+client/src/components/CountUp.tsx
+
+import { useEffect, useRef, useState } from "react";
+export default function CountUp({ to=0, duration=600 }:{ to:number; duration?:number }){
+  const [value,setValue]=useState(0);
+  const last = useRef(0);
+  useEffect(()=>{
+    const start = performance.now(); const from = last.current; const delta = to - from;
+    let raf:number;
+    const tick = (t:number)=>{
+      const p = Math.min(1, (t-start)/duration);
+      setValue(Math.round(from + delta * p));
+      if (p<1) raf = requestAnimationFrame(tick);
+      else last.current = to;
+    };
+    cancelAnimationFrame(raf); raf = requestAnimationFrame(tick);
+    return ()=> cancelAnimationFrame(raf);
+  },[to,duration]);
+  return <>{value}</>;
+}
+
+
+Patch client/src/pages/DashboardV2.tsx (import & use):
+
+import CountUp from "@/components/CountUp";
+// ...
+{loading ? <div className="skeleton h-[84px]" /> : k("Documents", <CountUp to={Number(sum?.docs||0)}/>, undefined, "primary")}
+// repeat for actions/risks/decisions/overdue etc.
+
+3) Updates Review — success glow + toast on “Apply All Safe”
+
+Patch client/src/pages/UpdatesReview.tsx (add state + toast)
+
+Top imports:
+
+import { useToast } from "@/components/ui/use-toast";
+
+
+Inside component:
+
+const { toast } = useToast();
+const [appliedNow, setAppliedNow] = useState(false);
+
+
+Replace your applyAllSafe() with:
+
+async function applyAllSafe(){
+  try{
+    const idsAll = items
+      .filter(i => i.status==="pending" && Number(i.confidence??0) >= thresh)
+      .map(i=>i.id);
+    const ids = selOnly ? idsAll.filter(id=>selected[id]) : idsAll;
+    if (!ids.length) { toast({ title: "No items ≥ threshold", description: `Min conf ${thresh}` }); return; }
+    await postJSON(`/api/updates/batch_approve?project_id=${projectId}`, { ids });
+    setAppliedNow(true);
+    setTimeout(()=>setAppliedNow(false), 1200);
+    toast({ title: "Applied", description: `${ids.length} update(s) applied` });
+    load();
+  }catch(e:any){
+    toast({ title:"Apply failed", description: String(e?.message||e), variant:"destructive" });
+  }
+}
+
+
+Add class to the button:
+
+<button className={`px-3 py-2 border rounded ${appliedNow?'applied-glow':''}`} onClick={applyAllSafe}>
+  Apply All Safe
+</button>
+
+4) Wellness Check-in (backend + UI)
+4A) API: POST /api/wellness/checkin
+
+Patch server/routers/wellness.py (append)
+
+from pydantic import BaseModel, Field
+
+class CheckinBody(BaseModel):
+    score: int = Field(ge=1, le=5)
+
+@router.post("/checkin")
+def checkin(body: CheckinBody, project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        sb.table("team_wellness").insert({
+          "org_id": ctx.org_id, "project_id": project_id, "user_id": ctx.user_id, "score": body.score
+        }).execute()
+        return {"ok": True}
+    except Exception:
+        # dev-safe: accept but not persist
+        return {"ok": True, "dev": True}
+
+
+(If team_wellness table doesn’t exist in dev, the route returns ok with dev:true.)
+
+4B) UI: inline check-in widget under card
+
+Patch client/src/components/WellnessCard.tsx (append inside the return right after the sparkline block):
+
+<div className="mt-3 flex items-center gap-2">
+  <span className="text-xs text-muted-foreground">How’s the team today?</span>
+  {[1,2,3,4,5].map(n=>(
+    <button key={n} className="brand-btn text-xs" onClick={async ()=>{
+      await fetch(`/api/wellness/checkin?project_id=${projectId}`, {
+        method:"POST", credentials:"include",
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({score:n})
+      });
+      // quick local refresh
+      try{
+        const d = await getJSON(`/api/wellness/summary?project_id=${projectId}`);
+        setPts(d.items||[]);
+      }catch{}
+    }}>{n}</button>
+  ))}
+</div>
+
+5) Timeline tooltips (±days)
+
+Patch client/src/components/PhaseTimeline.tsx — replace the inner bar <div> with title showing planning/actual deltas.
+
+First, compute display strings:
+
+// inside map(s=>...)
+const sStr = s.start_date ? new Date(s.start_date).toLocaleDateString() : "(start)";
+const eStr = s.end_date ? new Date(s.end_date).toLocaleDateString() : "(end)";
+const tip = `${s.title}${s.area?` • ${s.area}`:""}\n${sStr} → ${eStr}`;
+
+
+Then use:
+
+<div className="relative h-2 bg-white/10 rounded" title={tip}>
+  <div className="absolute h-2 rounded"
+    style={{ left:`${pctStart}%`, width:`${pctW}%`, background: col, boxShadow: glow }} />
+</div>
+
+
+(If you also want ±days vs today: compute deltaToday = Math.ceil((+new Date() - +end)/86400000) and append \nΔ today: ${deltaToday>0? '+'+deltaToday : deltaToday} d.)
+
+6) Mounts (server)
+
+Ensure these are present once in server/main.py (you likely already did wellness):
+
+from .routers import wellness
+app.include_router(wellness.router)
+
+7) 90-second verification
+
+Sign-Off Package preview/zip: header shows customer/vendor logos; same for Digest preview/send.
+
+Dashboard: numbers animate up; “Apply All Safe” → success glow + toast.
+
+Wellness: tap 1–5 → sparkline updates (in dev, still “ok” even if table missing).
+
+Timeline: hovering bars shows stage title + dates (+ optional δ vs today).

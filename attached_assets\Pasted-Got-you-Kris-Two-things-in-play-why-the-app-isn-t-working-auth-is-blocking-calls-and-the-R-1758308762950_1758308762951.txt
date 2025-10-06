@@ -1,0 +1,321 @@
+Got you, Kris. Two things in play:
+
+why the app “isn’t working” (auth is blocking calls), and
+
+the RBAC you want (team member = view-only + ask Kap; admin = full control + write via Kap).
+
+I’ll fix #1 so you can run right now in dev, then harden #2 so prod stays airtight.
+
+Make it run now (dev) — without breaking prod
+A) Backend: explicit dev auth toggle (off in prod)
+
+server/app/tenant.py – add a safe bypass only when DEV_AUTH=1.
+
+from fastapi import Depends, HTTPException, Header
+from pydantic import BaseModel
+from typing import Optional
+import os, jwt, time
+
+JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
+JWT_ALG = "HS256"
+DEV_AUTH = os.getenv("DEV_AUTH", "0") == "1"
+
+class TenantCtx(BaseModel):
+  user_id: str
+  org_id: str
+  role: str
+  jwt: str | None = None
+
+def tenant_ctx(authorization: Optional[str] = Header(None),
+               x_dev_user: Optional[str] = Header(None),
+               x_dev_org: Optional[str] = Header(None),
+               x_dev_role: Optional[str] = Header(None)) -> TenantCtx:
+  # Dev bypass (ONLY when DEV_AUTH=1)
+  if DEV_AUTH:
+    if not (x_dev_user and x_dev_org):
+      raise HTTPException(401, "Dev mode requires X-Dev-User and X-Dev-Org")
+    return TenantCtx(user_id=x_dev_user, org_id=x_dev_org, role=x_dev_role or "admin", jwt=None)
+
+  # Production path: real JWT required
+  if not authorization or not authorization.lower().startswith("bearer "):
+    raise HTTPException(401, "Missing or invalid Authorization header")
+  token = authorization.split(" ",1)[1]
+  try:
+    claims = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG], options={"verify_aud": False})
+  except Exception:
+    raise HTTPException(401, "Invalid token")
+  if claims.get("exp") and claims["exp"] < int(time.time()):
+    raise HTTPException(401, "Token expired")
+  org_id = claims.get("org_id"); sub = claims.get("sub"); role = claims.get("role","member")
+  if not org_id or not sub:
+    raise HTTPException(403, "Missing org/user claims")
+  return TenantCtx(user_id=sub, org_id=org_id, role=role, jwt=token)
+
+B) Frontend: auto-attach token, or dev headers if no token
+
+client/src/lib/api.ts
+
+import { supabase } from './supabase';
+
+const DEV_AUTH = import.meta.env.VITE_DEV_AUTH === '1';
+const DEV_USER = import.meta.env.VITE_DEV_USER || '';
+const DEV_ORG  = import.meta.env.VITE_DEV_ORG  || '';
+const DEV_ROLE = import.meta.env.VITE_DEV_ROLE || 'admin';
+
+async function baseHeaders() {
+  if (DEV_AUTH) {
+    return {
+      'X-Dev-User': DEV_USER,
+      'X-Dev-Org': DEV_ORG,
+      'X-Dev-Role': DEV_ROLE,
+    } as Record<string,string>;
+  }
+  const { data } = await supabase.auth.getSession();
+  const token = data.session?.access_token;
+  if (!token) throw new Error('Not authenticated');
+  return { Authorization: `Bearer ${token}` };
+}
+
+export async function apiGet<T>(path: string, params?: Record<string, string>) {
+  const qs = params ? '?' + new URLSearchParams(params).toString() : '';
+  const headers = await baseHeaders();
+  const res = await fetch(`/api${path}${qs}`, { headers });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json() as Promise<T>;
+}
+
+export async function apiPost<T>(path: string, body?: any, query?: Record<string, string>) {
+  const qs = query ? '?' + new URLSearchParams(query).toString() : '';
+  const headers = { ...(await baseHeaders()), 'Content-Type': 'application/json' };
+  const res = await fetch(`/api${path}${qs}`, { method: 'POST', headers, body: body ? JSON.stringify(body) : undefined });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json() as Promise<T>;
+}
+
+C) Env toggles (Replit)
+
+Backend: DEV_AUTH=1 (dev only), SUPABASE_* set as usual.
+
+Frontend: VITE_DEV_AUTH=1, VITE_DEV_USER=<your_user_uuid>, VITE_DEV_ORG=<your_org_uuid>, VITE_DEV_ROLE=admin.
+
+Flip both DEV_AUTH and VITE_DEV_AUTH to 0 for prod. That instantly restores strict JWT-only.
+
+Lock the RBAC you asked for (clean, enforceable)
+Roles we’ll use per project
+
+admin (you): everything, including write via Kap.
+
+pm: manage stages, actions/risks/decisions, emails, export/archive.
+
+member (your “team member”): read-only across project + can Ask Kap (RAG), but cannot mutate.
+
+customer_signer: can approve/reject Stage Sign-Off; otherwise read-only.
+
+viewer (optional): strict read-only (same as member for now; reserve for external auditors).
+
+1) Membership + helper in DB
+
+Supabase SQL
+
+-- already created earlier, ensure present:
+create table if not exists public.project_members (
+  org_id uuid not null,
+  project_id uuid not null,
+  user_id uuid not null,
+  role text not null check (role in ('admin','pm','member','customer_signer','viewer')),
+  created_at timestamptz not null default now(),
+  primary key (org_id, project_id, user_id)
+);
+
+create or replace function public.has_project_role(_org uuid, _project uuid, _roles text[])
+returns boolean language sql stable as $$
+  select exists(
+    select 1 from public.project_members
+    where org_id=_org and project_id=_project and user_id=auth.uid() and role = any(_roles)
+  );
+$$;
+
+2) RLS patterns (apply to your key tables)
+Stages (read: all members; create/update: role-gated)
+alter table public.project_stages enable row level security;
+
+create policy "stages_select_any_member"
+on public.project_stages for select
+using ( org_id = public.current_org() and public.is_member(org_id, project_id) );
+
+create policy "stages_insert_admin_pm"
+on public.project_stages for insert
+with check ( org_id = public.current_org() and public.has_project_role(org_id, project_id, array['admin','pm']) );
+
+-- Restrict status/fields updates to appropriate roles
+create policy "stages_update_admin_pm"
+on public.project_stages for update
+using ( org_id = public.current_org() and public.has_project_role(org_id, project_id, array['admin','pm']) )
+with check ( org_id = public.current_org() and public.has_project_role(org_id, project_id, array['admin','pm']) );
+
+-- Separate policy for signoff decision path (customer_signer or admin may finalize)
+create policy "stages_update_decision_signer"
+on public.project_stages for update
+using ( org_id = public.current_org() and public.has_project_role(org_id, project_id, array['customer_signer','admin']) )
+with check ( org_id = public.current_org() and public.has_project_role(org_id, project_id, array['customer_signer','admin']) );
+
+
+Because PostgREST evaluates any matching policy, both update policies can coexist: PMs can edit operational fields; customer_signer/admin can flip decision fields. Your API can also enforce this logic at the route layer (below).
+
+Actions/Risks/Decisions tables
+alter table public.actions enable row level security;
+create policy "actions_select_any_member" on public.actions for select
+using (org_id = public.current_org() and public.is_member(org_id, project_id));
+create policy "actions_write_admin_pm" on public.actions for insert
+with check (org_id = public.current_org() and public.has_project_role(org_id, project_id, array['admin','pm']));
+create policy "actions_update_admin_pm" on public.actions for update
+using (org_id = public.current_org() and public.has_project_role(org_id, project_id, array['admin','pm']))
+with check (org_id = public.current_org() and public.has_project_role(org_id, project_id, array['admin','pm']));
+
+
+(Repeat for risks, decisions.)
+
+RAG chunks & artifacts (read only)
+alter table public.artifact_chunks enable row level security;
+create policy "chunks_read_any_member" on public.artifact_chunks for select
+using (org_id = public.current_org() and public.is_member(org_id, project_id));
+-- inserts happen via backend jobs (service key), no public insert policy.
+
+Audit events (read for members; write by server)
+alter table public.audit_events enable row level security;
+create policy "audit_select_any_member" on public.audit_events for select
+using (org_id = public.current_org() and public.is_member(org_id, project_id));
+-- insert stays server-side with service key OR create a policy mirroring 'admin','pm'.
+
+3) Backend guards: tiny, composable
+
+server/app/guards.py
+
+from fastapi import Depends, HTTPException, Query
+from .tenant import tenant_ctx, TenantCtx
+from .deps import get_user_supabase
+
+def member_ctx(project_id: str = Query(...), ctx: TenantCtx = Depends(tenant_ctx)):
+  # RLS will hide rows if not a member; do an existence check
+  sb = get_user_supabase(ctx)
+  m = sb.table("project_members").select("role").eq("project_id", project_id).limit(1).execute().data
+  if not m: raise HTTPException(403, "Not a member of this project")
+  ctx.role = m[0]["role"]
+  return ctx
+
+def require_role(allowed: set[str]):
+  def _inner(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    if ctx.role not in allowed:
+      raise HTTPException(403, f"Requires role {', '.join(sorted(allowed))}")
+    return ctx
+  return _inner
+
+4) Wire guards into endpoints (examples)
+
+Stages API
+
+# list: any member
+@router.get("/list")
+def list_stages(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    ...
+
+# create/request: pm or admin
+PM_OR_ADMIN = require_role({"pm","admin"})
+
+@router.post("/create")
+def create_stage(..., project_id: str = Query(...), ctx: TenantCtx = Depends(PM_OR_ADMIN)):
+    ...
+
+@router.post("/request-signoff")
+def request_signoff(..., project_id: str = Query(...), ctx: TenantCtx = Depends(PM_OR_ADMIN)):
+    ...
+
+# decision: customer_signer or admin
+SIGNER_OR_ADMIN = require_role({"customer_signer","admin"})
+
+@router.post("/decision")
+def stage_decision(..., project_id: str = Query(...), ctx: TenantCtx = Depends(SIGNER_OR_ADMIN)):
+    ...
+
+
+RAG Ask (read-only): use member_ctx (all roles allowed).
+Mutating endpoints (actions/risks/etc.): use PM_OR_ADMIN.
+
+5) Kap (agent) writes — admin-only, with a keyed endpoint
+
+server/app/routers/agent.py
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from ..guards import require_role
+from ..tenant import TenantCtx
+from ..deps import get_service_supabase
+import os, json, datetime as dt
+
+router = APIRouter(prefix="/api/agent", tags=["agent"])
+AGENT_KEY = os.getenv("AGENT_API_KEY")
+
+ADMIN_ONLY = require_role({"admin"})
+
+@router.post("/mem/write")
+def mem_write(
+  payload: dict,
+  project_id: str = Query(...),
+  ctx: TenantCtx = Depends(ADMIN_ONLY),
+  x_agent_key: str | None = Header(None)
+):
+  if not AGENT_KEY or x_agent_key != AGENT_KEY:
+    raise HTTPException(401, "Invalid agent key")
+  sb = get_service_supabase()
+  # perform inserts with service key, but scoped and attributed to admin:
+  sb.table("mem_entries").insert({
+    "org_id": ctx.org_id,
+    "project_id": project_id,
+    "body": json.dumps(payload),
+    "created_by": ctx.user_id,
+    "created_at": dt.datetime.utcnow()
+  }).execute()
+  return {"ok": True}
+
+
+Result: Kap can only mutate when (a) admin is the actor, (b) correct AGENT_API_KEY is presented.
+
+Frontend UX gates (quick pass)
+
+Hide/disable Create Stage / Request Sign-Off buttons unless role ∈ {pm, admin}.
+
+Show Approve/Reject only when role ∈ {customer_signer, admin}.
+
+ChatDock “Ask Kap” always enabled; “Apply fixes” / “Write to dashboard” only for admin.
+
+{canPM && <Button onClick={...}>Create Stage</Button>}
+{canSign && s.status==='in_review' && <Button onClick={...}>Approve</Button>}
+
+
+Set canPM / canSign from role (you already pass it in ProjectStages).
+
+Sanity checklist (5 minutes)
+
+Set dev env:
+
+Backend: DEV_AUTH=1
+
+Frontend: VITE_DEV_AUTH=1 + VITE_DEV_USER, VITE_DEV_ORG
+
+Seed membership:
+
+insert into project_members(org_id, project_id, user_id, role)
+values ('<ORG>','<PROJ>','<USER>', 'admin');
+select pg_notify('pgrst','reload schema');
+
+
+Reload, open Stages page → list loads.
+
+Create a stage (admin) → ok.
+
+Request sign-off (admin/pm) → status in_review.
+
+Change role to customer_signer in project_members → Approve works.
+
+Flip to prod: set DEV_AUTH=0 and VITE_DEV_AUTH=0, log in via Supabase → everything still works.
+
+If you paste these patches, you’ll have: dev unblocked today, and a clean, enforceable RBAC that matches exactly what you described: team members can look + ask Kap, admins run the show (and Kap writes only when an admin says so). Want me to add a tiny Role Matrix card in Admin → Projects that previews exactly what each role can/can’t do and lets you change member roles inline?

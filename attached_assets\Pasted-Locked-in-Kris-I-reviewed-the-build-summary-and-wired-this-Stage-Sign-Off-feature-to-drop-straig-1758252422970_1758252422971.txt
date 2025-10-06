@@ -1,0 +1,445 @@
+Locked in, Kris. I reviewed the build summary and wired this “Stage Sign-Off” feature to drop straight into your stack (FastAPI + Express proxy, React/Vite + shadcn, Supabase auth/DB, Mailgun). Below are paste-ready snippets, organized in install order. If anything in your Replit layout differs, tell me what file paths you’re using and I’ll adapt. 
+
+📊 TEAIM Project Hub – Build St…
+
+1) Supabase: schema + RLS
+
+Run in Supabase SQL editor
+
+-- === STAGES ===
+create table if not exists public.project_stages (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid not null,
+  project_id uuid not null,
+  title text not null,
+  start_date date,
+  end_date date,
+  status text not null default 'pending', -- pending | in_review | signed_off | rejected
+  requested_by uuid,         -- user who requested signoff
+  requested_at timestamptz,
+  signoff_by uuid,           -- user who approved/rejected
+  signoff_date timestamptz,
+  signoff_decision text,     -- approved | rejected
+  signoff_notes text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+-- optional: unique order per project
+alter table public.project_stages
+  add column if not exists sort_index int generated always as identity;
+
+create index if not exists idx_project_stages_project on public.project_stages(project_id);
+
+-- === AUDIT LOG ===
+create table if not exists public.audit_events (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid not null,
+  project_id uuid,
+  actor_id uuid,
+  kind text not null, -- stage.requested | stage.approved | stage.rejected
+  details jsonb,
+  created_at timestamptz not null default now()
+);
+
+-- Row Level Security
+alter table public.project_stages enable row level security;
+alter table public.audit_events enable row level security;
+
+-- Basic roles you already plan to use: admin, pm, member, customer_signer
+-- Assuming user role is stored in auth.jwt() custom claims: role, org_id
+create or replace function public.current_role() returns text
+language sql stable as $$
+  select coalesce(nullif(current_setting('request.jwt.claims', true)::jsonb->>'role',''), 'member');
+$$;
+
+create or replace function public.current_org() returns uuid
+language sql stable as $$
+  select nullif(current_setting('request.jwt.claims', true)::jsonb->>'org_id','')::uuid;
+$$;
+
+-- Read: all project members can read stages for their org
+create policy "stages_read_same_org"
+on public.project_stages for select
+using (org_id = public.current_org());
+
+-- Write: pm/admin can create/update; customer_signer can update only when approving/rejecting
+create policy "stages_write_pm_admin"
+on public.project_stages for insert
+to public
+with check (
+  org_id = public.current_org()
+  and public.current_role() in ('admin','pm')
+);
+
+create policy "stages_update_pm_admin"
+on public.project_stages for update
+using (org_id = public.current_org() and public.current_role() in ('admin','pm'))
+with check (org_id = public.current_org());
+
+-- Approval path: allow signer to set status/decision on their org
+create policy "stages_update_signer"
+on public.project_stages for update
+using (org_id = public.current_org() and public.current_role() in ('customer_signer'))
+with check (org_id = public.current_org());
+
+-- Audit log policies
+create policy "audit_read_same_org"
+on public.audit_events for select
+using (org_id = public.current_org());
+
+create policy "audit_insert_pm_admin_signer"
+on public.audit_events for insert
+with check (org_id = public.current_org());
+
+2) FastAPI: routes ( /server/app/routers/stages.py )
+# server/app/routers/stages.py
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from typing import Optional, List
+from datetime import date, datetime
+import os
+import uuid
+
+from ..deps import get_supabase, require_auth  # your existing helpers
+
+router = APIRouter(prefix="/api/stages", tags=["stages"])
+
+class StageCreate(BaseModel):
+    org_id: str
+    project_id: str
+    title: str
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+
+class StageListParams(BaseModel):
+    org_id: str
+    project_id: str
+
+class StageRequestSignoff(BaseModel):
+    org_id: str
+    project_id: str
+    stage_id: str
+    email_to: str  # customer signer email
+    message: Optional[str] = None
+
+class StageDecision(BaseModel):
+    org_id: str
+    project_id: str
+    stage_id: str
+    decision: str  # "approved" | "rejected"
+    notes: Optional[str] = None
+
+def _mailgun_send(to_email: str, subject: str, html: str):
+    import requests
+    MG_DOMAIN = os.getenv("MAILGUN_DOMAIN")
+    MG_KEY = os.getenv("MAILGUN_API_KEY")
+    if not (MG_DOMAIN and MG_KEY):
+        return
+    return requests.post(
+        f"https://api.mailgun.net/v3/{MG_DOMAIN}/messages",
+        auth=("api", MG_KEY),
+        data={"from": f"TEAIM <no-reply@{MG_DOMAIN}>",
+              "to": [to_email],
+              "subject": subject,
+              "html": html},
+        timeout=15
+    )
+
+@router.post("/create")
+def create_stage(payload: StageCreate, user=Depends(require_auth), sb=Depends(get_supabase)):
+    row = {
+        "org_id": payload.org_id,
+        "project_id": payload.project_id,
+        "title": payload.title,
+        "start_date": payload.start_date,
+        "end_date": payload.end_date,
+        "status": "pending",
+    }
+    res = sb.table("project_stages").insert(row).execute()
+    return {"ok": True, "stage": res.data[0]}
+
+@router.get("/list")
+def list_stages(org_id: str, project_id: str, sb=Depends(get_supabase), user=Depends(require_auth)):
+    res = sb.table("project_stages").select("*").eq("org_id", org_id).eq("project_id", project_id)\
+        .order("sort_index", desc=False).order("created_at", desc=False).execute()
+    return {"stages": res.data}
+
+@router.post("/request-signoff")
+def request_signoff(payload: StageRequestSignoff, user=Depends(require_auth), sb=Depends(get_supabase)):
+    # mark in_review + set requested_by/at
+    sb.table("project_stages").update({
+        "status": "in_review",
+        "requested_by": user["sub"],
+        "requested_at": datetime.utcnow()
+    }).eq("id", payload.stage_id).eq("org_id", payload.org_id).eq("project_id", payload.project_id).execute()
+
+    # sign link (you may have a real tokenized route; placeholder query params for now)
+    approve_url = f"{os.getenv('APP_BASE_URL')}/signoff?stage_id={payload.stage_id}&project_id={payload.project_id}"
+    html = f"""
+      <p>Hello,</p>
+      <p>Please review and sign off the stage: <b>{payload.stage_id}</b>.</p>
+      <p><a href="{approve_url}">Open Sign-Off Page</a></p>
+      <p>{payload.message or ''}</p>
+      <p>— TEAIM</p>
+    """
+    _mailgun_send(payload.email_to, "TEAIM: Stage sign-off requested", html)
+
+    # audit
+    sb.table("audit_events").insert({
+        "org_id": payload.org_id,
+        "project_id": payload.project_id,
+        "actor_id": user["sub"],
+        "kind": "stage.requested",
+        "details": {"stage_id": payload.stage_id, "email_to": payload.email_to}
+    }).execute()
+
+    return {"ok": True}
+
+@router.post("/decision")
+def stage_decision(payload: StageDecision, user=Depends(require_auth), sb=Depends(get_supabase)):
+    if payload.decision not in ("approved", "rejected"):
+        raise HTTPException(400, "Invalid decision")
+    status = "signed_off" if payload.decision == "approved" else "rejected"
+
+    sb.table("project_stages").update({
+        "status": status,
+        "signoff_by": user["sub"],
+        "signoff_date": datetime.utcnow(),
+        "signoff_decision": payload.decision,
+        "signoff_notes": payload.notes
+    }).eq("id", payload.stage_id).eq("org_id", payload.org_id).eq("project_id", payload.project_id).execute()
+
+    sb.table("audit_events").insert({
+        "org_id": payload.org_id,
+        "project_id": payload.project_id,
+        "actor_id": user["sub"],
+        "kind": f"stage.{payload.decision}",
+        "details": {"stage_id": payload.stage_id, "notes": payload.notes}
+    }).execute()
+
+    # Optional: write immutable decision memory (hook your mem-agent here)
+    # mem_agent.write_decision(...)
+
+    return {"ok": True, "status": status}
+
+
+Wire router ( /server/app/main.py )
+
+# server/app/main.py
+from fastapi import FastAPI
+from .routers import stages  # add this
+# ...existing imports
+
+app = FastAPI()
+# ...existing includes
+app.include_router(stages.router)
+
+3) Express proxy (if you’re proxying /api to FastAPI)
+
+Add routes ( /proxy/index.js )
+
+// proxy/index.js (excerpt)
+const { createProxyMiddleware } = require('http-proxy-middleware');
+const API_BASE = process.env.FASTAPI_URL || 'http://127.0.0.1:8090';
+
+module.exports = function mount(app) {
+  app.use('/api/stages', createProxyMiddleware({
+    target: API_BASE,
+    changeOrigin: true,
+    pathRewrite: {'^/api': '/api'},
+    logLevel: 'warn'
+  }));
+};
+
+4) Frontend (React/Vite + shadcn)
+4a) API client helpers ( /web/src/lib/api.ts )
+// web/src/lib/api.ts
+export async function apiGet<T>(path: string, params?: Record<string,string>) {
+  const qs = params ? '?' + new URLSearchParams(params).toString() : '';
+  const res = await fetch(`/api${path}${qs}`, { credentials: 'include' });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json() as Promise<T>;
+}
+
+export async function apiPost<T>(path: string, body?: any) {
+  const res = await fetch(`/api${path}`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {'Content-Type':'application/json'},
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json() as Promise<T>;
+}
+
+4b) Stage Tracker component ( /web/src/components/StageTracker.tsx )
+// web/src/components/StageTracker.tsx
+import { useEffect, useState } from 'react';
+import { apiGet, apiPost } from '@/lib/api';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Textarea } from '@/components/ui/textarea';
+import { Input } from '@/components/ui/input';
+
+type Stage = {
+  id: string;
+  title: string;
+  status: 'pending' | 'in_review' | 'signed_off' | 'rejected';
+  start_date?: string;
+  end_date?: string;
+  signoff_decision?: string;
+  signoff_notes?: string;
+};
+
+export function StageTracker({ orgId, projectId, canPM, canSign }: {
+  orgId: string; projectId: string; canPM?: boolean; canSign?: boolean;
+}) {
+  const [stages, setStages] = useState<Stage[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [emailTo, setEmailTo] = useState('');
+  const [message, setMessage] = useState('');
+  const [notes, setNotes] = useState('');
+
+  async function load() {
+    setLoading(true);
+    const data = await apiGet<{stages: Stage[]}>('/stages/list', { org_id: orgId, project_id: projectId });
+    setStages(data.stages);
+    setLoading(false);
+  }
+  useEffect(() => { load(); }, [orgId, projectId]);
+
+  async function requestSignoff(stageId: string) {
+    await apiPost('/stages/request-signoff', { org_id: orgId, project_id: projectId, stage_id: stageId, email_to: emailTo, message });
+    await load();
+  }
+
+  async function decide(stageId: string, decision: 'approved' | 'rejected') {
+    await apiPost('/stages/decision', { org_id: orgId, project_id: projectId, stage_id: stageId, decision, notes });
+    setNotes('');
+    await load();
+  }
+
+  return (
+    <Card className="w-full">
+      <CardHeader>
+        <CardTitle>Stage Sign-Off</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {loading && <div>Loading…</div>}
+
+        {canPM && (
+          <div className="grid md:grid-cols-3 gap-2 items-end">
+            <Input placeholder="Customer signer email" value={emailTo} onChange={e=>setEmailTo(e.target.value)} />
+            <Textarea placeholder="Optional message…" value={message} onChange={e=>setMessage(e.target.value)} />
+            <div className="text-sm text-muted-foreground">Select a stage below and click “Request”.</div>
+          </div>
+        )}
+
+        <div className="grid gap-3">
+          {stages.map(s => (
+            <div key={s.id} className="flex items-start justify-between border rounded-lg p-3">
+              <div>
+                <div className="font-medium">{s.title}</div>
+                <div className="text-sm">Status: <span className="uppercase">{s.status}</span></div>
+                {s.signoff_decision && <div className="text-sm">Decision: {s.signoff_decision} — {s.signoff_notes}</div>}
+              </div>
+              <div className="flex gap-2">
+                {canPM && s.status === 'pending' && (
+                  <Button variant="secondary" onClick={()=>requestSignoff(s.id)}>Request</Button>
+                )}
+                {canSign && s.status === 'in_review' && (
+                  <>
+                    <Textarea className="min-w-[220px]" placeholder="Approval/Reject notes…" value={notes} onChange={e=>setNotes(e.target.value)} />
+                    <Button onClick={()=>decide(s.id,'approved')}>Approve</Button>
+                    <Button variant="destructive" onClick={()=>decide(s.id,'rejected')}>Reject</Button>
+                  </>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+4c) Route/page ( /web/src/pages/ProjectStages.tsx )
+import { StageTracker } from '@/components/StageTracker';
+import { useParams } from 'react-router-dom';
+import { useSession } from '@/stores/session'; // your auth role/org store
+
+export default function ProjectStages() {
+  const { projectId } = useParams();
+  const { orgId, role } = useSession();
+  return (
+    <div className="p-6">
+      <StageTracker
+        orgId={orgId}
+        projectId={projectId!}
+        canPM={['pm','admin'].includes(role)}
+        canSign={role === 'customer_signer'}
+      />
+    </div>
+  );
+}
+
+
+Add nav link (where you define sidebar items):
+
+// … add route
+{ path: "/projects/:projectId/stages", element: <ProjectStages/> },
+
+5) Mailgun template (optional HTML)
+<!-- Keep simple for now; you can move to stored templates later -->
+<html>
+  <body>
+    <p>Hi {{name}},</p>
+    <p>We’re requesting sign-off for the stage <b>{{stage_title}}</b> on project {{project_code}}.</p>
+    <p>Please review and approve or reject here:</p>
+    <p><a href="{{approve_url}}">Open Sign-Off Page</a></p>
+    <p>{{message}}</p>
+    <p>— TEAIM</p>
+  </body>
+</html>
+
+
+(If you want stored templates, I’ll switch _mailgun_send to template + h:X-Mailgun-Variables.)
+
+6) Quick smoke tests (cURL)
+# Create a stage
+curl -s -X POST "$APP/api/stages/create" \
+ -H "Content-Type: application/json" \
+ -b cookiejar.txt -c cookiejar.txt \
+ -d '{"org_id":"<ORG>","project_id":"<PROJ>","title":"Discovery"}'
+
+# List stages
+curl -s "$APP/api/stages/list?org_id=<ORG>&project_id=<PROJ>" -b cookiejar.txt
+
+# Request signoff (PM)
+curl -s -X POST "$APP/api/stages/request-signoff" \
+ -H "Content-Type: application/json" -b cookiejar.txt \
+ -d '{"org_id":"<ORG>","project_id":"<PROJ>","stage_id":"<STAGE>","email_to":"client@example.com","message":"Please review."}'
+
+# Decision (customer_signer)
+curl -s -X POST "$APP/api/stages/decision" \
+ -H "Content-Type: application/json" -b cookiejar.txt \
+ -d '{"org_id":"<ORG>","project_id":"<PROJ>","stage_id":"<STAGE>","decision":"approved","notes":"Looks good."}'
+
+7) Hook into your existing dashboard
+
+On your dashboard page, add a tiny widget querying /api/stages/list and showing counts:
+
+Pending (status=pending)
+
+In Review
+
+Signed Off
+
+Rejected
+
+Overdue (today > end_date & not signed_off)
+
+I can drop that widget in next if you want it styled like your KPIs.
+
+If you hit any mismatch with your current get_supabase, auth claims, or router wiring, paste those snippets from Replit and I’ll align them. Otherwise, green light to paste and run. And yes, I’ll happily add the Timeline UI to mirror stages next so the sign-off and Gantt bars tell the same story.

@@ -1,0 +1,154 @@
+1) ChatDock: persist collapsed state (default = minimized)
+
+client/src/components/ChatDock.tsx (edit your component; add/paste the state logic + small toggle UI)
+
+import { useEffect, useMemo, useState } from "react";
+
+export default function ChatDock({ projectId }: { projectId?: string }) {
+  /* === Persisted collapsed state (default = true / minimized) === */
+  const storageKey = useMemo(
+    () => `kapDock.collapsed:${projectId || "global"}`,
+    [projectId]
+  );
+
+  const [collapsed, setCollapsed] = useState<boolean>(() => {
+    const raw = localStorage.getItem(storageKey);
+    return raw === null ? true : raw === "true"; // default minimized
+  });
+
+  // when project changes, rehydrate from its own key
+  useEffect(() => {
+    const raw = localStorage.getItem(storageKey);
+    setCollapsed(raw === null ? true : raw === "true");
+  }, [storageKey]);
+
+  useEffect(() => {
+    localStorage.setItem(storageKey, String(collapsed));
+  }, [collapsed, storageKey]);
+
+  // ====== your existing dock content here ======
+  // Wrap your existing panel with a simple header + toggle:
+  return (
+    <div className="fixed right-4 bottom-4 z-[60]">
+      {collapsed ? (
+        <button
+          className="rounded-full shadow px-4 py-2 border bg-background"
+          onClick={() => setCollapsed(false)}
+          aria-label="Open Ask Kap"
+          title="Ask Kap"
+        >
+          Ask Kap
+        </button>
+      ) : (
+        <div className="w-[360px] h-[520px] rounded-xl shadow-xl border bg-background flex flex-col overflow-hidden">
+          <div className="flex items-center justify-between px-3 py-2 border-b">
+            <div className="font-medium">Ask Kap</div>
+            <button
+              className="text-sm opacity-70 hover:opacity-100"
+              onClick={() => setCollapsed(true)}
+              aria-label="Minimize"
+              title="Minimize"
+            >
+              ⤢
+            </button>
+          </div>
+
+          {/* Replace below with your existing chat body */}
+          <div className="flex-1 overflow-auto">
+            {/* ... your ChatDock body ... */}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+Behavior: first load = minimized. If user expands, we persist kapDock.collapsed:<projectId> so it stays expanded for that project until they minimize.
+
+2) Only show ChatDock on authenticated app pages (hide on public /signoff/*)
+
+client/src/App.jsx (or your main layout/router file)
+
+import { useLocation, useParams } from "react-router-dom";
+import ChatDock from "@/components/ChatDock";
+
+function AuthedLayout() {
+  const { pathname } = useLocation();
+  const hideDock = pathname.startsWith("/signoff/"); // public routes have no dock
+  const { projectId } = useParams(); // or your session store if that’s where projectId lives
+
+  return (
+    <div className="flex">
+      {/* sidebar/topbar, etc. */}
+      <div className="flex-1">
+        {/* <Outlet /> etc. */}
+      </div>
+
+      {!hideDock && <ChatDock projectId={projectId} />}
+    </div>
+  );
+}
+
+
+(If your layout is split, apply the same hideDock logic where ChatDock is rendered.)
+
+3) Tiny overlap polish (optional but nice)
+
+If the dock ever overlaps a bottom bar, give it spacing:
+
+/* client/src/index.css */
+@media (min-width: 640px) {
+  .kap-dock-safe {
+    padding-bottom: 84px; /* e.g., footer/nav height */
+  }
+}
+
+
+Wrap your page body in <div className="kap-dock-safe">...</div> where needed.
+
+4) (Bonus) Your digest endpoint returning HTML instead of JSON
+
+That’s usually the proxy serving the SPA fallback before it hits FastAPI. Make sure the API proxy mounts before the static fallback and forwards all headers.
+
+proxy/index.js (or wherever you wire the middleware)
+
+const { createProxyMiddleware } = require("http-proxy-middleware");
+const API_BASE = process.env.FASTAPI_URL || "http://127.0.0.1:8090";
+
+module.exports = function mount(app) {
+  // PROXY FIRST
+  app.use(
+    "/api",
+    createProxyMiddleware({
+      target: API_BASE,
+      changeOrigin: true,
+      xfwd: true,
+      onProxyReq(proxyReq, req) {
+        if (req.headers["authorization"]) {
+          proxyReq.setHeader("authorization", req.headers["authorization"]);
+        }
+        if (process.env.DEV_AUTH === "1") {
+          // forward dev headers when enabled
+          ["x-dev-user", "x-dev-org", "x-dev-role"].forEach((h) => {
+            if (req.headers[h]) proxyReq.setHeader(h, req.headers[h]);
+          });
+        }
+      },
+    })
+  );
+
+  // ...then static/SPA fallback catch-all after this
+  // app.use(express.static(...));
+  // app.get("*", (req,res)=> res.sendFile("index.html"));
+};
+
+
+And ensure the digest router is mounted in FastAPI:
+
+# server/app/main.py
+from .routers import digest, signoff_external, audit, meetings_export
+app.include_router(digest.router)
+app.include_router(signoff_external.router)
+app.include_router(audit.router)
+app.include_router(meetings_export.router)

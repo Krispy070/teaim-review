@@ -1,0 +1,190 @@
+Kap here. I read the Replit logs—robustness pack landed, dashboard now loads, Library + Composer look clean. Time to ship the promised upgrades:
+
+Overdue chip in the header (red count)
+
+Per-artifact “Share” signed URL (time-boxed public link)
+
+Finish auth-safe downloads everywhere (you already added GET; this includes a POST helper you can use for any export)
+
+All patches are drop-in and don’t fight your router (works with wouter or react-router).
+
+1) Backend — per-artifact signed URL (time-boxed link)
+
+server/routers/artifact_share.py
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+from typing import Optional
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase, get_service_supabase
+
+router = APIRouter(prefix="/api/artifacts", tags=["artifact-share"])
+
+class ShareBody(BaseModel):
+    artifact_id: Optional[str] = None        # recommend using artifact_id
+    storage_bucket: Optional[str] = None     # or (bucket + path)
+    storage_path: Optional[str] = None
+    expires_sec: int = 86400                 # default 24h
+
+@router.post("/share-url")
+def share_url(body: ShareBody, project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    """
+    Returns a time-boxed public URL for an artifact.
+    """
+    if not (body.artifact_id or (body.storage_bucket and body.storage_path)):
+        raise HTTPException(400, "Provide artifact_id OR (storage_bucket+storage_path)")
+
+    sb_user = get_user_supabase(ctx)
+    sb_svc = get_service_supabase()
+
+    bucket = body.storage_bucket
+    path = body.storage_path
+
+    # Resolve from artifact_id with user-scoped read to enforce RLS/membership
+    if body.artifact_id:
+        row = sb_user.table("artifacts").select("storage_bucket,storage_path")\
+              .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", body.artifact_id)\
+              .single().execute().data
+        if not row:
+            raise HTTPException(404, "Artifact not found")
+        bucket, path = row["storage_bucket"], row["storage_path"]
+
+    # Create signed URL with service client
+    try:
+        res = sb_svc.storage().from_(bucket).create_signed_url(path, body.expires_sec)
+        url = res.get("signedURL") or res.get("signed_url")  # supabase-py variants
+        if not url:
+            raise RuntimeError("No signed URL returned")
+        # Optional: prepend public URL origin if storage client returns relative
+        origin = sb_svc.storage().url if hasattr(sb_svc.storage(), "url") else ""
+        return {"ok": True, "url": (origin + url) if (origin and url.startswith("/")) else url, "expires_sec": body.expires_sec}
+    except Exception as e:
+        raise HTTPException(500, f"Failed to create signed URL: {e}")
+
+
+Mount in server/main.py:
+
+from .routers import artifact_share
+app.include_router(artifact_share.router)
+
+
+Security notes:
+
+Signed URLs are public for the lifetime; use short expires_sec (e.g., 900 = 15m) for sensitive docs.
+
+If you ever need immediate revoke, store a proxy token and gate via our API (I can add that later).
+
+2) Frontend — Overdue chip (red count) in the header
+
+client/src/components/OverdueChip.tsx
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom"; // if using wouter: import { useRoute } from "wouter"
+
+export default function OverdueChip(){
+  const { projectId } = useParams(); // with wouter: const [match, params] = useRoute("/projects/:projectId/:rest*"); const projectId = params?.projectId;
+  const [n,setN] = useState<number>(0);
+
+  async function load(){
+    try {
+      const r = await fetch(`/api/actions/overdue?project_id=${projectId}`, { credentials: "include" });
+      if (!r.ok) { setN(0); return; }
+      const d = await r.json();
+      setN((d.items||[]).length);
+    } catch { setN(0); }
+  }
+  useEffect(()=>{ load(); const t = setInterval(load, 60_000); return ()=>clearInterval(t); }, [projectId]);
+
+  if (!n) return null;
+  return (
+    <div className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-red-600 text-white text-xs">
+      Overdue: <b>{n}</b>
+    </div>
+  );
+}
+
+
+Place it in your header next to Wellness/Digest chips:
+
+import OverdueChip from "@/components/OverdueChip";
+// ...
+<h1 className="text-2xl font-semibold flex items-center gap-3">
+  Project Dashboard
+  <WellnessChip projectId={projectId!} />
+  <DigestChip projectId={projectId!} />
+  <OverdueChip />
+</h1>
+
+3) Frontend — per-artifact “Share” button (copy signed URL)
+
+Add this to your Documents/Library artifact row (visible to members+; use role gating if desired):
+
+import { useToast } from "@/components/ui/use-toast";
+
+function ArtifactRow({ a, projectId, role }:{ a:any; projectId:string; role:string }){
+  const { toast } = useToast();
+
+  async function share(){
+    try{
+      const res = await fetch(`/api/artifacts/share-url?project_id=${projectId}`, {
+        method: "POST",
+        credentials: "include",
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ artifact_id: a.id, expires_sec: 3600 }) // 1 hour
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const d = await res.json();
+      await navigator.clipboard.writeText(d.url);
+      toast({ title: "Share link copied", description: "Valid for ~1 hour." });
+    }catch(e:any){
+      toast({ title: "Share failed", description: String(e?.message||e), variant: "destructive" });
+    }
+  }
+
+  return (
+    <div id={`artifact-${a.id}`} className="border rounded p-3 flex items-center justify-between">
+      <div className="truncate">{a.name}</div>
+      <div className="flex items-center gap-2">
+        {/* existing buttons: Re-embed, etc. */}
+        <button className="px-2 py-1 border rounded text-xs" onClick={share}>Share</button>
+      </div>
+    </div>
+  );
+}
+
+
+You can also surface a quick dropdown: “15m / 1h / 24h” → pass different expires_sec.
+
+4) POST download helper (use for any POST export, e.g., ZIP package)
+
+You already added downloadGET and downloadPOST. Use downloadPOST anywhere you POST to get a file (e.g., Sign-Off ZIP). Example (Composer):
+
+import { downloadPOST } from "@/lib/download";
+
+async function downloadZip(){
+  const body = {
+    stage_title: stageTitle,
+    artifact_ids: arts.filter(a=>chk[a.id]).map(a=>a.id),
+    include_actions: actions, include_risks: risks, include_decisions: decisions,
+    message
+  };
+  await downloadPOST(`/api/signoff/package/zip?project_id=${projectId}`, body,
+    `signoff_${stageTitle.replace(/\s+/g,'_')}.zip`);
+}
+
+5) Extra guardrails (quick)
+
+If you saw a brief “wouter” mismatch earlier, make sure your header chips fetch projectId the same way the rest of your app does. I included both patterns in comments; switch to the one you’re using globally.
+
+For analytics cards that didn’t render previously: your skeleton + error-fallback are now in place; they won’t block.
+
+6) 60-second validation
+
+Header chips: Overdue count appears (if none, it hides).
+
+Documents row: “Share” copies a 1-hour signed URL; open in an incognito tab → file downloads.
+
+ZIP/CSV: Download buttons using downloadGET/downloadPOST succeed in dev (X-Dev headers) and prod (Bearer).
+
+Bell: still polling; shows signoff.package_sent, backup/reindex, reminder.sent events.

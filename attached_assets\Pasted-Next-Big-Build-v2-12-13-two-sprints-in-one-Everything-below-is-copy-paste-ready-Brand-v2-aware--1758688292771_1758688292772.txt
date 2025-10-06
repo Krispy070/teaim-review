@@ -1,0 +1,334 @@
+Next Big Build v2.12.13 (two sprints in one). Everything below is copy-paste ready, Brand v2–aware, and dev-safe (all new endpoints catch and return gracefully if a table/column is missing).
+
+Landing now:
+
+Request Sign-Off v4.2 — server-side pagination everywhere, domain suffix chips, and nightly auto-revoke expired via scheduler (+ manual trigger)
+
+Stages (Template Ops) — Apply start+end from template (per area) stores audit metadata; Restore from last template (one-click)
+
+Digests — /api/digest/changes endpoint + in-app Compact Changes Grid on Dashboard with deep-linked pre-filters
+
+Wellness Admin — Trend CSV (daily counts) for last 7/30 days (ready for Excel)
+
+1) Request Sign-Off v4.2 — paginate by default, domain chips, nightly auto-revoke
+1A) Scheduler: nightly revoke expired (dev-safe)
+
+server/scheduler.py (append – if you already have a background loop, drop this function & register it)
+
+import asyncio, datetime as dt
+from .deps import get_service_supabase
+
+async def revoke_expired_nightly():
+    """Runs once every 24h, revokes expired sign-off tokens across orgs. Dev-safe."""
+    sbs = get_service_supabase()
+    while True:
+        try:
+            # revoke all expired (used_at null, revoked_at null, expires_at < now)
+            now = dt.datetime.now(dt.timezone.utc).isoformat()
+            try:
+                sbs.table("signoff_doc_tokens").update({"revoked_at":"now()"})\
+                   .is_("used_at","null").is_("revoked_at","null").lt("expires_at", now).execute()
+            except Exception:
+                ...
+        except Exception:
+            ...
+        await asyncio.sleep(24*60*60)  # run daily
+
+
+server/main.py (register on startup)
+
+import asyncio
+from .scheduler import revoke_expired_nightly
+
+@app.on_event("startup")
+async def _start_tasks():
+    asyncio.create_task(revoke_expired_nightly())
+
+
+Dev-safe: if table doesn’t exist, it no-ops and tries again the next day.
+
+Manual trigger (for demos)
+
+server/routers/signoff_tokens_admin.py (append)
+
+@router.post("/revoke_expired_now")
+def revoke_expired_now(project_id: str | None = None, ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    sb = get_user_supabase(ctx)
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        q = sb.table("signoff_doc_tokens").update({"revoked_at":"now()"})\
+            .eq("org_id", ctx.org_id).is_("used_at","null").is_("revoked_at","null").lt("expires_at", now)
+        if project_id: q = q.eq("project_id", project_id)
+        r = q.execute()
+        return {"ok": True, "updated": getattr(r, "count", None)}
+    except Exception:
+        return {"ok": False, "updated": 0}
+
+
+(Already mounted earlier.)
+
+1B) Pending modal — domain suffix chips & default pagination
+
+client/src/components/SignoffRequestModal.tsx (pending controls; add under the search input)
+
+// Build domain chips from members list
+const domains = useMemo(()=>{
+  const set = new Set<string>();
+  (members||[]).forEach(m=>{
+    const em = (m.email||""); const at=em.indexOf("@"); if (at>0) set.add(em.slice(at+1));
+  });
+  return Array.from(set).sort().slice(0,8);
+},[members]);
+
+// Controls row (augment your existing pending controls)
+<div className="flex items-center gap-2 text-xs mb-1">
+  <input className="border rounded p-1 text-xs" placeholder="Search email…" value={qTok} onChange={e=>{setPage(1); setQTok(e.target.value)}} />
+  <input className="border rounded p-1 text-xs" placeholder="domain (acme.com)" value={domain} onChange={e=>{setPage(1); setDomain(e.target.value)}} />
+  <div className="flex items-center gap-1">
+    {domains.map(d=>(
+      <button key={d} className="brand-btn text-[11px]" onClick={()=>{ setDomain(d); setPage(1); }}>{'@'+d}</button>
+    ))}
+  </div>
+  <button className="brand-btn text-[11px]" onClick={()=>downloadGET(`/api/signoff/pending_export.csv?project_id=${projectId}&stage_id=${stageId}`, "pending.csv")}>Export CSV</button>
+  <button className="brand-btn text-[11px]" onClick={async()=>{
+    await fetch(`/api/signoff/revoke_expired_now?project_id=${projectId}`, {method:"POST", credentials:"include"});
+    loadPending(); alert("Revoked expired tokens");
+  }}>Revoke expired</button>
+  <div className="ml-auto flex items-center gap-1">
+    <button className="brand-btn text-[11px]" disabled={page<=1} onClick={()=>setPage(p=>Math.max(1,p-1))}>Prev</button>
+    <span>{page} / {Math.max(1, Math.ceil(total/pageSize))}</span>
+    <button className="brand-btn text-[11px]" disabled={page*pageSize>=total} onClick={()=>setPage(p=>p+1)}>Next</button>
+  </div>
+</div>
+
+
+Your pending_list endpoint already accepts q, domain, page, page_size. Now the UI surface makes it fast.
+
+2) Stages — Apply start+end from template (per area), audit metadata, Restore last template
+2A) Store last template & audit the apply
+
+Backend — record last applied template per project+area and write audit record.
+
+server/routers/stages_template_apply.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/stages", tags=["stages"])
+PM_PLUS = require_role({"owner","admin","pm"})
+
+class ApplyBody(BaseModel):
+    area: str
+    template_key: str
+    baseline: str  # YYYY-MM-DD
+    changes: dict   # { stage_id: {start_date, end_date} }
+
+@router.post("/apply_template")
+def apply_template(body: ApplyBody, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    updated = 0
+    try:
+        # apply changes
+        for sid, dates in (body.changes or {}).items():
+            try:
+                sb.table("project_stages").update({"start_date": dates.get("start_date"), "end_date": dates.get("end_date")})\
+                  .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", sid).execute()
+                updated += 1
+            except Exception: ...
+        # persist last template
+        try:
+            sb.table("stage_template_last").upsert({
+                "org_id": ctx.org_id, "project_id": project_id,
+                "area": body.area, "template_key": body.template_key, "baseline": body.baseline
+            }, on_conflict="org_id,project_id,area").execute()
+        except Exception: ...
+        # audit
+        try:
+            sb.table("audit_events").insert({
+                "org_id": ctx.org_id, "project_id": project_id, "actor_id": ctx.user_id,
+                "kind": "stage.apply_template",
+                "details": {"area": body.area, "template_key": body.template_key, "baseline": body.baseline, "updated": updated}
+            }).execute()
+        except Exception: ...
+        return {"ok": True, "updated": updated}
+    except Exception:
+        return {"ok": False, "updated": 0}
+
+@router.get("/restore_last_template")
+def restore_last_template(project_id: str = Query(...), area: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    try:
+        data = sb.table("stage_template_last").select("template_key,baseline")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("area", area).single().execute().data
+        return {"template_key": (data or {}).get("template_key"), "baseline": (data or {}).get("baseline")}
+    except Exception:
+        return {"template_key": None, "baseline": None}
+
+
+Mount in server/main.py:
+
+from .routers import stages_template_apply
+app.include_router(stages_template_apply.router)
+
+2B) Frontend — wire Apply and Restore to the preview dialog
+
+client/src/components/StageTemplateApply.tsx (augment)
+
+At top:
+
+import { postJSON } from "@/lib/authFetch";
+
+
+Change the apply() to batch via the new endpoint:
+
+async function apply(){
+  const changes:any = {};
+  preview.forEach((p:any)=> { if (p.will_update) changes[p.id] = { start_date: p.new_start, end_date: p.new_end }; });
+  await postJSON(`/api/stages/apply_template?project_id=${projectId}`, {
+    area, template_key: tplKey, baseline: base, changes
+  });
+  alert("Applied template"); onClose();
+}
+
+
+Add a Restore from last template button (next to baseline/template picker):
+
+async function restore(){
+  const r = await getJSON(`/api/stages/restore_last_template?project_id=${projectId}&area=${encodeURIComponent(area||"")}`);
+  if (!r?.template_key || !r?.baseline){ alert("No last template saved for this area"); return; }
+  setTplKey(r.template_key); setBase(r.baseline);
+}
+
+<div className="flex items-center gap-2">
+  {/* existing template picker + baseline date inputs */}
+  <button className="brand-btn text-xs" onClick={restore}>Restore last template</button>
+</div>
+
+3) Digests — /api/digest/changes + Compact Changes Grid on Dashboard
+3A) Backend endpoint (7 days by default; dev-safe)
+
+server/routers/digest_changes.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from datetime import datetime, timedelta, timezone
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/digest", tags=["digest"])
+
+@router.get("/changes")
+def changes(project_id: str = Query(...), days: int = 7, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=max(1,days))
+    out=[]
+    try:
+        a = sb.table("actions").select("id,title,owner,area,created_at")\
+             .eq("org_id", ctx.org_id).eq("project_id", project_id).gte("created_at", start.isoformat()).limit(200).execute().data or []
+        out += [{"table":"actions","id":x["id"],"title":x.get("title"),"owner":x.get("owner"),"area":x.get("area")} for x in a]
+    except Exception: ...
+    try:
+        r = sb.table("risks").select("id,title,owner,area,created_at")\
+             .eq("org_id", ctx.org_id).eq("project_id", project_id).gte("created_at", start.isoformat()).limit(200).execute().data or []
+        out += [{"table":"risks","id":x["id"],"title":x.get("title"),"owner":x.get("owner"),"area":x.get("area")} for x in r]
+    except Exception: ...
+    try:
+        d = sb.table("decisions").select("id,title,decided_by,area,created_at")\
+             .eq("org_id", ctx.org_id).eq("project_id", project_id).gte("created_at", start.isoformat()).limit(200).execute().data or []
+        out += [{"table":"decisions","id":x["id"],"title":x.get("title"),"owner":x.get("decided_by"),"area":x.get("area")} for x in d]
+    except Exception: ...
+    return {"items": out[:300]}
+
+
+Mount in server/main.py:
+
+from .routers import digest_changes
+app.include_router(digest_changes.router)
+
+3B) DashboardV2 — show Compact Changes Grid
+
+client/src/pages/DashboardV2.tsx (augment)
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import DigestChangesGrid from "@/components/DigestChangesGrid";
+
+const [changes,setChanges]=useState<any[]>([]);
+useEffect(()=>{ (async()=>{
+  try{
+    const r = await fetch(`/api/digest/changes?project_id=${projectId}&days=7`, {credentials:"include"});
+    const d = await r.json(); setChanges(d.items||[]);
+  }catch{ setChanges([]); }
+})(); },[projectId]);
+
+{/* somewhere on the dashboard layout */}
+<DigestChangesGrid projectId={projectId!} changes={changes} />
+
+4) Wellness Admin — Trend CSV (daily counts)
+
+server/routers/wellness_trend_csv.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
+import io, csv
+from datetime import datetime, timedelta, timezone
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/wellness", tags=["wellness"])
+
+@router.get("/trend.csv")
+def trend_csv(project_id: str = Query(...), days: int = 30,
+              ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    sb = get_user_supabase(ctx)
+    days = 7 if int(days)==7 else 30
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days-1)
+    try:
+        rows = sb.table("team_wellness").select("created_at")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+               .gte("created_at", start.isoformat()).execute().data or []
+    except Exception:
+        rows = []
+    by = {}
+    for r in rows:
+        d = (r.get("created_at") or "")[:10]
+        if d: by[d] = by.get(d,0)+1
+    s = io.StringIO(); w = csv.writer(s); w.writerow(["date","count"])
+    for i in range(days):
+        day = (start + timedelta(days=i)).isoformat()
+        w.writerow([day, by.get(day,0)])
+    s.seek(0)
+    return StreamingResponse(iter([s.read()]), media_type="text/csv",
+      headers={"Content-Disposition": f'attachment; filename="wellness_trend_{days}d.csv"'})
+
+
+Mount in server/main.py:
+
+from .routers import wellness_trend_csv
+app.include_router(wellness_trend_csv.router)
+
+
+Admin UI — add buttons near the trend charts:
+
+<button className="brand-btn text-xs" onClick={()=>downloadGET(`/api/wellness/trend.csv?project_id=${projectId}&days=7`, "wellness_trend_7d.csv")}>
+  Export 7d Trend CSV
+</button>
+<button className="brand-btn text-xs" onClick={()=>downloadGET(`/api/wellness/trend.csv?project_id=${projectId}&days=30`, "wellness_trend_30d.csv")}>
+  Export 30d Trend CSV
+</button>
+
+5) 2-minute validation
+
+Sign-Off v4.2: server-side paging, domain chips, nightly auto-revoke (and manual trigger), CSV export; custom resend templates remembered per project
+
+Stages: Apply Template (Preview) per area records audit & last template; Restore from last works; guardrail warnings; Shift by weeks tool applies start & end
+
+Digests: changes endpoint + dashboard grid; deep links with owner/area/tab prefilters still open filters and scroll/glow rows
+
+Wellness: Trend CSV (7/30) exports; compare CSV (7/30 both) and print HTML flows are ready

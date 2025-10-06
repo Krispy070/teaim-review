@@ -1,0 +1,240 @@
+Absolutely—let’s make the app “eat” an SOW + timeline and auto-build the dashboard. I’ll give you:
+
+what we’ll extract from the SOW you uploaded (MICA) and how it maps to the app
+
+the FastAPI endpoints to drop in now
+
+the parser outline (DOCX → objects)
+
+quick test scripts so you can see the dashboard light up
+
+I’ll also show a minimal approach for the timeline image (now) and a better OCR approach (later).
+
+What we’ll auto-create from the SOW (MICA)
+
+From your SOW, we can deterministically harvest:
+
+Phases / Stages: Plan → Architect → Configure & Prototype → Test → Deploy (names + order). 
+
+MICA SOW
+
+Functional Areas (HCM, Payroll, Benefits, Absence, Recruiting, Talent, Advanced Comp, Time, plus Financials modules, Grants, Procurement, Expenses, Supplier, etc.) → load into workstreams (up to 30). 
+
+MICA SOW
+
+Integrations in scope: Benefits 834s, TIAA, ADP/Ceridian, Bank files, PNC/MT Bank, Directory, Student Info, etc. → seed Integrations & Tech cards. 
+
+MICA SOW
+
+Teams & Roles: Executive Sponsor, Engagement Manager, Project Manager, Architects, Functional Leads, Testing Lead, Change Manager → seed Team (contacts you can amend). 
+
+MICA SOW
+
+Governance + Deliverables per stage → seed Actions (owner/verb/due) and Decisions/Risks placeholders that will get populated as we ingest minutes. 
+
+MICA SOW
+
+For the timeline (the image), we’ll start with a quick “manual capture” endpoint so you can paste the date ranges for each bar; later we can add OCR to parse bars from the JPG.
+
+Endpoints to add (drop-ins)
+1) SOW bootstrap (DOCX → dashboard)
+# /server/sow_bootstrap.py
+import io, datetime as dt, re
+from fastapi import APIRouter, UploadFile, File, Form
+from .supabase_client import sb
+from .db import get_conn
+import docx
+
+router = APIRouter()
+
+# simple helpers
+def _txt(doc_bytes: bytes) -> str:
+    d = docx.Document(io.BytesIO(doc_bytes))
+    return "\n".join(p.text for p in d.paragraphs)
+
+def _has(line: str, *keys): 
+    s=line.lower(); return all(k.lower() in s for k in keys)
+
+def parse_sow(text: str):
+    out = { "phases": [], "workstreams": [], "integrations": [], "roles": [] }
+
+    # phases (look for "Plan Stage", "Architect Stage", etc.)
+    for k in ["Plan Stage","Architect Stage","Configure and Prototype Stage","Test Stage","Deploy Stage"]:
+        if k in text: out["phases"].append({"name": k.split(" Stage")[0], "order": len(out["phases"])})
+    # functional areas table (line-based heuristic)
+    ws_set = set()
+    for line in text.splitlines():
+        if _has(line,"HCM") or _has(line,"Core HCM"): ws_set.add("HCM")
+        if _has(line,"Payroll"): ws_set.add("Payroll")
+        if _has(line,"Benefits"): ws_set.add("Benefits")
+        if _has(line,"Absence"): ws_set.add("Time & Absence")
+        if _has(line,"Recruiting"): ws_set.add("Recruiting")
+        if _has(line,"Talent"): ws_set.add("Talent")
+        if _has(line,"Advanced Compensation"): ws_set.add("Advanced Compensation")
+        if _has(line,"Time Tracking"): ws_set.add("Time Tracking")
+        if _has(line,"Core Financials") or _has(line,"Financial Accounting"): ws_set.add("Finance")
+        if _has(line,"Grants"): ws_set.add("Grants")
+        if _has(line,"Procurement") or _has(line,"Spend Management"): ws_set.add("Procurement")
+        if _has(line,"Supplier Accounts"): ws_set.add("Supplier Accounts")
+        if _has(line,"Expenses"): ws_set.add("Expenses")
+        if _has(line,"Reporting"): ws_set.add("Reporting/Prism")
+        if _has(line,"Security"): ws_set.add("Security")
+        if _has(line,"Data Conversion"): ws_set.add("Data Conversion")
+        if _has(line,"Integrations"): ws_set.add("Integrations")
+        if _has(line,"Cutover") or _has(line,"Go Live"): ws_set.add("Cutover")
+    out["workstreams"] = [{"name": n, "description": ""} for n in sorted(ws_set)]
+
+    # integrations (scan appendix A table lines)
+    for line in text.splitlines():
+        if "→" in line or "-" in line or "Cloud Connect" in line or "Integration" in line:
+            if any(x in line for x in ["834","TIAA","Tax Filing","Bank","PNC","M&T","Directory","Student","COBRA","ACH","BAI2","RaisersEdge"]):
+                out["integrations"].append(line.strip())
+
+    # roles (Teams & Resources)
+    for role in ["Executive Sponsor","Engagement Manager","Project Manager","Architect","Functional Lead","Testing Manager","Change Manager","Data Conversion Lead","Workday Administrator"]:
+        if role in text:
+            out["roles"].append({"role": role, "name": "", "email": ""})
+
+    return out
+
+@router.post("/sow/ingest")
+async def sow_ingest(org_id: str = Form(...), project_id: str = Form(...), file: UploadFile = File(...)):
+    data = await file.read()
+    text = _txt(data)
+
+    payload = parse_sow(text)
+
+    # 1) store phases as milestones (optional table) or mem entries
+    # 2) create workstreams (up to 30)
+    from .team_api import STEP_KEYS
+    # upsert workstreams
+    ws_items = [{"name": w["name"], "description": w.get("description","")} for w in payload["workstreams"]][:30]
+    try:
+        # prefer REST, then psycopg fallback
+        sb.table("workstreams").update({"is_active": False}).eq("org_id",org_id).eq("project_id",project_id).execute()
+        for i,it in enumerate(ws_items):
+            sb.table("workstreams").insert({
+              "org_id": org_id, "project_id": project_id, "name": it["name"],
+              "description": it["description"], "sort_order": i, "is_active": True
+            }).execute()
+    except Exception:
+        from .db import get_conn
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("update workstreams set is_active=false where org_id=%s and project_id=%s",(org_id,project_id))
+            for i,it in enumerate(ws_items):
+                cur.execute("""insert into workstreams (org_id,project_id,name,description,sort_order,is_active)
+                               values (%s,%s,%s,%s,%s,true)""",
+                               (org_id,project_id,it["name"],it["description"],i))
+
+    # 3) seed roles as contacts (blank emails to be filled later)
+    for r in payload["roles"]:
+        try:
+            sb.table("project_contacts").insert({
+              "org_id": org_id, "project_id": project_id, "name": r["role"], "email": f"{r['role'].replace(' ','').lower()}@todo",
+              "role": r["role"], "workstream": ""
+            }).execute()
+        except Exception: pass
+
+    # 4) stash integrations in mem entries (semantic) for Integrations page seed
+    try:
+        from .db import get_conn
+        with get_conn() as conn, conn.cursor() as cur:
+            for line in payload["integrations"][:50]:
+                cur.execute("""insert into mem_entries (org_id, project_id, type, title, body)
+                               values (%s,%s,'semantic','integration_in_scope',%s)""",
+                              (org_id, project_id, line[:4000]))
+    except Exception: pass
+
+    return {"ok": True, "workstreams": len(ws_items), "roles": len(payload["roles"]), "integrations": len(payload["integrations"])}
+
+
+Mount it:
+
+# /server/main.py
+from .sow_bootstrap import router as sow_router
+app.include_router(sow_router, prefix="")
+
+2) Timeline capture (minimal now)
+
+For the JPG, add a tiny endpoint that accepts rows like:
+{"phase":"Configure & Prototype","start":"2018-11-26","end":"2019-01-20"}
+
+# /server/timeline_api.py
+from fastapi import APIRouter, Body
+from .supabase_client import sb
+
+router = APIRouter()
+
+@router.post("/timeline/set")
+def set_timeline(org_id: str = Body(...), project_id: str = Body(...), rows: list[dict] = Body(...)):
+  # store as mem_entries 'episodic' or a milestones table if you already have one
+  for r in rows:
+    body = f"{r.get('phase')}|{r.get('start')}|{r.get('end')}"
+    try:
+      sb.table("mem_entries").insert({"org_id":org_id,"project_id":project_id,"type":"episodic","title":"timeline_phase","body":body}).execute()
+    except Exception: pass
+  return {"ok": True, "count": len(rows)}
+
+
+(We’ll replace this with OCR later.)
+
+Parser: why it works on your MICA SOW
+
+The MICA file has explicit Stage headings (Plan, Architect, Configure & Prototype, Test, Deploy), huge “Functional Area” lists, and “Interfaces/Integrations” catalog—exactly what we need to bootstrap tiles and cards. 
+
+MICA SOW
+
+Test it now (copy/paste)
+A) Upload the SOW (DOCX) directly to bootstrap
+BASE="http://localhost:5000/api"
+ORG="<ORG_UUID>"
+PROJ="<PROJ_UUID>"
+
+curl -s -X POST "$BASE/sow/ingest" \
+  -F "org_id=$ORG" -F "project_id=$PROJ" \
+  -F "file=@'/home/runner/<path-to>/MICA SOW.docx'"
+
+
+Response should show counts (workstreams, roles, integrations). Refresh the dashboard:
+
+Functional Areas: populated (HCM, Payroll, Finance, etc.)
+
+Integrations & Tech: list starts to show scope items (via semantic memories)
+
+Team: role placeholders added (you’ll fill real names/emails later)
+
+B) Enter timeline rows for the image (quick pass)
+curl -s -X POST "$BASE/timeline/set" -H "Content-Type: application/json" -d @- <<JSON
+{"org_id":"$ORG","project_id":"$PROJ","rows":[
+ {"phase":"Plan","start":"2018-08-08","end":"2018-09-28"},
+ {"phase":"Architect","start":"2018-10-01","end":"2018-11-23"},
+ {"phase":"Configure & Prototype","start":"2018-11-26","end":"2019-01-21"},
+ {"phase":"Test","start":"2019-01-21","end":"2019-05-17"},
+ {"phase":"Deploy","start":"2019-05-20","end":"2019-06-17"}
+]}
+JSON
+
+
+Your Timeline widget can read from mem_entries(title='timeline_phase') to draw bars.
+
+What the dashboard will show after bootstrap
+
+KPI strip: Artifacts = +1 (the SOW), Decisions/Risks = 0 until minutes start coming in
+
+Functional Areas: full grid from SOW (up to 30)
+
+Integrations & Tech: seeded list from appendix (we’ll convert these into structured cards over time)
+
+Team: role placeholders ready; you assign emails + subscriptions on the Team page
+
+Timeline: phases visible after you POST the rows above
+
+Later (when you want)
+
+OCR the JPG to auto-read the phase bars (Tesseract or a hosted Vision API)
+
+Expand parser to pull assumptions as risks and actions (e.g., “Client will provide …”) into the Pending list
+
+Normalize Integrations into structured rows: {name, owner, transport, frequency, status}
+
+If you want, I’ll wire your Timeline widget to read timeline_phase mem entries and render the bars. Or I can tighten the SOW parser to pull more from MICA (e.g., the big “In Scope” matrix) into real tables.

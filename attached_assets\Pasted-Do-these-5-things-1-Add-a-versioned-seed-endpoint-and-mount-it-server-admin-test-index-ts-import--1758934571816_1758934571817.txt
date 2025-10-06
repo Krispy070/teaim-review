@@ -1,0 +1,190 @@
+Do these 5 things
+1) Add a versioned seed endpoint and mount it
+
+server/admin/test/index.ts
+
+import { Router } from "express";
+import { seedMinimal } from "./seedMinimal";
+
+export const testAdminRouter = Router();
+
+testAdminRouter.post("/seed-v2", async (req, res) => {
+  const projectId = req.body?.projectId;
+  if (!projectId) return res.status(400).json({ ok:false, error:"projectId required" });
+  const stamp = new Date().toISOString();
+  console.log("[TEST/SEED v2] start", { projectId, stamp });
+
+  try {
+    const out = await seedMinimal(projectId);
+    const payload = { seeder:"v2", stamp, ...out };
+    console.log("[TEST/SEED v2] done", payload);
+    return res.json(payload);
+  } catch (e:any) {
+    console.error("[TEST/SEED v2] ERROR", e);
+    return res.status(500).json({ seeder:"v2", ok:false, error: e?.message || String(e) });
+  }
+});
+
+
+server/index.ts (or wherever you mount routers)
+
+import { testAdminRouter } from "./admin/test";
+app.use("/admin/test", testAdminRouter);
+console.log("[ROUTES] mounted /admin/test (seed-v2 enabled)");
+
+2) Replace the seeder with a self-verifying one
+
+This avoids .returning() quirks and proves inserts landed by counting rows after insert.
+
+server/admin/test/seedMinimal.ts
+
+import { v4 as uuid } from "uuid";
+import dayjs from "dayjs";
+import { db } from "../../db";
+
+export async function seedMinimal(projectId: string) {
+  const now = dayjs();
+
+  const ids = {
+    areaHcm: uuid(), areaFin: uuid(),
+    wbHcm: uuid(), wbFin: uuid(),
+    rptHcm: uuid(), rptFin: uuid(),
+    change1: uuid(), change2: uuid(),
+    cmt1: uuid(), cmt2: uuid(),
+    rel1: uuid(), notif1: uuid(),
+    sign1: uuid(),
+  };
+
+  // wipe
+  await db.transaction(async (tx:any) => {
+    for (const t of ["notifications","releases","comments","changes","reports","workbooks","areas","signoffs"]) {
+      await tx(t).where({ project_id: projectId }).del().catch(()=>{});
+    }
+  });
+
+  // seed
+  await db.transaction(async (tx:any) => {
+    await tx("areas").insert([
+      { id: ids.areaHcm, project_id: projectId, key:"HCM", name:"HCM", status:"active", created_at: now.toISOString() },
+      { id: ids.areaFin, project_id: projectId, key:"FIN", name:"Financials", status:"active", created_at: now.toISOString() },
+    ]);
+
+    await tx("workbooks").insert([
+      { id: ids.wbHcm, project_id: projectId, area_id: ids.areaHcm, title:"HCM Workbook", created_at: now.toISOString() },
+      { id: ids.wbFin, project_id: projectId, area_id: ids.areaFin, title:"FIN Workbook", created_at: now.toISOString() },
+    ]);
+
+    await tx("reports").insert([
+      { id: ids.rptHcm, project_id: projectId, area_id: ids.areaHcm, type:"wb_export_csv", title:"HCM Export", created_at: now.toISOString() },
+      { id: ids.rptFin, project_id: projectId, area_id: ids.areaFin, type:"wb_export_csv", title:"FIN Export", created_at: now.toISOString() },
+    ]);
+
+    await tx("changes").insert([
+      { id: ids.change1, project_id: projectId, area_id: ids.areaHcm, kind:"update", summary:"HCM mapping adjusted", created_at: now.subtract(1,"day").toISOString() },
+      { id: ids.change2, project_id: projectId, area_id: ids.areaFin, kind:"add",    summary:"GL segment added",    created_at: now.subtract(2,"day").toISOString() },
+    ]);
+
+    await tx("comments").insert([
+      { id: ids.cmt1, project_id: projectId, area_id: ids.areaHcm, body:"Review job catalog.", author:"System", created_at: now.toISOString() },
+      { id: ids.cmt2, project_id: projectId, area_id: ids.areaFin, body:"Need sign-off.",     author:"System", created_at: now.toISOString() },
+    ]);
+
+    await tx("releases").insert([
+      { id: ids.rel1, project_id: projectId, kind:"ics", channel:"staging", tag:"v0.1.0-test", created_at: now.toISOString() },
+    ]);
+
+    await tx("notifications").insert([
+      { id: ids.notif1, project_id: projectId, kind:"digest_ready", seen:false, created_at: now.toISOString() },
+    ]);
+
+    await tx("signoffs").insert([
+      { token: ids.sign1, project_id: projectId, status:"issued", expires_at: now.add(7,"day").toISOString(), created_at: now.toISOString() },
+    ]);
+  });
+
+  // verify
+  const count = async (tbl:string) =>
+    Number((await db(tbl).where({ project_id: projectId }).count<{count:string}>("* as count").first())?.count ?? 0);
+
+  const inserted = {
+    areas: await count("areas"),
+    workbooks: await count("workbooks"),
+    reports: await count("reports"),
+    changes: await count("changes"),
+    comments: await count("comments"),
+    releases: await count("releases"),
+    notifications: await count("notifications"),
+    signoffs: await count("signoffs"),
+  };
+
+  return { ok:true, projectId, inserted };
+}
+
+3) Point the Test Runner button at the new route
+
+ui/pages/AdminTestRunner.tsx (or wherever “Seed & Run” lives)
+
+async function seedAndRun(projectId: string) {
+  const res = await fetch("/admin/test/seed-v2", {
+    method: "POST",
+    headers: { "Content-Type":"application/json" },
+    body: JSON.stringify({ projectId })
+  });
+  const json = await res.json();
+  // Show signature so we KNOW it's v2:
+  console.log("Seed response:", json);
+  setSeedLog(JSON.stringify(json, null, 2)); // displays in that gray panel
+  await runAllTests(projectId); // your existing runner call
+}
+
+
+The log panel should now show seeder:"v2" and numeric counts (not strings). If it doesn’t, you’re still calling the old URL—fix that first.
+
+4) Add a tiny debug endpoint to expose DB target (eliminates “wrong DB” confusion)
+
+server/admin/test/index.ts
+
+testAdminRouter.get("/debug", async (_req, res) => {
+  try {
+    const [{ now }] = await db.raw("select now()");
+    const dbUrl = process.env.DATABASE_URL || "unknown";
+    const [{ cnt }] = await db("areas").count<{cnt:string}>("* as cnt");
+    res.json({ ok:true, dbUrl, serverTime: now, areasTotal: Number(cnt) });
+  } catch (e:any) {
+    res.status(500).json({ ok:false, error: e?.message || String(e) });
+  }
+});
+
+
+Hit /admin/test/debug in the browser; confirm it’s the DB you expect.
+
+5) One-line browser smoke to bypass UI
+
+Open DevTools → Console:
+
+await fetch("/admin/test/seed-v2",{
+  method:"POST",
+  headers:{"Content-Type":"application/json"},
+  body:JSON.stringify({ projectId: "e1ec6ad0-a4e8-45dd-87b0-e123776ffe6e" })
+}).then(r=>r.json())
+
+
+Expect:
+
+{ "seeder":"v2", "ok":true, "inserted": { "areas":2, "workbooks":2, "reports":2, "changes":2, "comments":2, "releases":1, "notifications":1, "signoffs":1 }, "projectId":"..." }
+
+
+If that returns good counts but the Runner still shows zeros → the Runner panel is reading an old response variable. Update it to use setSeedLog(json) from step 3.
+
+If it’s still stubborn after this
+
+Search for multiple seed endpoints and kill the zombie:
+
+grep -R "admin/test/seed" -n
+grep -R "seedSample" -n
+grep -R "inserted.*workbooks" -n
+
+
+Print the projectId right next to the button and in the server log to ensure they match.
+
+Print process.env.DATABASE_URL at server boot to confirm environment.

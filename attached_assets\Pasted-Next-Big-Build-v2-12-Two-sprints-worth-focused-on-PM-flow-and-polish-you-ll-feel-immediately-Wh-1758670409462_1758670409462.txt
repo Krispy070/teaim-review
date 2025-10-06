@@ -1,0 +1,305 @@
+Next Big Build v2.12. Two sprints’ worth, focused on PM flow and polish you’ll feel immediately.
+
+What lands now (copy-paste ready, Brand v2–aware, dev-safe):
+
+Request Sign-Off v3.1 — searchable, multi-select, custom message, CC and “CC all leads”; signer flags respected
+
+Stage Editor date v2 — ↑/↓ ±1, ⇧ ±7, ⌃/Ctrl ±30 and duration-preserving sync (both directions) with per-field undo + save toast
+
+Digest deep links — “Changes” and “Closed since last week” link to exact rows via anchors; Actions List + Audit Timeline auto-scroll/focus to anchors
+
+Wellness admin — “last 7 / 30 days” toggle + top responders trend (delta vs prior period), per-user modal sparkline & export (from 2.11)
+
+v2.12.1 — Request Sign-Off v3.1 + Stage Editor date v2
+1) Request Sign-Off v3.1 (batch, CC all leads, custom message)
+1A) Backend — add batch endpoint with cc_all_leads
+
+server/routers/stages_request_sign.py (extend your existing file)
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+from typing import List, Optional
+from datetime import datetime, timezone, timedelta
+import secrets, os
+
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase, get_service_supabase
+from ..routers.signoff_docs_gen import DraftReq
+
+router = APIRouter(prefix="/api/stages", tags=["stages"])
+PM_PLUS = require_role({"owner","admin","pm"})
+
+class RequestBatch(BaseModel):
+    stage_id: str
+    emails: List[str] = Field(min_items=1)
+    cc: Optional[List[str]] = None
+    cc_all_leads: bool = False
+    title: Optional[str] = "Stage Sign-Off"
+    area: Optional[str] = None
+    message: Optional[str] = None
+    expires_hours: int = 120
+
+@router.post("/request_signoff_batch")
+def request_signoff_batch(body: RequestBatch, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx); sbs = get_service_supabase()
+
+    # find or create doc for stage
+    docq = sbs.table("signoff_docs").select("id,status")\
+             .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+             .eq("stage_id", body.stage_id).limit(1).execute().data
+    if not docq:
+        draft = DraftReq(stage_id=body.stage_id, area=body.area, title=body.title or "Stage Sign-Off",
+                         summary=body.message or "Please review and acknowledge completion of this stage.",
+                         bullets=[], acceptance="I acknowledge and approve the above.", footer="Signed electronically via TEAIM")
+        from ..routers.signoff_docs_gen import generate_from_prompt
+        _ = generate_from_prompt(draft, project_id, ctx)
+        docq = sbs.table("signoff_docs").select("id,status")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+               .eq("stage_id", body.stage_id).limit(1).execute().data
+        if not docq: raise HTTPException(500, "Failed to create sign-off draft")
+    doc_id = docq[0]["id"]
+
+    # derive CC all leads (optional)
+    cc_list = set([e.strip() for e in (body.cc or []) if e.strip()])
+    if body.cc_all_leads:
+        try:
+            m = sb.table("project_members").select("user_id,role")\
+                .eq("org_id", ctx.org_id).eq("project_id", project_id).execute().data or []
+            leads = [x["user_id"] for x in m if (x.get("role") or "").lower()=="lead"]
+            prof = sb.table("users_profile").select("user_id,email").in_("user_id", leads).execute().data or []
+            for p in prof:
+                if p.get("email"): cc_list.add(p["email"])
+        except Exception: ...
+
+    # send token emails (reuse single endpoint for guards/audit)
+    from ..routers.signoff_docs import request_sign as _req
+    sent=[]
+    for email in body.emails:
+        _ = _req(type("B", (), {"doc_id": doc_id, "email_to": email, "expires_hours": body.expires_hours})(), project_id, ctx)
+        sent.append(email)
+
+    # optional FYI to CC leads
+    if cc_list:
+        try:
+            from ..email.util import mailgun_send_html, send_guard
+            ok, _ = send_guard(sb, ctx.org_id, project_id, "signoff_cc", ",".join(sorted(cc_list)))
+            if ok:
+                base = os.getenv("APP_BASE_URL","").rstrip("/")
+                link = f"{base}/projects/{project_id}/signoff/docs"
+                mailgun_send_html(list(cc_list), f"[FYI] Sign-off requested: {body.title}",
+                                  f"<p>A sign-off was requested for <b>{body.title}</b>.</p><p><a href='{link}'>View in TEAIM</a></p>")
+        except Exception: ...
+
+    try:
+        sbs.table("audit_events").insert({
+            "org_id": ctx.org_id, "project_id": project_id, "actor_id": ctx.user_id,
+            "kind": "stage.request_signoff",
+            "details": {"stage_id": body.stage_id, "emails": body.emails, "cc": sorted(list(cc_list)), "title": body.title}
+        }).execute()
+    except Exception: ...
+    return {"ok": True, "sent": sent, "cc": sorted(list(cc_list))}
+
+
+(Mount exists; dev-safe guards remain.)
+
+1B) Frontend — Modal v3.1: add CC all leads toggle
+
+client/src/components/SignoffRequestModal.tsx (tweak v3 you already added)
+
+const [ccAllLeads,setCcAllLeads]=useState(false);
+// …
+<div className="grid md:grid-cols-2 gap-2">
+  <input className="border rounded p-2 text-sm" placeholder="CC (comma-separated)" value={cc} onChange={e=>setCc(e.target.value)} />
+  <label className="flex items-center gap-2 text-xs">
+    <input type="checkbox" checked={ccAllLeads} onChange={e=>setCcAllLeads(e.target.checked)} /> CC all leads
+  </label>
+</div>
+// …
+await fetch(`/api/stages/request_signoff_batch?project_id=${projectId}`, {
+  method:"POST", credentials:"include", headers:{'Content-Type':'application/json'},
+  body: JSON.stringify({ stage_id: stageId, emails: picked, cc: ccList, cc_all_leads: ccAllLeads, title: stageTitle, area: stageArea, message: msg })
+});
+
+2) Stage Editor date v2 — duration-preserving sync both directions, undo, toast
+
+You implemented “start → shift end to preserve duration” in v2.11. This adds the reverse: hold Alt/Option while editing end date to preserve duration backwards (i.e., shift start instead).
+
+Patch client/src/pages/Stages.tsx date inputs for end_date:
+
+onKeyDown={(e)=>{
+  const step = e.shiftKey ? 7 : (e.ctrlKey||e.metaKey) ? 30 : 1;
+  const keepDurationBackwards = e.altKey; // NEW: hold Alt to preserve duration by shifting start
+  if (e.key==="ArrowUp" || e.key==="ArrowDown"){
+    e.preventDefault();
+    const sign = e.key==="ArrowUp" ? 1 : -1;
+    const v = adjustDate((e.currentTarget as HTMLInputElement).value || s.end_date || iso(new Date()), sign*step);
+
+    const oldSpan = diffDays(s.start_date, s.end_date);
+    if (keepDurationBackwards && oldSpan!=null && s.start_date){
+      // shift start by same delta
+      const delta = diffDays(s.end_date, v) || 0; // how much we moved end
+      const newStart = shiftDate(s.start_date, delta);
+      markDirty(s.id); pushUndo(s.id, { start_date: s.start_date, end_date: s.end_date });
+      saveDebounced(s.id,{ end_date: v, start_date: newStart });
+      toast({ title:"Duration preserved", description:`Shifted start by ${delta>0? "+"+delta: delta} day(s)` });
+    } else {
+      // normal: end cannot be before start
+      if (s.start_date && diffDays(s.start_date, v)! < 0){
+        (e.currentTarget as HTMLInputElement).value = s.start_date; // clamp
+        markDirty(s.id); pushUndo(s.id, { end_date: s.end_date });
+        saveDebounced(s.id,{ end_date: s.start_date });
+      } else {
+        (e.currentTarget as HTMLInputElement).value = v;
+        markDirty(s.id); pushUndo(s.id, { end_date: s.end_date });
+        saveDebounced(s.id,{ end_date: v });
+      }
+    }
+  }
+  if (e.key==="Enter"){ e.preventDefault(); saveField(s.id,{end_date:(e.currentTarget as HTMLInputElement).value}); }
+  if (e.key==="Escape"){ e.preventDefault();
+    const prev = popUndo(s.id); if (prev && prev.end_date){
+      (e.currentTarget as HTMLInputElement).value = prev.end_date; setDirty(d=>({...d,[s.id]:false}));
+    }
+  }
+}}
+
+
+Summary:
+• Start change → shifts End by same delta (preserve duration forward)
+• End change + Alt → shifts Start by same delta (preserve duration backward)
+• Undo (Esc) per-field, toast on preserved-duration
+
+v2.12.2 — Digest links to anchors + Wellness admin trend
+3) Deep-linked anchors (Actions List + Audit Timeline)
+3A) Actions List — scroll to #id= and highlight
+
+client/src/pages/ActionsList.tsx (or wherever you render actions list)
+
+At the top:
+
+import { useEffect } from "react";
+import { useLocation } from "react-router-dom";
+const loc = useLocation();
+useEffect(()=>{
+  const id = new URLSearchParams(loc.hash.replace(/^#/, "")).get("id") || (loc.hash.startsWith("#id=") ? loc.hash.slice(4) : "");
+  if (!id) return;
+  const el = document.querySelector(`[data-action-id="${id}"]`) as HTMLElement|null;
+  if (el){ el.scrollIntoView({behavior:"smooth",block:"center"}); el.classList.add("pulse-once"); setTimeout(()=>el.classList.remove("pulse-once"), 1500); }
+},[loc.key]);
+
+
+In each action row wrapper, add:
+
+<div data-action-id={action.id} /* existing classes */>
+  {/* row content */}
+</div>
+
+3B) Audit Timeline — same idea
+
+client/src/pages/AdminAuditTimeline.tsx (or similar)
+
+import { useEffect } from "react";
+import { useLocation } from "react-router-dom";
+const loc = useLocation();
+useEffect(()=>{
+  const id = new URLSearchParams(loc.hash.replace(/^#/, "")).get("id") || (loc.hash.startsWith("#id=") ? loc.hash.slice(4) : "");
+  if (!id) return;
+  const el = document.querySelector(`[data-audit-id="${id}"]`) as HTMLElement|null;
+  if (el){ el.scrollIntoView({behavior:"smooth",block:"center"}); el.classList.add("pulse-once"); setTimeout(()=>el.classList.remove("pulse-once"), 1500); }
+},[loc.key]);
+
+
+And set an attribute on the rendered rows:
+
+<div data-audit-id={evt.id} /* row classes */>…</div>
+
+4) Wellness admin — 7/30-day toggle + responders trend
+4A) Backend — accept days and compute trend
+
+Patch server/routers/wellness_rollup.py:
+
+@router.get("/rollup")
+def rollup(project_id: str = Query(...), user_id: str | None = None, days: int = 30,
+           ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    days = 7 if days and int(days)==7 else 30
+    # rest same, but window size uses `days`
+    # start = end - timedelta(days=days-1)
+
+
+Add trend to top responders:
+
+@router.get("/top_responders")
+def top_responders(project_id: str = Query(...), days: int = 30,
+                   ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    sb = get_user_supabase(ctx)
+    from datetime import datetime, timedelta, timezone
+    days = 7 if days and int(days)==7 else 30
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days-1)
+    prev_start = start - timedelta(days=days)
+    prev_end = start - timedelta(days=1)
+
+    rows = sb.table("team_wellness").select("user_id,created_at")\
+             .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+             .gte("created_at", start.isoformat()).execute().data or []
+    prev_rows = sb.table("team_wellness").select("user_id,created_at")\
+                .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+                .gte("created_at", prev_start.isoformat()).lte("created_at", prev_end.isoformat()).execute().data or []
+
+    cur = {}; prev={}
+    for r in rows: cur[r["user_id"]] = cur.get(r["user_id"],0) + 1
+    for r in prev_rows: prev[r["user_id"]] = prev.get(r["user_id"],0) + 1
+
+    items = []
+    for u,c in cur.items():
+        items.append({"user_id": u, "checkins": c, "delta": c - (prev.get(u,0))})
+    items.sort(key=lambda x: ( -x["checkins"], -x["delta"] ))
+    return {"items": items[:10]}
+
+4B) Frontend — toggle and trend display
+
+Patch client/src/components/AdminWellness.tsx:
+
+Add at top:
+
+const [range,setRange]=useState<7|30>(30);
+
+
+Use range in loaders:
+
+const d = await getJSON(`/api/wellness/rollup?project_id=${projectId}&days=${range}${selected?`&user_id=${encodeURIComponent(selected)}`:""}`);
+const t = await getJSON(`/api/wellness/top_responders?project_id=${projectId}&days=${range}`);
+
+
+Toggle UI near title:
+
+<div className="flex items-center gap-2">
+  <button className={`brand-btn text-xs ${range===7?'pulse-once':''}`} onClick={()=>setRange(7)}>Last 7d</button>
+  <button className={`brand-btn text-xs ${range===30?'pulse-once':''}`} onClick={()=>setRange(30)}>Last 30d</button>
+  <button className="brand-btn text-xs" onClick={()=>downloadGET(`/api/wellness/export.csv?project_id=${projectId}`, "wellness.csv")}>Export CSV</button>
+</div>
+
+
+Show trend in list:
+
+{(top||[]).map(t=>{
+  const em = (members.find(m=>m.user_id===t.user_id)?.email) || t.user_id;
+  const delta = t.delta ?? 0; const cls = delta>0 ? "text-[var(--brand-good)]" : delta<0 ? "text-red-400" : "text-muted-foreground";
+  return (
+    <div key={t.user_id} className="text-xs flex justify-between">
+      <button className="underline" onClick={()=>setUserModal({user_id:t.user_id, email:em})}>{em}</button>
+      <span>{t.checkins} <span className={cls}>{delta>0?`(+${delta})`: delta<0?`(${delta})`:"(+0)"}</span></span>
+    </div>
+  );
+})}
+
+5) 90-second validation
+
+Request Sign-Off modal shows search + multi-select + CC all leads; sends batch emails
+
+Stage Editor: Alt+Arrow on end date preserves duration backwards (start shifts), Enter saves, Esc undoes
+
+Digest “Changes” & “Closed” sections link to exact list rows; Actions List & Audit Timeline auto-scroll & glow
+
+Wellness Admin: Last 7/30 toggle; Top responders show trend deltas; per-user modal sparkline + CSV

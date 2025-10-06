@@ -1,0 +1,60 @@
+Good catch. That neon green glow on “Seed & Run” screams game UI, not $10k/yr SaaS. Let’s swap it for a crisp, accessible hover/focus treatment.
+
+Quick patch (drop-in CSS)
+/* BUTTON BASE */
+.k-btn{
+  display:inline-flex; align-items:center; gap:.6ch;
+  padding:.55rem .9rem; border-radius:12px;
+  border:1px solid var(--ui-border);
+  background: var(--ui-panel-2);
+  color: var(--text-strong);
+  box-shadow: none;                     /* kill any residual glows */
+  transition: background .12s ease, border-color .12s ease, transform .06s ease;
+}
+.k-btn:hover{ background:#1B1E28; border-color:#3A3E4E; }
+.k-btn:active{ transform: translateY(1px); }
+
+/* PRIMARY (orange) */
+.k-btn--primary{
+  background: var(--brand-orange);
+  border-color:#C65115;
+  color:#0B0B0D;
+  box-shadow: none;                     /* remove glow */
+}
+
+/* FOCUS: subtle, accessible, brand-consistent */
+.k-btn:focus-visible{
+  outline: 2px solid var(--focus);      /* we already set --focus to gold */
+  outline-offset: 2px;
+  box-shadow: none;                     /* no halo */
+}
+
+/* DISABLED + LOADING */
+.k-btn[aria-busy="true"], .k-btn:disabled{
+  opacity:.65; cursor:not-allowed; filter:none; box-shadow:none;
+}
+
+/* OPTIONAL: remove any legacy “glow” utility someone added */
+.k-btn.glow, .k-btn--primary.glow{ box-shadow:none !important; filter:none !important; }
+
+
+If you’re using Tailwind classes somewhere like shadow-[0_0_30px_#00ff88] or drop-shadow-*, delete them.
+
+For inline styles (just in case it’s hard-coded on that button):
+
+<button
+  className="k-btn k-btn--primary"
+  style={{ boxShadow: "none", filter: "none" }}
+>
+  Seed & Run
+</button>
+
+Why this feels better
+
+No glow = less noise; your orange primary already commands attention.
+
+Focus-visible outline keeps keyboard accessibility without flashy effects.
+
+Micro-press (translateY(1px)) gives tactile feedback without gimmicks.
+
+Want me to scan your button component to remove any stray drop-shadow, filter: blur(), or box-shadow utilities and hand you a tiny diff?

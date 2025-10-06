@@ -1,0 +1,194 @@
+✅ Drop-in Seeder File
+
+server/admin/test/seedMinimal.ts
+
+// server/admin/test/seedMinimal.ts
+// Drop-in minimal dataset seeder so the /admin/test runner flips to green.
+// Works with knex/pg. If you use Prisma, swap .insert/delete for createMany/deleteMany.
+
+import { v4 as uuid } from "uuid";
+import dayjs from "dayjs";
+import { db } from "../../db"; // adjust path to your db client
+
+export async function seedMinimal(projectId: string) {
+  const now = dayjs();
+
+  const ids = {
+    hcmArea: uuid(),
+    finArea: uuid(),
+    hcmWb: uuid(),
+    finWb: uuid(),
+    rptHcm: uuid(),
+    rptFin: uuid(),
+    change1: uuid(),
+    change2: uuid(),
+    comment1: uuid(),
+    comment2: uuid(),
+    release1: uuid(),
+    notif1: uuid(),
+    signoffValid: uuid(),
+  };
+
+  await db.transaction(async (tx: any) => {
+    // cleanup
+    for (const t of [
+      "notifications",
+      "releases",
+      "comments",
+      "changes",
+      "reports",
+      "workbooks",
+      "areas",
+      "signoffs",
+    ]) {
+      await tx(t).where({ project_id: projectId }).del();
+    }
+
+    // areas
+    await tx("areas").insert([
+      { id: ids.hcmArea, project_id: projectId, key: "HCM", name: "HCM", status: "active", created_at: now.toISOString() },
+      { id: ids.finArea, project_id: projectId, key: "FIN", name: "Financials", status: "active", created_at: now.toISOString() },
+    ]);
+
+    // workbooks
+    await tx("workbooks").insert([
+      { id: ids.hcmWb, project_id: projectId, area_id: ids.hcmArea, title: "HCM Workbook", metrics: { items: 10, open: 3, closed: 7 } },
+      { id: ids.finWb, project_id: projectId, area_id: ids.finArea, title: "FIN Workbook", metrics: { items: 8, open: 2, closed: 6 } },
+    ]);
+
+    // reports
+    await tx("reports").insert([
+      { id: ids.rptHcm, project_id: projectId, area_id: ids.hcmArea, type: "wb_export_csv", title: "HCM Export", payload: { rows: 10 } },
+      { id: ids.rptFin, project_id: projectId, area_id: ids.finArea, type: "wb_export_csv", title: "FIN Export", payload: { rows: 8 } },
+    ]);
+
+    // changes
+    await tx("changes").insert([
+      { id: ids.change1, project_id: projectId, area_id: ids.hcmArea, kind: "update", summary: "HCM field mapping adjusted", created_at: now.toISOString() },
+      { id: ids.change2, project_id: projectId, area_id: ids.finArea, kind: "add", summary: "New GL segment added", created_at: now.toISOString() },
+    ]);
+
+    // comments
+    await tx("comments").insert([
+      { id: ids.comment1, project_id: projectId, area_id: ids.hcmArea, body: "Review job catalog changes.", author: "System", created_at: now.toISOString() },
+      { id: ids.comment2, project_id: projectId, area_id: ids.finArea, body: "Finance needs sign-off.", author: "System", created_at: now.toISOString() },
+    ]);
+
+    // releases
+    await tx("releases").insert([
+      { id: ids.release1, project_id: projectId, kind: "ics", channel: "staging", tag: "v0.1.0-test", created_at: now.toISOString() },
+    ]);
+
+    // notifications
+    await tx("notifications").insert([
+      { id: ids.notif1, project_id: projectId, kind: "digest_ready", seen: false, payload: { areas: ["HCM","FIN"] }, created_at: now.toISOString() },
+    ]);
+
+    // signoff
+    await tx("signoffs").insert([
+      { token: ids.signoffValid, project_id: projectId, status: "issued", expires_at: now.add(7, "day").toISOString(), created_at: now.toISOString() },
+    ]);
+  });
+
+  return { ok: true, inserted: "✓ seedMinimal populated test dataset" };
+}
+
+
+👉 Wire this in your test runner endpoint (/admin/test/seed).
+After Seed & Run, you should flip 7/8 greens (last one stays red because it’s intentionally testing invalid token).
+
+🎨 Header Redesign (Enterprise $10k/yr Look)
+
+ui/components/HeaderBar.tsx
+
+import React from "react";
+
+type Logo = { src?: string; alt: string; href?: string };
+type Env = "DEV" | "STAGE" | "PROD";
+
+export function HeaderBar({
+  teaim,
+  customer,
+  implementor,
+  tagline,
+  projectName,
+  env = "DEV",
+}: {
+  teaim: Logo;
+  customer: Logo;
+  implementor?: Logo;
+  tagline?: string;
+  projectName?: string;
+  env?: Env;
+}) {
+  return (
+    <header className="sticky top-0 z-50 w-full border-b border-[var(--ui-border)] bg-[var(--ui-surface)]/95 backdrop-blur">
+      <div className="mx-auto flex h-16 max-w-[1320px] items-center justify-between gap-4 px-4">
+        {/* Left: TEAIM brand */}
+        <a href={teaim.href || "#"} className="flex items-center gap-2 shrink-0">
+          {teaim.src ? (
+            <img src={teaim.src} alt={teaim.alt} className="h-7 w-auto" />
+          ) : (
+            <span className="text-lg font-semibold text-[var(--ui-text-strong)]">TEAIM</span>
+          )}
+        </a>
+
+        {/* Center: Customer logo + tagline */}
+        <div className="flex flex-col items-center min-w-0 mx-auto">
+          {customer?.src ? (
+            <img
+              src={customer.src}
+              alt={customer.alt}
+              className="h-8 max-w-[240px] object-contain"
+            />
+          ) : (
+            <span className="truncate text-sm text-[var(--ui-text-muted)]">{customer.alt}</span>
+          )}
+          {tagline && (
+            <span className="mt-1 text-[11px] text-[var(--ui-text-muted)] truncate">{tagline}</span>
+          )}
+        </div>
+
+        {/* Right: Implementor + ENV + user controls */}
+        <div className="flex items-center gap-3">
+          {implementor?.src && (
+            <img src={implementor.src} alt={implementor.alt} className="h-6 w-auto opacity-80" />
+          )}
+          <span
+            className={`rounded-lg border px-2 py-0.5 text-[11px] font-medium ${
+              env === "PROD"
+                ? "bg-green-500/20 text-green-300 border-green-600/50"
+                : env === "STAGE"
+                ? "bg-amber-500/20 text-amber-300 border-amber-600/50"
+                : "bg-sky-500/20 text-sky-300 border-sky-600/50"
+            }`}
+          >
+            {env}
+          </span>
+          <button className="grid h-7 w-7 place-items-center rounded-full border border-[var(--ui-border)] text-[var(--ui-text)] hover:bg-[var(--ui-hover)]">
+            🔔
+          </button>
+          <div className="h-7 w-7 rounded-full bg-[var(--ui-neutral-700)]" />
+        </div>
+      </div>
+    </header>
+  );
+}
+
+
+Theme tokens (adapt to your new scheme):
+
+:root {
+  --ui-surface: #0B0B10;
+  --ui-text: #E8E9F1;
+  --ui-text-strong: #FFFFFF;
+  --ui-text-muted: #A9ACB8;
+  --ui-border: #2B2E3A;
+  --ui-hover: rgba(255,255,255,0.06);
+  --ui-neutral-700: #3A3D4A;
+
+  /* Brand overrides for your new palette */
+  --brand-primary: #7A4BFF;  /* swap in your purple */
+  --brand-accent: #25FFD2;   /* neon highlight */
+  --brand-warn: #FFB020;
+}

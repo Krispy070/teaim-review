@@ -1,0 +1,371 @@
+Kap here — I read the Replit log. You’ve got the composer/bell/tick wired, but a few shims are still missing (documents list + auth-safe downloads), and we’re ready to stack the next big build. I’ll do both right now:
+
+Finish: auth-safe GET/POST downloads, Documents list endpoint, wire NotificationBell & Composer route
+
+Next build: Sign-Off ZIP POST download, Project Analytics mini-dashboard, Action Due-Date + SLA reminders, CSV GET download with dev headers
+
+Everything is paste-ready.
+
+A) Finish wiring the current build
+A1) Auth-safe download helpers (GET + POST)
+
+client/src/lib/download.ts (replace file)
+
+import { supabase } from "@/lib/supabase";
+
+const DEV = import.meta.env.VITE_DEV_AUTH === "1";
+
+function devOverride() {
+  try { const o = JSON.parse(localStorage.getItem("kap.devAuth") || "null"); return o && o.dev ? o : null; }
+  catch { return null; }
+}
+
+async function authHeaders() {
+  const override = devOverride();
+  if (DEV || override) {
+    return {
+      "X-Dev-User":  override?.user || (import.meta.env.VITE_DEV_USER || ""),
+      "X-Dev-Org":   override?.org  || (import.meta.env.VITE_DEV_ORG  || ""),
+      "X-Dev-Role":  override?.role || (import.meta.env.VITE_DEV_ROLE || "admin")
+    } as Record<string,string>;
+  }
+  const { data } = await supabase.auth.getSession();
+  const token = data.session?.access_token;
+  if (!token) throw new Error("Not authenticated");
+  return { Authorization: `Bearer ${token}` };
+}
+
+export async function downloadGET(url: string, filename: string) {
+  const headers = await authHeaders();
+  const res = await fetch(url, { headers, credentials: "include" });
+  if (!res.ok) throw new Error(await res.text());
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a); a.click(); URL.revokeObjectURL(a.href); a.remove();
+}
+
+export async function downloadPOST(url: string, body: any, filename: string) {
+  const headers = { ...(await authHeaders()), "Content-Type": "application/json" };
+  const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), credentials: "include" });
+  if (!res.ok) throw new Error(await res.text());
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a); a.click(); URL.revokeObjectURL(a.href); a.remove();
+}
+
+Replace plain <a href="/api/..."> CSV links with JS download
+
+Example (Actions/Risks/Decisions export buttons):
+
+import { downloadGET } from "@/lib/download";
+
+<button className="px-3 py-2 border rounded" onClick={() => downloadGET(`/api/export/actions.csv?project_id=${projectId}`, "actions.csv")}>
+  Export Actions CSV
+</button>
+<button className="px-3 py-2 border rounded" onClick={() => downloadGET(`/api/export/risks.csv?project_id=${projectId}`, "risks.csv")}>
+  Export Risks CSV
+</button>
+<button className="px-3 py-2 border rounded" onClick={() => downloadGET(`/api/export/decisions.csv?project_id=${projectId}`, "decisions.csv")}>
+  Export Decisions CSV
+</button>
+
+
+This fixes the dev-auth 401s the tester saw.
+
+A2) Documents list shim (used by SignoffComposer)
+
+server/routers/documents_list.py
+
+from fastapi import APIRouter, Depends, Query
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/documents", tags=["documents"])
+
+@router.get("/list")
+def list_docs(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    rows = sb.table("artifacts").select("id,name,created_at")\
+            .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+            .order("created_at", desc=True).limit(500).execute().data or []
+    return {"items": rows}
+
+
+Mount in server/main.py:
+
+from .routers import documents_list
+app.include_router(documents_list.router)
+
+A3) Wire NotificationBell & SignoffComposer route
+
+Add NotificationBell into your authenticated topbar (where your user menu lives):
+
+import NotificationBell from "@/components/NotificationBell";
+
+<div className="flex items-center gap-3">
+  {/* ...existing topbar items... */}
+  <NotificationBell />
+</div>
+
+
+Add SignoffComposer route (and a sidebar link under “Sign-Off” or “Admin”):
+
+{ path: "/projects/:projectId/signoff/compose", element: <SignoffComposer/> }
+
+
+Done — your current build is fully wired.
+
+B) Next Big Build (paste-ready)
+B1) Sign-Off ZIP button (real POST download)
+
+In SignoffComposer replace the placeholder with:
+
+import { downloadPOST } from "@/lib/download";
+
+async function downloadZip(){
+  const body = {
+    stage_title: stageTitle,
+    artifact_ids: arts.filter(a=>chk[a.id]).map(a=>a.id),
+    include_actions: actions, include_risks: risks, include_decisions: decisions,
+    message
+  };
+  await downloadPOST(`/api/signoff/package/zip?project_id=${projectId}`, body,
+    `signoff_${stageTitle.replace(/\s+/g,'_')}.zip`);
+}
+...
+<button className="px-3 py-2 border rounded" onClick={downloadZip}>Download ZIP</button>
+
+B2) Project Analytics mini-dashboard
+Backend: summary + burn-up
+
+server/routers/analytics.py
+
+from fastapi import APIRouter, Depends, Query
+from datetime import datetime, timedelta, timezone
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/analytics", tags=["analytics"])
+
+@router.get("/summary")
+def summary(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    def cnt(table): 
+        try:
+            r = sb.table(table).select("id", count="exact")\
+                 .eq("org_id", ctx.org_id).eq("project_id", project_id).execute()
+            return r.count or 0
+        except Exception:
+            return 0
+    return {
+        "actions": cnt("actions"),
+        "risks": cnt("risks"),
+        "decisions": cnt("decisions"),
+        "docs": cnt("artifacts"),
+        "stages_in_review": sb.table("project_stages").select("id", count="exact")
+                             .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("status","in_review").execute().count or 0
+    }
+
+@router.get("/burnup")
+def burnup(project_id: str = Query(...), days: int = 35, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    def daily(table):
+        try:
+            rows = sb.table(table).select("created_at").eq("org_id", ctx.org_id).eq("project_id", project_id)\
+                    .gte("created_at", start.isoformat()).lte("created_at", end.isoformat()).execute().data or []
+        except Exception:
+            rows = []
+        buckets = {}
+        for r in rows:
+            d = (r["created_at"] or "")[:10]
+            buckets[d] = buckets.get(d,0)+1
+        out=[]; cur=0
+        for i in range(days+1):
+            day = (start + timedelta(days=i)).date().isoformat()
+            cur += buckets.get(day,0)
+            out.append({"date": day, "count": cur})
+        return out
+    return {
+        "actions": daily("actions"),
+        "docs": daily("artifacts")
+    }
+
+
+Mount:
+
+from .routers import analytics
+app.include_router(analytics.router)
+
+Frontend widget
+
+client/src/components/AnalyticsCards.tsx
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
+
+export default function AnalyticsCards(){
+  const { projectId } = useParams();
+  const [sum,setSum] = useState<any>(null);
+  const [burn,setBurn] = useState<any>(null);
+
+  useEffect(()=>{ (async ()=>{
+    const s = await fetch(`/api/analytics/summary?project_id=${projectId}`, { credentials:"include" }).then(r=>r.ok?r.json():null);
+    const b = await fetch(`/api/analytics/burnup?project_id=${projectId}`, { credentials:"include" }).then(r=>r.ok?r.json():null);
+    setSum(s); setBurn(b);
+  })(); },[projectId]);
+
+  if (!sum) return null;
+
+  return (
+    <div className="grid md:grid-cols-3 gap-3">
+      {[
+        ["Docs", sum.docs], ["Actions", sum.actions], ["Risks", sum.risks],
+        ["Decisions", sum.decisions], ["Stages in Review", sum.stages_in_review]
+      ].map(([t,v]:any)=>(
+        <div key={t} className="border rounded p-3">
+          <div className="text-sm text-muted-foreground">{t}</div>
+          <div className="text-xl font-semibold">{v}</div>
+        </div>
+      ))}
+      {burn && (
+        <div className="md:col-span-3 border rounded p-3">
+          <div className="text-sm text-muted-foreground mb-2">Burn-up (last 5 weeks)</div>
+          <div style={{width:"100%", height:220}}>
+            <ResponsiveContainer>
+              <LineChart data={burn.actions}>
+                <XAxis dataKey="date" hide />
+                <YAxis allowDecimals={false}/>
+                <Tooltip />
+                <Line type="monotone" dataKey="count" />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+Drop it onto your Project Dashboard (below the header chips).
+
+B3) Actions Due-Date + SLA reminders
+SQL (optional but recommended)
+alter table public.actions add column if not exists due_date date;
+create index if not exists idx_actions_due on public.actions(project_id, due_date);
+select pg_notify('pgrst','reload schema');
+
+Backend: set due-date + reminder tick
+
+server/routers/actions_due.py
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from datetime import date
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/actions", tags=["actions"])
+PM_PLUS = require_role({"owner","admin","pm","lead"})
+
+class DueBody(BaseModel):
+    due_date: date | None
+
+@router.post("/set-due")
+def set_due(action_id: str, body: DueBody, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    sb.table("actions").update({"due_date": body.due_date})\
+      .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", action_id).execute()
+    return {"ok": True}
+
+
+Mount:
+
+from .routers import actions_due
+app.include_router(actions_due.router)
+
+
+Scheduler reminder tick (in server/scheduler.py):
+
+async def reminders_tick(app):
+    sb = get_service_supabase()
+    while True:
+        try:
+            now = dt.datetime.now(dt.timezone.utc).date()
+            rows = sb.table("actions").select("id,org_id,project_id,title,owner,due_date,status")\
+                   .neq("status","done").not_.is_("due_date", "null").lte("due_date", now.isoformat()).execute().data or []
+            for a in rows:
+                org = a["org_id"]; proj = a["project_id"]
+                # resolve owner email if you store it (users_profile/contacts); else fallback to DIGEST_TEST_EMAIL
+                email = os.getenv("DIGEST_TEST_EMAIL")
+                if not email: continue
+                # Guard quiet hours / caps via existing helpers
+                from .routers.digest import _get_local_now
+                from .email.util import send_guard, mailgun_send_html, log_send
+                user_sb = get_user_supabase(type("C",(object,),{"org_id":org,"jwt":None})())  # quick ctx mimic for guard/log
+                ok, reason = send_guard(user_sb, org, proj, "reminder", email)
+                if not ok: continue
+                html = f"<p>Action Overdue: <b>{a['title']}</b> (due {a['due_date']})</p>"
+                mailgun_send_html(email, "TEAIM Reminder: Action Overdue", html)
+                log_send(user_sb, org, proj, "reminder", email)
+                # audit
+                sb.table("audit_events").insert({
+                    "org_id": org, "project_id": proj, "actor_id": None,
+                    "kind": "reminder.sent", "details": {"action_id": a["id"], "email": email}
+                }).execute()
+        except Exception:
+            pass
+        await asyncio.sleep(int(os.getenv("REMINDERS_TICK_SEC","600")))  # every 10m
+
+
+Start it:
+
+from .scheduler import reminders_tick
+@app.on_event("startup")
+async def _start_reminders_tick():
+    asyncio.create_task(reminders_tick(app))
+
+Frontend: add due date to Actions Kanban cards
+
+In ActionsKanban.tsx card render:
+
+function DueEditor({ id, projectId, due }:{ id:string; projectId:string; due?:string }){
+  const [val,setVal] = useState<string>(due || "");
+  async function save(){ 
+    await fetch(`/api/actions/set-due?action_id=${id}&project_id=${projectId}`, { 
+      method:"POST", credentials:"include", headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ due_date: val || null })
+    });
+  }
+  return (
+    <div className="flex items-center gap-1 text-xs mt-1">
+      <input type="date" className="border rounded px-1 py-0.5" value={val} onChange={e=>setVal(e.target.value)} />
+      <button className="px-1 border rounded" onClick={save}>✓</button>
+    </div>
+  );
+}
+
+
+Use it inside the action card (pass current due if your list endpoint returns it).
+
+C) Fast sanity checks
+
+Downloads: Actions CSV & Sign-Off ZIP download; no 401s in dev.
+
+Composer: Preview renders; Send returns token_link.
+
+Analytics: Cards show counts; chart renders.
+
+Due-dates: set a due date to yesterday → within 10m you get a reminder (or call the endpoint manually by adjusting REMINDERS_TICK_SEC=10).
+
+Bell: Notifications show signoff.package_sent, reminder.sent, backup/reindex events.

@@ -1,0 +1,100 @@
+Love it. Meeting Summaries + memory APIs are in — that’s the continuity layer we wanted. Here’s how I’d tighten it so it’s demo-ready and bulletproof, plus a few quick fixes and validation steps.
+
+Quick wins (do these now)
+1) Smoke test the full loop
+BASE="https://<YOUR-REPLIT-URL>/api"
+ORG="<ORG_UUID>"
+PROJ="<PROJ_UUID>"
+
+# Upload a small “minutes” doc
+echo "WG Minutes: Decision: adopt retro v2. Risk: SFTP cert expiry (High).
+Action: Sam deliver SFTP cert by 2025-09-22. ADP → Workday daily SFTP." > /tmp/minutes.txt
+
+curl -s -X POST "$BASE/ingest-sync" \
+  -F "org_id=$ORG" -F "project_id=$PROJ" \
+  -F "file=@/tmp/minutes.txt"
+
+# List meeting summaries (should include the upload)
+curl -s "$BASE/meetings?org_id=$ORG&project_id=$PROJ" | sed -e 's/{"items":\[//' -e 's/\]}$//' | head -c 400
+
+
+Then in the UI: /meetings page should show a card with the summary, counts, and an Open link.
+
+2) Fix the Chat Dock overlapping the “no meetings” message
+
+Add one line where you render main content (or in the Meetings page container):
+
+<div className="pb-28">  {/* bottom padding so the dock never hides content */}
+// ... existing content ...
+</div>
+
+
+(Adjust pb-28 if your dock height changes.)
+
+3) Parse a meeting date from filenames (nicer cards)
+
+Inside ingestion, when you create the artifact:
+
+# naive filename date parse (YYYY-MM-DD or YYYY_MM_DD)
+import re, datetime as dt
+m = re.search(r'(20\d{2})[-_](\d{2})[-_](\d{2})', file.filename or "")
+meeting_date = None
+if m:
+    try: meeting_date = dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+    except: pass
+# include {"meeting_date": meeting_date} in the artifacts insert if present
+
+
+Meeting cards will show a real date instead of createdAt.
+
+Nice-to-have polish (very fast)
+
+Search in summaries: already implemented via query q param; surface a “clear” button on the page.
+
+Sort/paginate: extend /meetings?limit=50&offset=0&sort=created_at:desc.
+
+Export: add a “Download All Summaries (.csv)” button that hits /meetings and flattens summary/risks/decisions/actions.
+
+Confidence & review
+
+Your classifier is writing high-confidence items directly and queuing low-confidence ones. To use that:
+
+Approve from API (until we add the small UI):
+
+curl -s "$BASE/review/pending?org_id=$ORG&project_id=$PROJ" | python3 -m json.tool
+# Approve one:
+curl -s -X POST "$BASE/review/approve" -H "Content-Type: application/json" -d \
+'{"org_id":"'$ORG'","project_id":"'$PROJ'","id":<ID>,"publish":true}'
+
+
+Refresh Dashboard → Pending/Red Flags/Decisions should grow.
+
+If you want a tiny Review page next (approve/edit/discard in the UI), say the word — I’ll drop it in one pass.
+
+Continuity upgrades (shortlist)
+
+Weekly memory roll-up: a background job that writes a weekly “This week in WD-ACME” memory (top 5 decisions, top risks, new actions). Then show it on a “Weekly” tab.
+
+Memory search UI: one page that calls /mem/search (already done on the backend) so you can find “retro policy v2” months later.
+
+Ask-from-meeting: add a “Ask Kap about this meeting” button on each card, pre-seeding the Chat Dock with the artifact context.
+
+If something looks off
+
+Meeting cards empty? Check /meetings?org_id=&project_id= in a shell — if empty, the summaries insert might be failing (log will show).
+
+“Internal Server Error” banner: we already swapped it for friendly text; if you see raw errors, your page still renders the exception string. Use setErr(e.message) and show a helpful hint.
+
+No updates after upload: check /review/pending — lower confidence items may be waiting for approval.
+
+What you have now
+
+Mem-agent writing semantic/episodic/procedural/decision memories on every doc.
+
+Meeting Summaries page with one-click links and AI summaries.
+
+Memory APIs (search/timeline) for continuity.
+
+Classifier + updater that reads any doc and updates the project — high-confidence to live tables, low-confidence to review.
+
+If you want me to add the Review UI or wire the Timeline widget to the stored phases next, I’ll hand you paste-ready code.

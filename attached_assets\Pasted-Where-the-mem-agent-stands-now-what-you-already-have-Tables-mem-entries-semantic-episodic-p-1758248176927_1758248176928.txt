@@ -1,0 +1,205 @@
+Where the mem-agent stands now (what you already have)
+
+Tables: mem_entries (semantic / episodic / procedural / decision / affect), mem_chunks (vectorized memories), mem_stats (e.g., wellness score), mem_signals (morale_drop, deadline_slip).
+
+Ingest path (upload/email): parse → chunk/embed → extract_memories → write mem_entries (+ embed) → write summaries per artifact.
+
+Ask-AI RAG: pulls artifact_chunks and mem_chunks (semantic/procedural first) so answers stay consistent over time.
+
+So the memory fabric exists and is being written on every doc. What’s missing is a first-class UI (& a couple convenience APIs) to use that memory during the project.
+
+Add a “Meeting Summaries” page (friendly continuity)
+1) Backend: list and details (paste into FastAPI)
+# /server/meetings_api.py
+from fastapi import APIRouter, Query
+from .supabase_client import sb
+
+router = APIRouter()
+BUCKET = "project-artifacts"
+
+def signed_url(path: str):
+    try:
+        r = sb.storage.from_(BUCKET).create_signed_url(path, 3600)
+        return r.get("signedURL") or r.get("signed_url")
+    except Exception:
+        return None
+
+@router.get("/meetings")
+def list_meetings(org_id: str, project_id: str, q: str = "", limit: int = 50):
+    # pick up artifacts that look like transcripts or minutes, *or* anything with an artifact-level summary
+    arts = sb.table("artifacts").select("id,title,source,meeting_date,created_at,path") \
+        .eq("org_id", org_id).eq("project_id", project_id).order("created_at", desc=True).limit(limit).execute().data or []
+
+    ids = [a["id"] for a in arts]
+    sums = sb.table("summaries").select("artifact_id,summary,risks,decisions,actions,created_at") \
+        .in_("artifact_id", ids).execute().data or []
+    by_art = { s["artifact_id"]: s for s in sums }
+
+    out = []
+    for a in arts:
+        s = by_art.get(a["id"], {})
+        if q and q.lower() not in (a.get("title","")+s.get("summary","")).lower(): 
+            continue
+        out.append({
+            "artifact_id": a["id"],
+            "title": a.get("title"),
+            "source": a.get("source"),
+            "meeting_date": a.get("meeting_date"),
+            "created_at": a.get("created_at"),
+            "summary": s.get("summary",""),
+            "risks_count": len(s.get("risks") or []),
+            "decisions_count": len(s.get("decisions") or []),
+            "actions_count": len(s.get("actions") or []),
+            "url": signed_url(a["path"])
+        })
+    return {"items": out}
+
+@router.get("/meetings/{artifact_id}")
+def meeting_detail(artifact_id: str, org_id: str, project_id: str):
+    a = sb.table("artifacts").select("id,title,source,meeting_date,created_at,path") \
+        .eq("org_id", org_id).eq("project_id", project_id).eq("id", artifact_id).limit(1).execute().data
+    if not a: return {"ok": False, "error": "not found"}
+    a = a[0]
+    sums = sb.table("summaries").select("*").eq("artifact_id", artifact_id).limit(1).execute().data
+    s = sums[0] if sums else {}
+    return {
+        "artifact": {**a, "url": signed_url(a["path"])},
+        "summary": s.get("summary",""),
+        "risks": s.get("risks") or [],
+        "decisions": s.get("decisions") or [],
+        "actions": s.get("actions") or []
+    }
+
+
+Mount it in main.py:
+
+from .meetings_api import router as meetings_router
+app.include_router(meetings_router, prefix="")
+
+
+Ingest already writes summaries per artifact; this page simply surfaces them with a signed “Open” link.
+
+Memory continuity tools (so history is findable)
+2) Search memories (semantic/procedural/decision)
+# /server/mem_api.py
+from fastapi import APIRouter, Query
+from .supabase_client import sb
+from .db import get_conn
+
+router = APIRouter()
+
+@router.get("/mem/search")
+def mem_search(org_id: str, project_id: str, q: str, limit: int = 20):
+    # simple LIKE first; you can add pgvector search on mem_chunks if you wish
+    rows = sb.table("mem_entries").select("id,type,title,body,created_at") \
+        .eq("org_id",org_id).eq("project_id",project_id).order("created_at", desc=True).limit(400).execute().data or []
+    ql = q.lower()
+    hits = [r for r in rows if ql in ( (r.get("title") or "") + " " + (r.get("body") or "") ).lower() ][:limit]
+    return {"items": hits}
+
+@router.get("/mem/timeline")
+def mem_timeline(org_id: str, project_id: str, since_days: int = 90, limit: int = 200):
+    rows = sb.table("mem_entries").select("id,type,title,body,created_at") \
+        .eq("org_id",org_id).eq("project_id",project_id).order("created_at", desc=True).limit(limit).execute().data or []
+    # client can render a vertical timeline; types convey context (decision/episodic/etc.)
+    return {"items": rows}
+
+
+Mount in main.py:
+
+from .mem_api import router as mem_router
+app.include_router(mem_router, prefix="")
+
+3) Frontend: add the “Meeting Summaries” page
+
+Create /web/src/pages/Meetings.jsx:
+
+import React, { useEffect, useState } from "react"
+
+export default function Meetings({ orgId, projectId }) {
+  const [items, setItems] = useState([])
+  const [q, setQ] = useState("")
+  const [loading, setLoading] = useState(false)
+  const [err, setErr] = useState("")
+
+  async function load() {
+    if(!orgId || !projectId) return
+    setLoading(true); setErr("")
+    try{
+      const r = await fetch(`/api/meetings?org_id=${orgId}&project_id=${projectId}&q=${encodeURIComponent(q)}`)
+      const js = await r.json()
+      setItems(js.items||[])
+    } catch(e){ setErr(String(e)) }
+    finally{ setLoading(false) }
+  }
+  useEffect(()=>{ load() }, [orgId, projectId])
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <h2 className="text-xl font-semibold">Meeting Summaries</h2>
+        <div className="flex gap-2">
+          <input className="border px-2 py-1 rounded text-sm" placeholder="Search title/summary" value={q} onChange={e=>setQ(e.target.value)} />
+          <button className="px-3 py-1.5 border rounded text-sm" onClick={load}>Search</button>
+        </div>
+      </div>
+      {loading && <div className="text-sm text-slate-500">Loading…</div>}
+      {err && <div className="text-sm text-rose-600">{err}</div>}
+      <div className="grid gap-3">
+        {items.map(m=>(
+          <div key={m.artifact_id} className="border rounded-xl p-3">
+            <div className="flex items-center justify-between">
+              <div className="font-semibold">{m.title || "(untitled)"}</div>
+              {m.url ? <a className="text-sm px-3 py-1 border rounded" href={m.url} target="_blank" rel="noreferrer">Open</a> : <span className="text-xs text-slate-500">no link</span>}
+            </div>
+            <div className="text-xs text-slate-500">{m.meeting_date || new Date(m.created_at).toLocaleString()}</div>
+            <p className="text-sm mt-2 whitespace-pre-wrap">{m.summary || "No summary extracted yet."}</p>
+            <div className="text-xs text-slate-500 mt-2">
+              {m.actions_count} actions · {m.risks_count} risks · {m.decisions_count} decisions
+            </div>
+          </div>
+        ))}
+        {!items.length && !loading && <div className="text-sm text-slate-500">No meetings yet. Upload a transcript or minutes and it will appear here.</div>}
+      </div>
+    </div>
+  )
+}
+
+
+Hook it into your router & sidebar:
+
+import Meetings from "./pages/Meetings"
+// routes:
+<Route path="/meetings" element={<Meetings orgId={orgId} projectId={projectId} />} />
+// sidebar link:
+{link('/meetings','Meeting Summaries')}
+
+4) Small ingestion tweak (label transcripts)
+
+If you haven’t already, tag common transcript formats as source='transcript' so they’re easy to filter:
+
+# in /ingest or /ingest-sync
+ext = (file.filename or "").lower()
+src = "transcript" if (ext.endswith(".vtt") or ext.endswith(".srt") or "transcript" in ext) else source
+# use 'src' when inserting into artifacts
+
+
+(Email intake can mark messages from your transcriber as source='transcript' too.)
+
+5) Continuity that never breaks (nice to have next)
+
+Weekly memory roll-up: cron job writes a mem_summaries row per week (top decisions/risks/actions + highlights). Expose as /mem/weekly + a page “This Week in the Project.”
+
+Memory search in UI: a simple page calling /mem/search?q=… so you can find “retro policy v2” three months later in 2 clicks.
+
+Pinning: allow pinning any memory to the dashboard (“Key Decisions”) with one toggle.
+
+Bottom line
+
+The mem-agent is in, writing on every ingestion.
+
+The Meeting Summaries page surfaces those summaries with one-click links.
+
+The memory search/timeline endpoints give you continuity across months.
+
+Paste the endpoints and the page above, refresh, and you’ll have a living record of every meeting with summaries, counts, and deep links—exactly the “don’t lose the plot” safety net you want.

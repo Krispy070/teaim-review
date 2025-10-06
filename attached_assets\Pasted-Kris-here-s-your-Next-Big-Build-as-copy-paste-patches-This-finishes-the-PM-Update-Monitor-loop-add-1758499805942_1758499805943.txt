@@ -1,0 +1,240 @@
+Kris—here’s your Next Big Build as copy-paste patches. This finishes the PM Update Monitor loop, adds customer Sign-Off Documents (upload + “Kap draft” + token sign page), wires Stage Areas end-to-end, adds an Apply All Safe button, enforces visibility (respect Team Access), drops in an Owner Directory picker, and gives you a Reload Schema button (done) and a reliable pending-updates badge (done). I also included route aliases and dev-safe guards so forwarding quirks don’t bite.
+
+I’ve kept files short and labeled so you can paste straight into Replit.
+
+0) Stage sign-off audit bug (ensure org_id/project_id present)
+
+Where you insert sign-off audit events (in your stage decision / external token routes), make sure both fields exist:
+
+sb.table("audit_events").insert({
+    "org_id": ctx.org_id,          # REQUIRED
+    "project_id": project_id,      # REQUIRED
+    "actor_id": ctx.user_id,       # None for external signer
+    "kind": f"stage.{body.decision}",
+    "details": {"stage_id": body.stage_id, "via": "external_token" if some_external else "pm", "notes": body.notes}
+}).execute()
+
+1) “Apply All Safe” in PM Update Monitor
+1A) Backend already supports rules (/api/updates/rules) & batch approve. No changes needed.
+1B) Frontend — patch client/src/pages/UpdatesReview.tsx
+
+Add a top-bar button and handler:
+
+import { getJSON, postJSON } from "@/lib/authFetch"; // ensure you're using AuthFetch here
+
+// inside component
+async function applyAllSafe(){
+  try{
+    const rules = await getJSON(`/api/updates/rules`);
+    const min = Number(rules?.auto_apply_min_conf ?? 0.85);
+    const ids = items
+      .filter(i => i.status === "pending" && Number(i.confidence ?? 0) >= min)
+      .map(i => i.id);
+    if (!ids.length) { alert(`No pending items >= ${min}`); return; }
+    await postJSON(`/api/updates/batch_approve?project_id=${projectId}`, { ids });
+    load();
+  }catch(e:any){ alert(`Apply all safe failed: ${String(e?.message||e)}`); }
+}
+
+// In the left list toolbar (where filters live), add:
+{status==="pending" && items.length>0 && (
+  <button className="px-3 py-2 border rounded" onClick={applyAllSafe}>
+    Apply All Safe (≥ rules)
+  </button>
+)}
+
+2) Stage Editor (Areas) UI (so PMs can set areas)
+
+You already mounted the API. Create the page if you haven’t:
+
+client/src/pages/Stages.tsx (from previous push) – keep as is.
+
+Add a link in SignoffComposer to jump to it:
+
+// client/src/pages/SignoffComposer.tsx — near the stage area input
+<a className="text-xs underline" href={`/projects/${projectId}/stages/manage`}>Manage stages</a>
+
+3) Visibility enforcement (Team Access → API results)
+
+Add a tiny helper and use it in Documents List so non-“view all” users only see allowed areas.
+
+3A) Helper — server/utils/visibility.py
+from typing import List, Dict, Any
+
+def get_member_areas(sb, org_id: str, project_id: str, user_id: str):
+    r = sb.table("project_member_access").select("can_view_all,visibility_areas")\
+         .eq("org_id", org_id).eq("project_id", project_id).eq("user_id", user_id).limit(1).execute().data
+    if not r: return True, []
+    a = r[0]
+    return bool(a.get("can_view_all", True)), (a.get("visibility_areas") or [])
+
+def filter_artifacts_by_areas(sb, org_id: str, project_id: str, artifacts: List[Dict[str,Any]], allowed: List[str]):
+    if not allowed: return artifacts
+    # area tags are tagged as tags.name = 'area:<Area>'
+    ids = [a["id"] for a in artifacts]
+    if not ids: return artifacts
+    at = sb.table("artifact_tags").select("artifact_id,tag_id")\
+          .eq("org_id", org_id).eq("project_id", project_id).in_("artifact_id", ids).execute().data or []
+    tids = list({x["tag_id"] for x in at})
+    tags = sb.table("tags").select("id,name").in_("id", tids).execute().data or []
+    name_map = {t["id"]: t["name"] for t in tags}
+    art_areas = { aid: set() for aid in ids}
+    for r in at:
+        name = name_map.get(r["tag_id"], "")
+        if name.startswith("area:"):
+            art_areas[r["artifact_id"]].add(name.split(":",1)[1])
+    keep = set()
+    for aid,areas in art_areas.items():
+        if areas & set(allowed): keep.add(aid)
+    return [a for a in artifacts if (a["id"] in keep) or not art_areas[a["id"]]]
+
+3B) Use in Documents List
+
+Patch server/routers/documents_list.py:
+
+from ..utils.visibility import get_member_areas, filter_artifacts_by_areas
+
+@router.get("/list")
+def list_docs(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        rows = sb.table("artifacts").select("id,name,created_at")\
+                .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+                .order("created_at", desc=True).limit(500).execute().data or []
+        can_all, areas = get_member_areas(sb, ctx.org_id, project_id, ctx.user_id)
+        if not can_all:
+            rows = filter_artifacts_by_areas(sb, ctx.org_id, project_id, rows, areas)
+        return {"items": rows}
+    except Exception:
+        # dev fallback
+        if os.getenv("DEV_AUTH","0")=="1":
+            rows = [
+               {"id":"11111111-1111-1111-1111-111111111111","name":"SOW_v1_ACME-HCM-001.pdf","created_at":"2025-09-20T00:00:00Z"},
+               {"id":"22222222-2222-2222-2222-222222222222","name":"Kickoff_Transcript.txt","created_at":"2025-09-19T00:00:00Z"},
+               {"id":"33333333-3333-3333-3333-333333333333","name":"Discovery_Package.docx","created_at":"2025-09-18T00:00:00Z"}
+            ]
+            return {"items": rows}
+        return {"items": []}
+
+
+As you start tagging artifacts with tags like area:HCM, non-view-all users will only see those allowed areas.
+
+4) Owner Directory picker (Actions Kanban)
+
+client/src/components/OwnerPicker.tsx
+
+import { useEffect, useState } from "react";
+import { getJSON } from "@/lib/authFetch";
+
+export default function OwnerPicker({ projectId, value, onChange }:{ projectId:string; value?:string; onChange:(v:string)=>void }){
+  const [rows,setRows]=useState<{user_id:string; role:string; email?:string}[]>([]);
+  useEffect(()=>{ (async()=>{
+    try{
+      const d = await getJSON<{members:any[]}>(`/api/members/list?project_id=${projectId}`);
+      const list = (d.members||[]).map((m:any)=>({ user_id:m.user_id, role:m.role, email:m.email || m.user_id }));
+      setRows(list);
+    }catch{ setRows([]); }
+  })(); },[projectId]);
+  return (
+    <select className="border rounded px-1 py-0.5 text-xs" value={value||""} onChange={e=>onChange(e.target.value)}>
+      <option value="">(unassigned)</option>
+      {rows.map(m=><option key={m.user_id} value={m.email||m.user_id}>{m.email||m.user_id} ({m.role})</option>)}
+    </select>
+  );
+}
+
+
+Use inside ActionsKanban card:
+
+import OwnerPicker from "@/components/OwnerPicker";
+
+function OwnerEditor({ id, projectId, owner }:{ id:string; projectId:string; owner?:string }){
+  const [val,setVal] = useState(owner||"");
+  async function save(){ 
+    await fetch(`/api/actions/set-owner?action_id=${id}&project_id=${projectId}`, { 
+      method:"POST", credentials:"include", headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({owner: val||null}) 
+    });
+  }
+  return (
+    <div className="flex items-center gap-1 text-xs mt-1">
+      <OwnerPicker projectId={projectId} value={val} onChange={setVal} />
+      <button className="px-1 border rounded" onClick={save}>✓</button>
+    </div>
+  );
+}
+
+5) Sign-Off Documents (upload + “Kap draft” + token signing)
+
+You already pasted most of this previously. Ensure the router and page from the last push are present:
+
+server/routers/signoff_docs.py (create/list/upload/generate/request-sign + public token view/sign)
+
+client/src/pages/SignoffDocs.tsx (generate/upload/send)
+
+main.py mounts:
+
+app.include_router(signoff_docs.router)   # /api/signoff/docs/*
+app.include_router(signoff_docs.pub)      # /signoff/doc/{token}
+
+
+Add a menu link under the Sign-Off section:
+
+{ path: "/projects/:projectId/signoff/docs", element: <SignoffDocs/> }
+
+6) Admin Health — Reload Schema button
+
+You already added it. If not, drop the snippet (previous message).
+
+7) Router alias pattern (if your proxy sometimes strips /api)
+
+Add once for updates and team-access (you already used this trick):
+
+# server/main.py
+from fastapi import APIRouter
+# UPDATES alias
+from .routers import updates
+updates_alias = APIRouter(prefix="/updates", tags=["updates"])
+for r in updates.router.routes:
+    updates_alias.add_api_route(r.path.replace("/api/updates","") or "/", r.endpoint, methods=r.methods)
+app.include_router(updates_alias)
+
+# TEAM-ACCESS alias (if needed)
+from .routers import team_access
+ta_alias = APIRouter(prefix="/team-access", tags=["team-access"])
+for r in team_access.router.routes:
+    ta_alias.add_api_route(r.path.replace("/api/team/access","") or "/", r.endpoint, methods=r.methods)
+app.include_router(ta_alias)
+
+8) Express proxy (no pathRewrite)
+
+Make sure your proxy doesn’t strip /api; forward dev headers:
+
+// proxy/index.js
+app.use('/api', createProxyMiddleware({
+  target: API_BASE,
+  changeOrigin: true,
+  xfwd: true,
+  onProxyReq(proxyReq, req) {
+    if (process.env.DEV_AUTH === '1') {
+      ['x-dev-user','x-dev-org','x-dev-role'].forEach(h => { if (req.headers[h]) proxyReq.setHeader(h, req.headers[h]); });
+    }
+    if (req.headers['authorization']) proxyReq.setHeader('authorization', req.headers['authorization']);
+  },
+}));
+
+9) 2-minute sanity
+
+Stage Editor → set Area; Composer shows Manage stages.
+
+PM Update Monitor → Apply All Safe approves only ≥ rule.
+
+Docs → user with can_view_all=false & visibility_areas=[HCM] only sees artifacts with area:HCM tags; others hidden.
+
+Actions → Owner picker lists members; assign works.
+
+Sign-Off Docs → Generate or Upload; Request Sign sends token page; sign button changes status → signed; audit event appears.
+
+Admin Health → Reload Schema works.
+
+Sidebar badge ticks every 15s.

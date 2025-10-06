@@ -1,0 +1,250 @@
+I reviewed the Replit output—Brand v2 is live, nav is stable & complete, project switcher and wellness/chart/dataroom are in. Time to ship Next Big Build v2.6.9 with four high-impact upgrades that demo beautifully and tighten operations:
+
+Stage timeline knows what’s signed (green ✔ overlay; “at risk” ignores signed stages)
+
+Inline “Request Sign-Off” from the timeline (1-click email prompt)
+
+CSV Bundle Export (actions/risks/decisions zipped with a branded manifest.html)
+
+KPI delta polish (no change to your CountUp/DeltaBadge—just using it where it matters)
+
+Everything is brand-flag aware and dev-safe. Paste these 1:1.
+
+1) Stage lateness: ignore signed stages
+
+Patch server/routers/method_lateness.py (replace the endpoint body)
+
+from fastapi import APIRouter, Depends, Query
+from datetime import datetime
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/method", tags=["method"])
+
+@router.get("/lateness")
+def lateness(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    # Stages with planned end_date
+    stages = sb.table("project_stages").select("id,title,area,end_date")\
+              .eq("org_id", ctx.org_id).eq("project_id", project_id).execute().data or []
+
+    # Signed stages (via signoff_docs or method_metrics kind=stage.signed)
+    signed_ids = set()
+    try:
+        d = sb.table("signoff_docs").select("stage_id").eq("org_id", ctx.org_id)\
+              .eq("project_id", project_id).eq("status","signed").not_.is_("stage_id","null").execute().data or []
+        signed_ids.update([r["stage_id"] for r in d if r.get("stage_id")])
+    except Exception: ...
+    if not signed_ids:
+        try:
+            mm = sb.table("method_metrics").select("stage_id").eq("org_id", ctx.org_id)\
+                 .eq("project_id", project_id).eq("kind","stage.signed").not_.is_("stage_id","null").execute().data or []
+            signed_ids.update([m["stage_id"] for m in mm if m.get("stage_id")])
+        except Exception: ...
+
+    out=[]; late=on=0
+    today = datetime.now().date()
+    for st in stages:
+        sid = st["id"]; end = st.get("end_date")
+        if not end: continue
+        try:
+            plan = datetime.fromisoformat(end).date()
+        except: 
+            continue
+        if sid in signed_ids:
+            # signed: count on-time/early vs planned end
+            # (we don't have exact signed date, so treat signed as on-time)
+            on += 1
+            continue
+        # unsigned: at risk if planned end < today
+        if plan < today:
+            late += 1
+            out.append({"title": st.get("title"), "area": st.get("area"), "days": (today - plan).days})
+        else:
+            on += 1
+    return {"summary": {"late": late, "on_time_or_early": on}, "details": out[:50]}
+
+2) Stage timeline: ✔ overlay + inline “Request Sign-Off”
+2A) Quick request endpoint
+
+server/routers/stages_request_sign.py (new)
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase, get_service_supabase
+from ..routers.signoff_docs_gen import DraftReq  # reuse draft body
+from datetime import datetime, timedelta, timezone
+import secrets, os
+
+router = APIRouter(prefix="/api/stages", tags=["stages"])
+PM_PLUS = require_role({"owner","admin","pm"})
+
+class RequestBody(BaseModel):
+    stage_id: str
+    email_to: str
+    title: str | None = None
+    area: str | None = None
+
+@router.post("/request_signoff")
+def request_signoff(body: RequestBody, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx); sbs = get_service_supabase()
+
+    # find existing doc for stage or create a simple draft
+    docq = sbs.table("signoff_docs").select("id,status").eq("org_id", ctx.org_id)\
+            .eq("project_id", project_id).eq("stage_id", body.stage_id).limit(1).execute().data
+    if not docq:
+        # create from prompt (simple template)
+        draft = DraftReq(stage_id=body.stage_id, area=body.area, title=body.title or "Stage Sign-Off",
+                         summary="Please review and acknowledge completion of this stage.",
+                         bullets=[], acceptance="I acknowledge and approve the above.", footer="Signed electronically via TEAIM")
+        proj = sb.table("projects").select("code").eq("id", project_id).single().execute().data or {}
+        # generate doc
+        from ..routers.signoff_docs_gen import generate_from_prompt
+        _ = generate_from_prompt(draft, project_id, ctx)  # creates signoff_docs row
+        docq = sbs.table("signoff_docs").select("id,status").eq("org_id", ctx.org_id)\
+               .eq("project_id", project_id).eq("stage_id", body.stage_id).limit(1).execute().data
+        if not docq: raise HTTPException(500, "Failed to create draft")
+
+    doc_id = docq[0]["id"]
+
+    # create token & send email (reusing signoff_docs.request_sign)
+    from ..routers.signoff_docs import request_sign as _req
+    _ = _req(type("B", (), {"doc_id": doc_id, "email_to": body.email_to, "expires_hours": 120})(), project_id, ctx)  # little shim
+    return {"ok": True}
+
+
+Mount in server/main.py:
+
+from .routers import stages_request_sign
+app.include_router(stages_request_sign.router)
+
+2B) Timeline overlay & button
+
+Patch client/src/components/PhaseTimeline.tsx:
+
+Add inside stages.map below the bar:
+
+// Request button (hover-only)
+<div className="mt-1 flex justify-end">
+  <button
+    className="brand-btn text-[11px]"
+    onClick={async ()=>{
+      const email = prompt("Send sign-off request to email:");
+      if (!email) return;
+      try{
+        await fetch(`/api/stages/request_signoff?project_id=${projectId}`, {
+          method:"POST", credentials:"include",
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ stage_id: s.id, email_to: email, title: s.title, area: s.area })
+        });
+        alert("Request sent");
+      }catch(e:any){ alert(String(e?.message||e)); }
+    }}
+    title="Request sign-off"
+  >Request Sign-Off</button>
+</div>
+
+
+(You can later replace prompt() with a nice modal.)
+
+3) CSV Bundle Export (actions/risks/decisions + branded manifest)
+
+server/routers/export_csv_bundle.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
+import io, zipfile, json, datetime as dt
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+from ..brand.export_header import export_header_html
+
+router = APIRouter(prefix="/api/export", tags=["export"])
+
+@router.get("/csv_bundle.zip")
+def csv_bundle(project_id: str = Query(...),
+               types: str = Query("actions,risks,decisions"),
+               ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    tset = {t.strip() for t in types.split(",") if t.strip()}
+    proj = sb.table("projects").select("code").eq("id", project_id).single().execute().data or {}
+    code = proj.get("code") or project_id
+    org = sb.table("org_branding").select("*").eq("org_id", ctx.org_id).single().execute().data or {}
+
+    def q(table, cols):
+        try:
+            r = sb.table(table).select(",".join(cols))\
+                 .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+                 .order("created_at", desc=True).limit(5000).execute().data or []
+            return r
+        except Exception:
+            return []
+
+    actions = q("actions", ["id","title","owner","status","area","created_at"]) if "actions" in tset else []
+    risks   = q("risks",   ["id","title","severity","owner","area","created_at"]) if "risks" in tset else []
+    decis   = q("decisions",["id","title","decided_by","area","created_at"]) if "decisions" in tset else []
+
+    hdr = export_header_html(org, code)
+    html = f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:880px;margin:auto}}</style>
+</head><body>{hdr}
+<h2>CSV Bundle</h2>
+<div style="font-size:12px;color:#666">Generated {dt.datetime.now(dt.timezone.utc).isoformat()}</div>
+<ul>
+  <li>actions.csv — {len(actions)} rows</li>
+  <li>risks.csv — {len(risks)} rows</li>
+  <li>decisions.csv — {len(decis)} rows</li>
+</ul>
+</body></html>"""
+
+    buf = io.BytesIO(); zf = zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED)
+
+    # write CSVs
+    import csv
+    def write_csv(name, rows, cols):
+        s = io.StringIO(); w = csv.writer(s); w.writerow(cols)
+        for r in rows: w.writerow([r.get(c) for c in cols])
+        zf.writestr(name, s.getvalue())
+
+    if "actions" in tset:  write_csv("actions.csv",  actions, ["id","title","owner","status","area","created_at"])
+    if "risks"   in tset:  write_csv("risks.csv",    risks,   ["id","title","severity","owner","area","created_at"])
+    if "decisions" in tset:write_csv("decisions.csv",decis,   ["id","title","decided_by","area","created_at"])
+
+    zf.writestr("manifest.html", html)
+    zf.close(); buf.seek(0)
+    return StreamingResponse(iter([buf.getvalue()]), media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="csv_bundle.zip"'})
+
+
+Mount in server/main.py:
+
+from .routers import export_csv_bundle
+app.include_router(export_csv_bundle.router)
+
+
+Add a button (put this on Documents page or Admin/Reporting):
+
+import { downloadGET } from "@/lib/download";
+// ...
+<button className="brand-btn text-xs" onClick={()=>
+  downloadGET(`/api/export/csv_bundle.zip?project_id=${projectId}&types=actions,risks,decisions`, "csv_bundle.zip")
+}>
+  Export CSV Bundle
+</button>
+
+4) KPI delta polish
+
+You already added DeltaBadge. Make sure you pass the raw numbers into it next to CountUp for the KPIs you care about (we showed “Documents” in the prior push). Repeat for “Actions”, “Risks”, etc.
+
+5) 60-second validation
+
+Timeline shows ✔ on signed stages; “At risk” ignores signed ones.
+
+Hover a stage → Request Sign-Off → prompt sends email (dev-safe if Mailgun isn’t set).
+
+Export CSV bundle → zip with actions/risks/decisions + branded manifest.html.
+
+KPIs glow and show +/- badge on change.

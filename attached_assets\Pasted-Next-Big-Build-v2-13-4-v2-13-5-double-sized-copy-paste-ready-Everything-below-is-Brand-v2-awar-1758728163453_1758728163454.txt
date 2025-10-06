@@ -1,0 +1,252 @@
+Next Big Build v2.13.4 + v2.13.5 (double-sized, copy-paste ready)
+
+Everything below is Brand v2–aware and dev-safe (new endpoints return safe empties if a table/column is missing).
+
+v2.13.4 — Data & Reporting polish
+1) Workbooks — tooltip timeline pins, late reason, aggregate run KPIs
+1A) Backend: project-level run KPI summary
+
+server/routers/workbooks.py (append)
+
+@router.get("/runs/aggregate_summary")
+def runs_aggregate_summary(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    out = {"pulled":0,"validated":0,"loaded":0,"failed":0}
+    try:
+        rows = sb.table("workbook_runs").select("status")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id).execute().data or []
+        for r in rows:
+            s = (r.get("status") or "pulled").lower()
+            if s in out: out[s]+=1
+    except Exception:
+        ...
+    return {"counts": out}
+
+
+Dev-safe: returns zeros if table missing.
+
+1B) Backend: support optional late_reason in upsert
+
+server/routers/workbooks.py (in Workbook model and upsert_workbook)
+
+class Workbook(BaseModel):
+    # ...existing...
+    late_reason: Optional[str] = None
+
+
+The existing upsert_workbook already includes all fields from model_dump(), so nothing else to change.
+
+1C) UI: late/at-risk chips + late reason + project run KPIs
+
+client/src/pages/Reporting.tsx (inside WorkbooksCard)
+
+Add late reason to the Add/Edit form:
+
+<input className="border rounded p-2 md:col-span-2" placeholder="Late/At-Risk reason (optional)"
+       value={form.late_reason||""} onChange={e=>setForm({...form, late_reason:e.target.value})}/>
+
+
+Add aggregate run KPI tile (above the table, next to existing KPIs):
+
+const [runAgg,setRunAgg]=useState<{counts?:any}>({});
+useEffect(()=>{ (async()=>{ try{
+  const d = await getJSON(`/api/workbooks/runs/aggregate_summary?project_id=${projectId}`); setRunAgg(d||{});
+}catch{ setRunAgg({}); } })(); },[projectId]);
+
+<div className="grid md:grid-cols-5 gap-2">
+  <KPI label="WB Total" v={metrics?.summary?.total} />
+  <KPI label="In progress" v={metrics?.summary?.in_progress} />
+  <KPI label="Done" v={metrics?.summary?.done} />
+  <KPI label="Overdue" v={metrics?.summary?.overdue} />
+  <KPI label="Runs (loaded)" v={runAgg?.counts?.loaded ?? "—"} />
+</div>
+
+
+Show late/at-risk chips in the list (keep _chip from previous build):
+
+<td className="p-1">
+  {w.status||"—"} { _chip(w) }
+  {w.late_reason && <span className="ml-1 text-[11px] text-muted-foreground">• {w.late_reason}</span>}
+</td>
+
+1D) Tooltip timeline pins (inside the runs expander)
+
+client/src/components/WorkbookRunsExpander.tsx (augment table row with a small pinbar)
+
+Add right under the runs table:
+
+<div className="mt-2">
+  <div className="text-xs text-muted-foreground mb-1">Runs timeline</div>
+  <div className="relative h-2 bg-white/10 rounded">
+    {(items||[]).map((r:any, idx:number)=>{
+      const left = Math.min(98, Math.max(0, (idx/Math.max(1,(items||[]).length-1))*100));
+      const col = r.status==="loaded" ? "var(--brand-good)" : r.status==="validated" ? "#19d492" : r.status==="failed" ? "#ef4444" : "#6b7280";
+      const tip = `Run ${r.run_no || idx+1} • ${r.status||"pulled"} • rows ${r.rows||0}${r.pulled_on?` • ${r.pulled_on}`:""}`;
+      return <div key={idx} title={tip} className="absolute -top-1 w-[6px] h-[6px] rounded-full" style={{ left:`${left}%`, background: col }} />;
+    })}
+  </div>
+</div>
+
+2) Reports — CSV import mapping UI (column→field)
+2A) Backend: import with a field map
+
+server/routers/reports_registry.py (append)
+
+class ImportMapBody(BaseModel):
+    map: dict  # {"csv_col":"field_name", ...}
+
+@router.post("/import_map")
+def import_map(project_id: str = Query(...), body: ImportMapBody = None,
+               file: UploadFile = File(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    try:
+        raw = (file.file.read()).decode("utf-8", errors="ignore")
+        rdr = csv.DictReader(io.StringIO(raw))
+        n=0; mapping = (body.map if body and body.map else {})
+        for row in rdr:
+            data = {}
+            for k,v in mapping.items():
+                if k in row: data[v] = row.get(k)
+            if not (data.get("name") or "").strip(): continue
+            data.update({"org_id": ctx.org_id, "project_id": project_id})
+            try: sb.table("reports").insert(data).execute(); n+=1
+            except Exception: ...
+        return {"ok": True, "imported": n}
+    except Exception:
+        return {"ok": False, "imported": 0}
+
+
+Mount already exists.
+
+2B) Frontend: mapping picker before upload
+
+client/src/pages/Reporting.tsx (inside ReportsCard)
+
+Add a simple “Map & Import CSV” modal:
+
+const [mapOpen,setMapOpen]=useState(false);
+const [csvFile,setCsvFile]=useState<File|null>(null);
+const [csvHeaders,setCsvHeaders]=useState<string[]>([]);
+const fields = ["name","legacy_system","owner","frequency","due_date","status","wd_type","wd_report_name","design_doc_url","sample_url","notes"];
+
+function openMap(file:File){
+  setCsvFile(file);
+  file.text().then(t=>{
+    const [head] = t.split(/\r?\n/); 
+    setCsvHeaders((head||"").split(",").map(h=>h.trim()).filter(Boolean));
+    setMapOpen(true);
+  });
+}
+
+{/* replace the simple import input */}
+<input type="file" accept=".csv" className="text-xs" onChange={e=>{
+  const f = e.target.files?.[0]; if (!f) return;
+  openMap(f);
+}} />
+
+{mapOpen && <MapModal projectId={projectId} file={csvFile!} headers={csvHeaders} fields={fields} onClose={()=>{setMapOpen(false); load();}}/>}
+
+
+client/src/components/MapModal.tsx (new)
+
+import { useState } from "react";
+
+export default function MapModal({projectId,file,headers,fields,onClose}:{projectId:string;file:File;headers:string[];fields:string[];onClose:()=>void}){
+  const [map,setMap]=useState<Record<string,string>>({}); // csv_col -> field
+
+  async function submit(){
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("body", new Blob([JSON.stringify({map})], {type:"application/json"}));
+    await fetch(`/api/reports/import_map?project_id=${projectId}`, { method:"POST", body: fd, credentials:"include" });
+    onClose();
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-[200]" onClick={onClose}>
+      <div className="mx-auto mt-[8vh] w-[720px] max-w-[96%] bg-white dark:bg-neutral-900 rounded shadow-xl border"
+           onClick={e=>e.stopPropagation()}>
+        <div className="p-3 border-b text-sm font-medium">Map CSV Columns</div>
+        <div className="p-3 space-y-2 max-h-[70vh] overflow-auto">
+          {headers.map(h=>(
+            <div key={h} className="flex items-center gap-2">
+              <div className="text-xs w-[40%]">{h}</div>
+              <select className="border rounded p-2 text-sm w-[60%]" value={map[h]||""} onChange={e=>setMap({...map,[h]:e.target.value})}>
+                <option value="">(ignore)</option>
+                {fields.map(f=> <option key={f} value={f}>{f}</option>)}
+              </select>
+            </div>
+          ))}
+        </div>
+        <div className="p-3 border-t flex justify-end gap-2">
+          <button className="brand-btn text-xs" onClick={onClose}>Cancel</button>
+          <button className="brand-btn text-xs swoosh" onClick={submit}>Import</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+3) Dashboard — Data & Reporting tile (hooked last drop)
+
+Already added; no change.
+
+v2.13.5 — Hardening & finishing touches
+4) Ops — job pass/fail + last run stamps
+4A) Scheduler: record last run & counts
+
+server/scheduler.py (wrap each job with KV upserts)
+
+Add tiny KV helper table usage:
+
+async def _kv_set(sbs, key, val):
+    try:
+        sbs.table("ops_kv").upsert({"key":key,"val":val}).execute()
+    except Exception: ...
+
+
+In revoke_expired_nightly() after try:
+
+await _kv_set(sbs, "last_run_revoke", dt.datetime.now(dt.timezone.utc).isoformat())
+
+
+In process_comms_queue() after processing:
+
+await _kv_set(sbs, "last_run_queue", dt.datetime.now(dt.timezone.utc).isoformat())
+
+
+Dev-safe: if ops_kv is missing, helper silently fails.
+
+4B) Health endpoint: include last run stamps
+
+server/routers/ops_scheduler.py (extend)
+
+@router.get("/scheduler_health")
+def scheduler_health(ctx: TenantCtx = Depends(require_role({"owner","admin"}))):
+    sb = get_service_supabase()
+    out = {"queue": {"due": 0, "total": 0}, "tokens_revoked_today": 0, "last_run": {}}
+    # ...existing...
+    try:
+        kv = sb.table("ops_kv").select("key,val").in_("key", ["last_run_revoke","last_run_queue"]).execute().data or []
+        for k in kv: out["last_run"][k["key"]] = k.get("val")
+    except Exception: ...
+    return out
+
+
+Update Ops card UI accordingly (show last_run_queue / last_run_revoke).
+
+5) Digest Preview — mute empty simulation (toggled last drop)
+
+Already added a checkbox and back-end support; nothing to change.
+
+6) 90-second sanity
+
+Workbooks: CSV import; run expander with inline edits; timeline pins with tooltips; project run KPI tile; late reason visible
+
+Reports: CSV import mapping UI; owner/frequency chips; owner filter chips
+
+Dashboard: KPI tile visible (WBs + reports)
+
+Ops: scheduler health shows queue & last run stamps
+
+Digest Preview: mute-empty simulation toggle confirmed

@@ -1,0 +1,298 @@
+let’s keep shipping. Here’s Next Big Build v2.6.2 you can paste straight into Replit. It finishes the “phase-1 revamp” you greenlit:
+
+PDF/Export styling (brand header + gradient, print-safe CSS for sign-offs/digests)
+
+Micro-interactions pass (button glow, loading swoosh, sign-off “confetti” on public page)
+
+Wellness Card v2 (sparkline + vibe copy; dev-safe fallback)
+
+Stage Health Chip (late/at-risk summary from method insights)
+
+All changes are brand-flag aware and resilient to empty/dev environments.
+
+0) Add print / export styles (one place)
+
+client/src/brand/print.css
+
+/* Compact, print-safe typography */
+@media print {
+  body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  * { color-adjust: exact !important; }
+  .hide-print { display: none !important; }
+  .brand-card { border: 0 !important; }
+  .rule-gradient { opacity: 1 !important; }
+}
+
+/* Export header block */
+.export-header {
+  display: flex; align-items: center; justify-content: space-between;
+  border-bottom: 2px solid var(--brand-color, #111111); padding: 8px 0;
+}
+.export-header .left, .export-header .right { display:flex; align-items:center; gap:8px; }
+.export-header .title { font-family: Poppins, Inter, system-ui; font-size: 18px; font-weight: 600; }
+.export-subtle { font-size: 12px; color: #666 }
+
+
+Import (once, after tokens/micro)
+
+/* client/src/index.css */
+@import "./brand/print.css";
+
+1) Brand header block for exported HTML (sign-off, digest)
+
+Add a tiny helper you can reuse when building HTML exports.
+
+server/brand/export_header.py (new)
+
+def export_header_html(org_settings: dict, proj_code: str | None = None):
+    color = (org_settings or {}).get("theme_color") or "#111111"
+    cust_img = org_settings.get("customer_logo_path")
+    vend_img = org_settings.get("vendor_logo_path")
+    cust_url = f"/branding/logo?which=customer"
+    vend_url = f"/branding/logo?which=vendor"
+    title = org_settings.get("customer_name") or "TEAIM"
+    sub = f"Project: {proj_code}" if proj_code else ""
+
+    # Use proxy endpoints; the public page can request them if authless is allowed or you pre-render on server.
+    l = f'<img src="{cust_url}" style="height:20px" alt="cust"/>' if cust_img else (org_settings.get("customer_name","") or "")
+    r = f'<img src="{vend_url}" style="height:20px" alt="vend"/>' if vend_img else '<span style="font-weight:700;color:{color}">TEAIM</span>'
+
+    return f"""
+    <div class="export-header" style="border-color:{color}">
+      <div class="left">{l}</div>
+      <div class="title">{title}</div>
+      <div class="right">{r}</div>
+    </div>
+    <div class="export-subtle">{sub}</div>
+    """
+
+
+This is server-side HTML you can prepend in any export (sign-off HTML, digest HTML). If you prefer not to import a new module, copy/paste the export_header_html function into the file where you build HTML.
+
+2) Sign-off public page: lightweight “confetti” + brand header
+
+Patch server/routers/signoff_docs.py (public GET + POST)
+
+At the top add:
+
+from .signoff_docs_gen import _branding_header  # re-use your existing branding header
+
+
+In open_doc, after you build html:
+
+bheader = _branding_header(sbs, d["org_id"])
+return HTMLResponse(f"""
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Arial, sans-serif; max-width:880px; margin:auto }}
+    .btn {{ padding:10px 14px; border:1px solid #ccc; border-radius:6px; cursor:pointer }}
+    .btn:hover {{ box-shadow: 0 0 14px rgba(29,228,255,.35) }}
+  </style>
+</head>
+<body>
+  {bheader}
+  {html}
+  <hr/>
+  <form method="POST" action="/api/signoff/docs/token-sign?token={token}">
+    <label>Name: <input name="signed_name" required/></label>
+    <label style="margin-left:10px;"><input type="checkbox" name="confirm" required/> I agree and sign.</label>
+    <br/><br/>
+    <input class="btn" type="submit" value="I acknowledge and sign"/>
+  </form>
+</body></html>
+""")
+
+
+In token_sign (the POST): after success, return an HTML with confetti effect:
+
+return HTMLResponse("""
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Arial, sans-serif; display:flex; align-items:center; justify-content:center; height:100vh }
+  .card { text-align:center; }
+  .confetti { position:fixed; inset:0; pointer-events:none; }
+</style></head>
+<body>
+  <canvas class="confetti" id="c"></canvas>
+  <div class="card">
+    <h2>Thank you — signed!</h2>
+    <div style="color:#666">Your acknowledgment has been recorded.</div>
+  </div>
+<script>
+  // tiny confetti
+  const canvas = document.getElementById('c'); const ctx = canvas.getContext('2d');
+  let w, h, pieces=[]; function resize(){ w=canvas.width=window.innerWidth; h=canvas.height=window.innerHeight }
+  window.addEventListener('resize', resize); resize();
+  for(let i=0;i<120;i++) pieces.push({x:Math.random()*w, y:Math.random()*-h, r:2+Math.random()*4, c:`hsl(${Math.random()*360},80%,60%)`, s:1+Math.random()*2});
+  function tick(){ ctx.clearRect(0,0,w,h); pieces.forEach(p=>{ p.y+=p.s; p.x+=Math.sin(p.y/20); if(p.y>h) p.y=-10; ctx.fillStyle=p.c; ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,Math.PI*2); ctx.fill();}); requestAnimationFrame(tick); }
+  tick();
+  setTimeout(()=>{document.querySelector('.confetti').remove();}, 4000);
+</script>
+</body></html>
+""")
+
+
+This gives a light confetti glow after signing. (No heavy lib.)
+
+3) Wellness Card v2 (dev-safe fallback)
+3A) Backend wellness summary (optional dev-safe)
+
+server/routers/wellness.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/wellness", tags=["wellness"])
+
+@router.get("/summary")
+def summary(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        rows = sb.table("team_wellness").select("created_at,score")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id).order("created_at", desc=True).limit(30).execute().data or []
+        return {"items": rows}
+    except Exception:
+        # dev-safe fallback
+        return {"items": []}
+
+
+Mount in server/main.py:
+
+from .routers import wellness
+app.include_router(wellness.router)
+
+3B) Frontend card
+
+client/src/components/WellnessCard.tsx
+
+import { useEffect, useMemo, useState } from "react";
+import { getJSON } from "@/lib/authFetch";
+import { useParams } from "react-router-dom";
+
+export default function WellnessCard(){
+  const { projectId } = useParams();
+  const [pts,setPts]=useState<{created_at:string;score:number}[]>([]);
+  useEffect(()=>{ (async()=>{ try{
+    const d = await getJSON(`/api/wellness/summary?project_id=${projectId}`);
+    setPts(d.items||[]);
+  }catch{ setPts([]); } })(); },[projectId]);
+
+  const avg = useMemo(()=>{
+    if (!pts.length) return null;
+    const s = pts.reduce((a,b)=> a + Number(b.score||0), 0) / pts.length;
+    return Math.round(s*10)/10;
+  },[pts]);
+
+  const vibe = avg==null ? "n/a"
+    : avg >= 4.2 ? "🚀 excellent"
+    : avg >= 3.5 ? "🙂 steady"
+    : avg >= 2.8 ? "😐 needs attention"
+    : "⚠️ at risk";
+
+  return (
+    <div className="brand-card p-3">
+      <div className="text-sm font-medium mb-1">Team Wellness</div>
+      {avg==null ? (
+        <div className="text-xs text-muted-foreground">No check-ins yet.</div>
+      ) : (
+        <>
+          <div className="text-2xl font-semibold">{avg}</div>
+          <div className="text-xs text-muted-foreground">{vibe}</div>
+          <div className="mt-2 h-[36px] flex items-end gap-1">
+            {(pts.slice().reverse()).map((p,i)=>(
+              <div key={i} title={`${p.score} • ${new Date(p.created_at).toLocaleDateString()}`}
+                   style={{ height: `${(Number(p.score||0)/5)*36}px`, width: '6px', background: 'var(--brand-accent)', opacity: .75 }} />
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+
+Use it on DashboardV2 (add under KPI row):
+
+// client/src/pages/DashboardV2.tsx
+import WellnessCard from "@/components/WellnessCard";
+// ...
+<div className="grid md:grid-cols-3 gap-3">
+  <WellnessCard />
+  {/* existing Sign-Offs card */}
+  <div className="md:col-span-2 brand-card p-3"> ... </div>
+</div>
+
+4) Stage Health Chip (late/at-risk summary)
+
+client/src/components/StageHealthChip.tsx
+
+import { useEffect, useState } from "react";
+import { getJSON } from "@/lib/authFetch";
+import { useParams } from "react-router-dom";
+
+export default function StageHealthChip(){
+  const { projectId } = useParams();
+  const [late,setLate]=useState<number>(0);
+  const [ok,setOk]=useState<number>(0);
+
+  useEffect(()=>{ (async()=>{ try{
+    const d = await getJSON(`/api/method/lateness?project_id=${projectId}`);
+    setLate(d?.summary?.late || 0);
+    setOk(d?.summary?.on_time_or_early || 0);
+  }catch{ setLate(0); setOk(0); } })(); },[projectId]);
+
+  if (late===0 && ok===0) return null;
+
+  return (
+    <div className="inline-flex items-center gap-2 brand-chip">
+      <span className="text-xs">Stages</span>
+      <span className="text-xs" style={{color: late>0 ? "var(--brand-warn)" : "var(--brand-good)"}}>
+        {late>0 ? `${late} late` : `${ok} on-time`}
+      </span>
+    </div>
+  );
+}
+
+
+Drop it next to KPI chips or the timeline header:
+
+// in DashboardV2 render:
+<div className="flex items-center gap-2">
+  <div className="text-sm font-medium mb-2">Phase Timeline</div>
+  <StageHealthChip />
+</div>
+
+5) Micro-interactions on primary buttons (global)
+
+You already have .brand-btn and glow; apply it to high-traffic CTAs (e.g., Export, Request Sign, Propose):
+
+<button className="brand-btn" ...>Request Sign</button>
+
+
+For a loading swoosh during long exports:
+
+const [busy,setBusy]=useState(false);
+// ...
+<button className={`brand-btn ${busy?'skeleton':''}`} onClick={doExport} disabled={busy}>{busy?'Preparing…':'Export Data Room'}</button>
+
+6) Mounts (server)
+
+Make sure these are once in server/main.py:
+
+from .routers import wellness
+app.include_router(wellness.router)
+# method_lateness was mounted in prior push
+
+7) 90-second validation
+
+Sign-off public page: after signing, a soft confetti shows.
+
+Digest/Sign-off exports: include a consistent brand header (when you use export_header_html).
+
+Dashboard: Wellness card shows sparkline (or dev-safe empty state).
+
+Stage Health chip: shows “X late” if lateness API reports late stages.

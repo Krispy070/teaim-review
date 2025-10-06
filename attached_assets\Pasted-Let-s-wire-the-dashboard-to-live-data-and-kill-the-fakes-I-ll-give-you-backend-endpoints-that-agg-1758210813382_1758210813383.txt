@@ -1,0 +1,345 @@
+Let’s wire the dashboard to live data and kill the fakes. I’ll give you:
+
+backend endpoints that aggregate real KPIs, pending items, workstreams, and integrations
+
+frontend swaps that replace mocks with live fetches (loading/empty states handled)
+
+tiny seed scripts to ingest a few “realistic” docs so the widgets light up immediately
+
+You can paste these now—no need to wait for the SQL step to finish (they’ll just return empty until your tables are visible). When SQL is done, the same code lights up.
+
+1) Backend: live Dashboard endpoints (drop-ins)
+
+Add these to /server/main.py (below your imports):
+
+from fastapi import Query
+from typing import Dict, Any, List
+import json, datetime as dt
+
+def _safe_json(x):
+    if isinstance(x, str):
+        try: return json.loads(x)
+        except: return {}
+    return x or {}
+
+@app.get("/dashboard/overview")
+def dashboard_overview(org_id: str = Query(...), project_id: str = Query(...)) -> Dict[str, Any]:
+    # counts
+    arts = sb.table("artifacts").select("id,created_at,source,title").eq("org_id", org_id).eq("project_id", project_id).execute().data or []
+    sums = sb.table("summaries").select("id,artifact_id,level,summary,risks,decisions,actions,created_at").eq("org_id", org_id).eq("project_id", project_id).execute().data or []
+    acts = sb.table("actions").select("id,status,due_date,owner_email,source_artifact").eq("org_id", org_id).eq("project_id", project_id).execute().data or []
+    sigs = []
+    try:
+        sigs = sb.table("mem_signals").select("signal,weight,observed_at").eq("org_id", org_id).eq("project_id", project_id).execute().data or []
+    except Exception:
+        pass
+
+    # derive KPIs
+    total_artifacts = len(arts)
+    total_actions = len(acts)
+    overdue_actions = sum(1 for a in acts if a.get("status") in ("open","in_progress","overdue")
+                          and a.get("due_date") and str(a["due_date"]) < str(dt.date.today()))
+    high_risks = 0
+    decisions_wk = 0
+    week_ago = dt.datetime.utcnow() - dt.timedelta(days=7)
+    for s in sums:
+        risks = _safe_json(s.get("risks"))
+        decisions = _safe_json(s.get("decisions"))
+        if isinstance(risks, list):
+            high_risks += sum(1 for r in risks if isinstance(r, dict) and str(r.get("severity","")).lower() in ("high","critical"))
+        if isinstance(decisions, list):
+            if s.get("created_at") and str(s["created_at"])[:10] >= week_ago.strftime("%Y-%m-%d"):
+                decisions_wk += len(decisions)
+
+    red_flags = []
+    if overdue_actions: red_flags.append(f"{overdue_actions} action(s) overdue")
+    if high_risks: red_flags.append(f"{high_risks} high-severity risk(s)")
+    for sig in sigs:
+        if sig.get("signal") == "morale_drop":
+            red_flags.append("Wellness dip detected")
+
+    # pending items (pull from actions open + decisions needing approval in summaries)
+    pending = [f"{(a.get('owner_email') or 'Unassigned')} → {a.get('status','open')} due {a.get('due_date')}"
+               for a in acts if a.get("status") in ("open","in_progress","overdue")][:10]
+
+    return {
+        "kpis": {
+            "totalArtifacts": total_artifacts,
+            "totalActions": total_actions,
+            "overdueActions": overdue_actions,
+            "decisionsLast7d": decisions_wk
+        },
+        "redFlags": red_flags,
+        "pending": pending
+    }
+
+@app.get("/dashboard/workstreams")
+def dashboard_workstreams(org_id: str = Query(...), project_id: str = Query(...)) -> Dict[str, Any]:
+    # naive inference: look at artifact titles/summaries and bucket keywords
+    ws_names = ["HCM","Payroll","Finance","Integrations","Security","Reporting","Cutover"]
+    ws = {n: {"name": n, "overdue": 0, "updated": None, "health": "green"} for n in ws_names}
+
+    arts = sb.table("artifacts").select("id,title,created_at").eq("org_id", org_id).eq("project_id", project_id).execute().data or []
+    acts = sb.table("actions").select("id,status,due_date").eq("org_id", org_id).eq("project_id", project_id).execute().data or []
+    sums = sb.table("summaries").select("id,summary,created_at,risks").eq("org_id", org_id).eq("project_id", project_id).execute().data or []
+
+    def tag(title):
+        t = (title or "").lower()
+        if any(k in t for k in ["integration","sftp","api","interface"]): return "Integrations"
+        if "payroll" in t: return "Payroll"
+        if "security" in t: return "Security"
+        if "report" in t or "dashboard" in t: return "Reporting"
+        if "cutover" in t: return "Cutover"
+        if "fin" in t or "gl" in t or "journal" in t: return "Finance"
+        return "HCM"
+
+    for a in arts:
+        w = ws[tag(a.get("title"))]
+        cur = w.get("updated")
+        w["updated"] = max(str(a.get("created_at") or ""), cur or "") if a.get("created_at") else cur
+
+    overdue = sum(1 for a in acts if a.get("status") in ("open","in_progress","overdue")
+                  and a.get("due_date") and str(a["due_date"]) < str(dt.date.today()))
+    # spread overdue crudely for now
+    for n in ws:
+        ws[n]["overdue"] = overdue
+
+    # set health amber/red if many risks mention that stream
+    for s in sums:
+        risks = _safe_json(s.get("risks"))
+        if isinstance(risks, list):
+            for r in risks:
+                txt = json.dumps(r).lower()
+                for n in ws:
+                    if n.lower() in txt:
+                        ws[n]["health"] = "amber"
+
+    return {"workstreams": list(ws.values())}
+
+@app.get("/dashboard/integrations")
+def dashboard_integrations(org_id: str = Query(...), project_id: str = Query(...)) -> Dict[str, Any]:
+    # Try to infer integrations from mem_entries semantic/decision bodies or artifact titles
+    items: List[Dict[str,Any]] = []
+    try:
+        mems = sb.table("mem_entries").select("type,body,created_at").eq("org_id", org_id).eq("project_id", project_id).execute().data or []
+    except Exception:
+        mems = []
+    arts = sb.table("artifacts").select("title,created_at").eq("org_id", org_id).eq("project_id", project_id).execute().data or []
+
+    def parse_pair(text: str):
+        # find patterns like "ADP -> Workday" or "ADP → Workday"
+        for arrow in ["->","→"]:
+            if arrow in text:
+                parts = [p.strip() for p in text.split(arrow)]
+                if len(parts) == 2:
+                    return parts[0], parts[1]
+        return None, None
+
+    seen = set()
+    for x in mems:
+        body = x.get("body") or ""
+        if "->" in body or "→" in body:
+            s,t = parse_pair(body)
+            if s and t:
+                key = (s,t)
+                if key not in seen:
+                    seen.add(key)
+                    items.append({"name": f"{s} → {t}", "owner":"", "status":{"Discover":True}, "pending":[]})
+
+    for a in arts:
+        title = (a.get("title") or "")
+        s,t = parse_pair(title)
+        if s and t:
+            key = (s,t)
+            if key not in seen:
+                seen.add(key)
+                items.append({"name": f"{s} → {t}", "owner":"", "status":{"Discover":True}, "pending":[]})
+
+    return {"integrations": items}
+
+
+These endpoints compute the same info your mock showed, but from live tables (and degrade gracefully if empty).
+
+2) Frontend: swap mocks for live data
+
+Add a tiny API helper: /web/src/lib/api.ts
+
+export async function getJSON(path: string, params?: Record<string,string>) {
+  const q = params ? "?" + new URLSearchParams(params).toString() : "";
+  const r = await fetch("/api" + path + q);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+
+In your Dashboard component (inside your existing React mock), replace the places that use hard-coded arrays:
+
+// at top of Dashboard file
+import { useEffect, useState } from 'react'
+import { getJSON } from '../lib/api'  // adjust path to match your structure
+
+function useOrgProject() {
+  // get from your header inputs or global state
+  const orgId = (window as any).__ORG__ || '';
+  const projectId = (window as any).__PROJ__ || '';
+  return { orgId, projectId }
+}
+
+export function LiveDashboardWidgets() {
+  const { orgId, projectId } = useOrgProject();
+  const [loading, setLoading] = useState(true);
+  const [kpis, setKpis] = useState<any>(null);
+  const [redFlags, setRedFlags] = useState<string[]>([]);
+  const [pending, setPending] = useState<string[]>([]);
+  const [workstreams, setWorkstreams] = useState<any[]>([]);
+  const [integrations, setIntegrations] = useState<any[]>([]);
+  const [err, setErr] = useState<string>("");
+
+  useEffect(() => {
+    if (!orgId || !projectId) return;
+    setLoading(true);
+    Promise.all([
+      getJSON("/dashboard/overview", { org_id: orgId, project_id: projectId }),
+      getJSON("/dashboard/workstreams", { org_id: orgId, project_id: projectId }),
+      getJSON("/dashboard/integrations", { org_id: orgId, project_id: projectId })
+    ])
+      .then(([ov, ws, ig]) => {
+        setKpis(ov.kpis); setRedFlags(ov.redFlags); setPending(ov.pending);
+        setWorkstreams(ws.workstreams || []); setIntegrations(ig.integrations || []);
+      })
+      .catch(e => setErr(e.message))
+      .finally(()=> setLoading(false));
+  }, [orgId, projectId]);
+
+  if (!orgId || !projectId) return <div className="text-sm text-amber-600">Set org_id and project_id to load live data.</div>;
+  if (loading) return <div className="text-sm text-slate-500">Loading live dashboard…</div>;
+  if (err) return <div className="text-sm text-rose-600">Error: {err}</div>;
+
+  return (
+    <div className="space-y-4">
+      <div className="rounded-2xl border p-4 grid sm:grid-cols-4 gap-3">
+        <KpiCard label="Artifacts" value={kpis?.totalArtifacts || 0}/>
+        <KpiCard label="Actions" value={kpis?.totalActions || 0}/>
+        <KpiCard label="Overdue" value={kpis?.overdueActions || 0}/>
+        <KpiCard label="Decisions (7d)" value={kpis?.decisionsLast7d || 0}/>
+      </div>
+
+      {!!redFlags.length && (
+        <div className="rounded-2xl border p-4">
+          <div className="font-semibold mb-2">Red Flags</div>
+          <ul className="list-disc pl-5 text-sm">{redFlags.map((r,i)=><li key={i}>{r}</li>)}</ul>
+        </div>
+      )}
+
+      {!!pending.length && (
+        <div className="rounded-2xl border p-4">
+          <div className="font-semibold mb-2">Pending Items</div>
+          <ul className="list-disc pl-5 text-sm">
+            {pending.map((p,i)=><li key={i}>{p}</li>)}
+          </ul>
+        </div>
+      )}
+
+      <div className="rounded-2xl border p-4">
+        <div className="font-semibold mb-2">Workstreams</div>
+        <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+          {workstreams.map(ws => (
+            <div key={ws.name} className="p-3 border rounded-xl">
+              <div className="font-semibold">{ws.name}</div>
+              <div className="text-xs text-slate-500">Updated: {ws.updated || "—"}</div>
+              <div className="text-xs">Overdue actions: {ws.overdue || 0}</div>
+              <div className={`text-xs mt-1 ${ws.health==='red'?'text-rose-600':ws.health==='amber'?'text-amber-600':'text-emerald-600'}`}>
+                Health: {ws.health}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="rounded-2xl border p-4">
+        <div className="font-semibold mb-2">Integrations</div>
+        {!integrations.length ? <div className="text-sm text-slate-500">None detected yet.</div> :
+          <ul className="list-disc pl-5 text-sm">
+            {integrations.map((it,i)=><li key={i}>{it.name}</li>)}
+          </ul>
+        }
+      </div>
+    </div>
+  )
+}
+
+function KpiCard({label, value}:{label:string, value:number}) {
+  return (
+    <div className="p-3 border rounded-xl">
+      <div className="text-xs text-slate-500">{label}</div>
+      <div className="text-2xl font-bold">{value}</div>
+    </div>
+  )
+}
+
+
+Then in your Dashboard page where you currently render the mock widgets, drop <LiveDashboardWidgets/> in place of the hard-coded KPI/workstream/pending areas (keep your timeline widget as-is for now).
+
+3) Tiny seeds to demo responsiveness (no PostgREST admin needed)
+
+Assuming your /api/ingest-sync works (REST or psycopg mode), run these from the Replit shell to fabricate 3 realistic docs:
+
+BASE="http://localhost:5000/api"
+ORG="d915376c-2bd7-4e79-b9c9-aab9d7fcb5a8"
+PROJ="dced0b98-87b4-46ff-b2a4-2cf8e627e8d2"
+
+# 1) Standup minutes (creates actions + risks via summaries)
+cat > /tmp/standup.txt <<'TXT'
+Standup Minutes 2025-09-18
+Decisions:
+- Payroll retro rules will follow policy v2 starting next sprint (owner: payroll@client.com).
+Risks:
+- SFTP certificate for ADP → Workday expires in 5 days (severity: High).
+Actions:
+- sam@client.com to deliver new SFTP cert by 2025-09-22.
+- jane@client.com to circulate payroll retro rules doc by 2025-09-21.
+TXT
+curl -s -X POST "$BASE/ingest-sync" -F "org_id=$ORG" -F "project_id=$PROJ" -F "file=@/tmp/standup.txt"
+
+# 2) Integration spec (detects Integrations)
+cat > /tmp/integration.txt <<'TXT'
+Integration Mapping
+ADP → Workday: earnings code mapping in progress; transport: SFTP daily.
+Workday → GL: summary journal posting weekly; transport: API.
+TXT
+curl -s -X POST "$BASE/ingest-sync" -F "org_id=$ORG" -F "project_id=$PROJ" -F "file=@/tmp/integration.txt"
+
+# 3) Steering notes (more decisions)
+cat > /tmp/steer.txt <<'TXT'
+Steering Committee Notes
+Decisions:
+- SIT exit criteria approved (80% tests pass, no Sev1 open).
+- Cutover rehearsal scheduled for next month.
+TXT
+curl -s -X POST "$BASE/ingest-sync" -F "org_id=$ORG" -F "project_id=$PROJ" -F "file=@/tmp/steer.txt"
+
+
+Then hit:
+
+curl -s "$BASE/diag/index-stats?org_id=$ORG&project_id=$PROJ"
+
+
+You should see chunks > 0. Refresh the Dashboard — KPIs, Red Flags, Pending, Workstreams, and Integrations should move immediately.
+
+4) Order of operations (minimal friction)
+
+Paste backend endpoints → restart.
+
+Add getJSON + LiveDashboardWidgets → drop into Dashboard page.
+
+Run the 3 seed ingests above (once SQL is green / or using psycopg mode).
+
+Refresh: demo the live dashboard.
+
+When you’re ready, I’ll wire:
+
+/ingest-email (allowlist + #proj: tags) + a curlable test,
+
+Supabase Auth (magic link) + role-based gating for Wellness/Admin,
+
+Weekly digest endpoint with a sample HTML/PDF.

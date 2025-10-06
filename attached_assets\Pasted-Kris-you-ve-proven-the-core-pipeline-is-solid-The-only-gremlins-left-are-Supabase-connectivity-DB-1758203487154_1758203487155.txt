@@ -1,0 +1,231 @@
+Kris, you’ve proven the core pipeline is solid. The only gremlins left are Supabase connectivity (DB + Storage) when writing/reading via PostgREST. Let’s make you unstoppable:
+
+✅ Keep the psycopg fallback for reads (RAG search) — already working.
+
+✅ Add psycopg writes for ingest (so we bypass PostgREST for inserts during debug).
+
+✅ Fix storage upload for the supabase-py version you have.
+
+✅ Add two quick diag endpoints to verify DB + Storage in one glance.
+
+Below are drop-in patches. Paste them and you’ll be able to upload, index, and chat with citations end-to-end right now.
+
+1) Make sure the DB URI is SSL-enabled (one-time check)
+
+In Replit → Secrets, set/replace:
+
+SUPABASE_DB_URL = postgresql://postgres:<DB_PASSWORD>@<project-ref>.supabase.co:5432/postgres?sslmode=require
+
+
+If needed, reset the DB password in Supabase → Settings → Database → Reset Password.
+
+2) Add psycopg WRITE helpers (bypass PostgREST for inserts)
+A) /server/db.py (add insert helpers)
+# /server/db.py
+import os, psycopg
+from pgvector.psycopg import register_vector
+
+def get_conn():
+    dsn = os.environ.get("SUPABASE_DB_URL")
+    if not dsn:
+        raise RuntimeError("SUPABASE_DB_URL not set")
+    conn = psycopg.connect(dsn, autocommit=True)
+    register_vector(conn)
+    return conn
+
+def insert_artifact(conn, org_id, project_id, path, mime_type, title, source):
+    with conn.cursor() as cur:
+        cur.execute("""
+            insert into artifacts (org_id, project_id, path, mime_type, title, source)
+            values (%s,%s,%s,%s,%s,%s)
+            returning id
+        """, (org_id, project_id, path, mime_type, title, source))
+        return cur.fetchone()[0]
+
+def update_artifact_chunk_count(conn, artifact_id, n):
+    with conn.cursor() as cur:
+        cur.execute("update artifacts set chunk_count=%s where id=%s", (n, artifact_id))
+
+def insert_chunks(conn, org_id, project_id, artifact_id, rows):
+    # rows: list of dicts with content, embedding, chunk_index
+    with conn.cursor() as cur:
+        cur.executemany("""
+            insert into artifact_chunks (org_id, project_id, artifact_id, chunk_index, content, embedding)
+            values (%s,%s,%s,%s,%s,%s)
+        """, [
+            (org_id, project_id, artifact_id, r["chunk_index"], r["content"], r["embedding"])
+            for r in rows
+        ])
+
+def insert_summary(conn, org_id, project_id, artifact_id, summary):
+    with conn.cursor() as cur:
+        cur.execute("""
+            insert into summaries (org_id, project_id, artifact_id, level, summary)
+            values (%s,%s,%s,'artifact',%s)
+        """, (org_id, project_id, artifact_id, summary))
+
+3) Fix storage upload for supabase-py v2
+
+supabase-py v2 expects the upload signature like this:
+
+client.storage.from_("bucket").upload(
+    path=key,
+    file=data,  # bytes
+    file_options={"content-type": "application/pdf"},  # or whatever
+    upsert=True
+)
+
+B) Patch your storage upload call in /server/main.py
+
+Replace any upload(key, data, {...}) with:
+
+# store file in Supabase Storage (v2 client signature)
+sb.storage.from_(BUCKET).upload(
+    path=key,
+    file=data,
+    file_options={"content-type": file.content_type or "application/octet-stream"},
+    upsert=True
+)
+
+
+And for signed URLs:
+
+signed = sb.storage.from_(BUCKET).create_signed_url(key, 3600)
+signed_url = signed.get("signedURL") or signed.get("signed_url")  # handle both
+
+4) /ingest-sync that writes via psycopg (not PostgREST)
+C) Drop-in /ingest-sync (replace your current debug version)
+# /server/main.py
+from fastapi import HTTPException
+from .parsing import extract_text
+from .chunking import chunk_text
+from .rag import embed_texts
+from .db import get_conn, insert_artifact, update_artifact_chunk_count, insert_chunks, insert_summary
+
+@app.post("/ingest-sync")
+async def ingest_sync(org_id: str = Form(...),
+                      project_id: str = Form(...),
+                      source: str = Form("doc"),
+                      file: UploadFile = File(...)):
+    try:
+        data = await file.read()
+        key = f"{project_id}/{file.filename}"
+
+        # 1) storage (v2 signature)
+        sb.storage.from_(BUCKET).upload(
+            path=key,
+            file=data,
+            file_options={"content-type": file.content_type or "application/octet-stream"},
+            upsert=True
+        )
+
+        # 2) DB writes via psycopg (bypass PostgREST)
+        with get_conn() as conn:
+            artifact_id = insert_artifact(
+                conn, org_id, project_id, key, file.content_type, file.filename, source
+            )
+
+            # 3) parse -> chunk -> embed -> insert chunks
+            text = extract_text(file.filename, data, file.content_type)
+            chunks = chunk_text(text, 1200, 200)
+            embs = embed_texts(chunks) if chunks else []
+            rows = [{
+                "chunk_index": i,
+                "content": c,
+                "embedding": e
+            } for i, (c, e) in enumerate(zip(chunks, embs))]
+
+            if rows:
+                insert_chunks(conn, org_id, project_id, artifact_id, rows)
+            update_artifact_chunk_count(conn, artifact_id, len(rows))
+
+            # 4) tiny summary
+            insert_summary(conn, org_id, project_id, artifact_id, text[:2000])
+
+        return {"ok": True, "artifact_id": artifact_id, "chunks": len(rows)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+This path: always works if your DB URI is correct and Storage bucket is set, regardless of PostgREST cache.
+
+5) Diags for DB + Storage (paste if you haven’t yet)
+
+Add to /server/main.py:
+
+from .db import get_conn
+import time
+
+@app.get("/diag/db")
+def diag_db():
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("select 1")
+            ok = cur.fetchone()[0] == 1
+        return {"ok": ok}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/diag/storage")
+def diag_storage():
+    try:
+        key = f"diag/{int(time.time())}.txt"
+        content = b"teaim-storage-smoke"
+        sb.storage.from_(BUCKET).upload(
+            path=key,
+            file=content,
+            file_options={"content-type": "text/plain"},
+            upsert=True
+        )
+        signed = sb.storage.from_(BUCKET).create_signed_url(key, 600)
+        url = signed.get("signedURL") or signed.get("signed_url")
+        return {"ok": True, "key": key, "signed_url": url}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+6) Quick test sequence (exact commands)
+
+A) Sanity: DB + Storage
+
+curl -s http://localhost:5000/api/diag/db
+curl -s http://localhost:5000/api/diag/storage
+
+
+Expect both to be {"ok": true,...}.
+If DB fails → fix SUPABASE_DB_URL (sslmode=require).
+If Storage fails → confirm bucket project-artifacts exists and SUPABASE_SERVICE_ROLE_KEY is correct.
+
+B) Inline ingest
+
+echo "Payroll retro rules and SIT exit criteria." > /tmp/teaim2.txt
+curl -s -X POST http://localhost:5000/api/ingest-sync \
+  -F "org_id=d915376c-2bd7-4e79-b9c9-aab9d7fcb5a8" \
+  -F "project_id=dced0b98-87b4-46ff-b2a4-2cf8e627e8d2" \
+  -F "file=@/tmp/teaim2.txt"
+
+
+Expect: {"ok":true,"artifact_id":"…","chunks":1}
+
+C) Index stats
+
+curl -s "http://localhost:5000/api/diag/index-stats?org_id=d915376c-2bd7-4e79-b9c9-aab9d7fcb5a8&project_id=dced0b98-87b4-46ff-b2a4-2cf8e627e8d2"
+
+
+Expect: "chunks": 1 (or higher)
+
+D) Library (UI)
+Library page should list the file with an Open link.
+
+E) Ask Kap
+Ask: “Summarize the latest document and list any exit criteria.”
+You should get an answer with Sources: teaim2.txt.
+
+7) When you’re happy
+
+Flip the Upload button back to /api/ingest (background mode).
+
+Keep the psycopg read/write fallbacks in place; they’re your “always works” path.
+
+Next up: email dropbox + Supabase Auth.
+
+Shoot me the outputs of /api/diag/db, /api/diag/storage, and the /api/ingest-sync response, and I’ll confirm we’re airtight and move you to the email drop + auth step.

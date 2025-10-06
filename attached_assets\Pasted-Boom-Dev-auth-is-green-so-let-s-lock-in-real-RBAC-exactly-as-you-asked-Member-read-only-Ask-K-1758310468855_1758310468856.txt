@@ -1,0 +1,378 @@
+Boom. Dev auth is green, so let’s lock in real RBAC exactly as you asked:
+
+Member: read-only + Ask Kap (no writes).
+
+Admin: full control + Kap can write through you.
+…and we’ll scaffold the rest (owner/pm/lead/guest + signer flag) so you can expand without rewiring.
+
+Below are paste-ready patches in this order:
+
+1) Supabase SQL — roles, signer flag, helpers, and policies
+
+Run in Supabase SQL editor:
+
+-- 1) Project membership w/ signer flag
+create table if not exists public.project_members (
+  org_id uuid not null,
+  project_id uuid not null,
+  user_id uuid not null,
+  role text not null check (role in ('owner','admin','pm','lead','member','guest')),
+  can_sign boolean not null default false,
+  created_at timestamptz not null default now(),
+  primary key (org_id, project_id, user_id)
+);
+
+create index if not exists idx_pm_user on public.project_members(user_id);
+create index if not exists idx_pm_proj on public.project_members(project_id);
+
+-- 2) Helper fns (reuse if you already have current_org/is_member)
+create or replace function public.current_org() returns uuid
+language sql stable as $$
+  select nullif(current_setting('request.jwt.claims', true)::jsonb->>'org_id','')::uuid;
+$$;
+
+create or replace function public.is_member(_org uuid, _project uuid) returns boolean
+language sql stable as $$
+  select exists(
+    select 1 from public.project_members pm
+    where pm.org_id=_org and pm.project_id=_project and pm.user_id=auth.uid()
+  );
+$$;
+
+create or replace function public.member_role(_org uuid, _project uuid) returns text
+language sql stable as $$
+  select role from public.project_members
+  where org_id=_org and project_id=_project and user_id=auth.uid()
+  limit 1;
+$$;
+
+create or replace function public.has_role(_org uuid, _project uuid, _roles text[]) returns boolean
+language sql stable as $$
+  select coalesce(member_role(_org,_project) = any(_roles), false);
+$$;
+
+create or replace function public.can_sign_stage(_org uuid, _project uuid) returns boolean
+language sql stable as $$
+  select coalesce( exists(
+    select 1 from public.project_members
+    where org_id=_org and project_id=_project and user_id=auth.uid() and (can_sign or role in ('owner','admin'))
+  ), false);
+$$;
+
+-- 3) Enable RLS everywhere important (example set; repeat pattern)
+alter table public.project_members enable row level security;
+alter table public.project_stages    enable row level security;
+alter table public.actions           enable row level security;
+alter table public.risks             enable row level security;
+alter table public.decisions         enable row level security;
+alter table public.artifact_chunks   enable row level security;
+alter table public.audit_events      enable row level security;
+
+-- 4) Membership policies
+create policy "pm_read_self_or_admin_owner"
+on public.project_members for select
+using (
+  org_id = public.current_org()
+  and (user_id = auth.uid() or public.has_role(org_id, project_id, array['owner','admin']))
+);
+
+create policy "pm_insert_admin_owner"
+on public.project_members for insert
+with check (
+  org_id = public.current_org()
+  and public.has_role(org_id, project_id, array['owner','admin'])
+);
+
+create policy "pm_update_admin_owner"
+on public.project_members for update
+using (
+  org_id = public.current_org()
+  and public.has_role(org_id, project_id, array['owner','admin'])
+)
+with check (
+  org_id = public.current_org()
+  and public.has_role(org_id, project_id, array['owner','admin'])
+);
+
+-- 5) Stages — read: any member; create/request: pm/lead/admin/owner; decision: signer/admin/owner
+create policy "stages_select_members"
+on public.project_stages for select
+using (org_id = public.current_org() and public.is_member(org_id, project_id));
+
+create policy "stages_insert_edit_pm_plus"
+on public.project_stages for insert
+with check (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm','lead']));
+
+create policy "stages_update_pm_plus"
+on public.project_stages for update
+using (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm','lead']))
+with check (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm','lead']));
+
+create policy "stages_update_decision_signers"
+on public.project_stages for update
+using (org_id = public.current_org() and public.can_sign_stage(org_id, project_id))
+with check (org_id = public.current_org() and public.can_sign_stage(org_id, project_id));
+
+-- 6) Read-only tables for members (RAG + logs)
+create policy "chunks_read_members"
+on public.artifact_chunks for select
+using (org_id = public.current_org() and public.is_member(org_id, project_id));
+
+create policy "audit_read_members"
+on public.audit_events for select
+using (org_id = public.current_org() and public.is_member(org_id, project_id));
+
+-- 7) Actions/risks/decisions — read: members; write: pm/lead/admin/owner
+create policy "actions_select_members" on public.actions for select
+using (org_id = public.current_org() and public.is_member(org_id, project_id));
+create policy "actions_insert_pm_plus" on public.actions for insert
+with check (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm','lead']));
+create policy "actions_update_pm_plus" on public.actions for update
+using (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm','lead']))
+with check (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm','lead']));
+
+-- (repeat the 3 policies above for risks and decisions tables)
+
+-- 8) PostgREST refresh (so UI sees changes immediately)
+select pg_notify('pgrst','reload schema');
+
+
+TL;DR: Member can read everything + RAG; Admin (and above) can write; Signer is a toggle on membership (can_sign) that allows stage approvals without making them an admin.
+
+2) Backend guards — roles + signer, wired into your existing routers
+
+server/app/guards.py
+
+from fastapi import Depends, HTTPException, Query
+from .tenant import tenant_ctx, TenantCtx
+from .deps import get_user_supabase
+
+def member_ctx(project_id: str = Query(...), ctx: TenantCtx = Depends(tenant_ctx)):
+  sb = get_user_supabase(ctx)
+  # RLS ensures we only see rows if member; this extra check gives a clean 403
+  m = sb.table("project_members").select("role, can_sign").eq("project_id", project_id).limit(1).execute().data
+  if not m:
+    raise HTTPException(403, "Not a member of this project")
+  ctx.role = m[0]["role"]
+  ctx.can_sign = m[0]["can_sign"]
+  return ctx
+
+def require_role(allowed: set[str]):
+  def _inner(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    if ctx.role not in allowed:
+      raise HTTPException(403, f"Requires role: {', '.join(sorted(allowed))}")
+    return ctx
+  return _inner
+
+def require_signer_or_admin():
+  def _inner(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    if ctx.role in {"owner","admin"} or getattr(ctx, "can_sign", False):
+      return ctx
+    raise HTTPException(403, "Requires signer or admin")
+  return _inner
+
+
+Use in Stages API (only the deps change; your handlers stay the same):
+
+# server/app/routers/stages.py (snippets)
+from ..guards import member_ctx, require_role, require_signer_or_admin
+PM_PLUS = require_role({"owner","admin","pm","lead"})
+SIGNER_OR_ADMIN = require_signer_or_admin()
+
+@router.get("/list")
+def list_stages(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    ...
+
+@router.post("/create")
+def create_stage(..., project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    ...
+
+@router.post("/request-signoff")
+def request_signoff(..., project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    ...
+
+@router.post("/decision")
+def stage_decision(..., project_id: str = Query(...), ctx: TenantCtx = Depends(SIGNER_OR_ADMIN)):
+    ...
+
+
+Kap write endpoints (mem/actions updates) should be require_role({"owner","admin"}) and require AGENT_API_KEY header—exactly like we sketched earlier.
+
+3) Members API — manage roles & signer flag (owner/admin only)
+
+server/app/routers/members.py
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/members", tags=["members"])
+ADMIN_OR_OWNER = require_role({"owner","admin"})
+
+class UpsertBody(BaseModel):
+  user_id: str
+  role: str  # 'owner','admin','pm','lead','member','guest'
+  can_sign: bool = False
+
+@router.get("/list")
+def list_members(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+  sb = get_user_supabase(ctx)
+  out = sb.table("project_members").select("user_id, role, can_sign, created_at")\
+        .eq("project_id", project_id).order("created_at", desc=False).execute()
+  return {"members": out.data}
+
+@router.post("/upsert")
+def upsert_member(body: UpsertBody, project_id: str = Query(...), ctx: TenantCtx = Depends(ADMIN_OR_OWNER)):
+  # Optional guard: only 'owner' can assign 'owner' or 'admin'
+  if body.role in {"owner","admin"} and ctx.role != "owner":
+    raise HTTPException(403, "Only owner can assign admin/owner")
+  sb = get_user_supabase(ctx)
+  sb.table("project_members").upsert({
+    "org_id": ctx.org_id, "project_id": project_id,
+    "user_id": body.user_id, "role": body.role, "can_sign": body.can_sign
+  }, on_conflict="org_id,project_id,user_id").execute()
+  return {"ok": True}
+
+@router.post("/remove")
+def remove_member(user_id: str, project_id: str = Query(...), ctx: TenantCtx = Depends(ADMIN_OR_OWNER)):
+  if ctx.role != "owner" and user_id == ctx.user_id:
+    raise HTTPException(400, "Admins cannot remove themselves")
+  sb = get_user_supabase(ctx)
+  sb.table("project_members").delete().eq("org_id", ctx.org_id)\
+    .eq("project_id", project_id).eq("user_id", user_id).execute()
+  return {"ok": True}
+
+
+Don’t forget to app.include_router(members.router) in main.py.
+
+4) Frontend — simple Admin → Members page
+
+client/src/pages/AdminMembers.tsx
+
+import { useEffect, useState } from 'react';
+import { apiGet, apiPost } from '@/lib/api';
+import { useParams } from 'react-router-dom';
+import { Button } from '@/components/ui/button';
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
+import { Switch } from '@/components/ui/switch';
+import { Input } from '@/components/ui/input';
+
+type Member = { user_id: string; role: string; can_sign: boolean; created_at: string };
+
+export default function AdminMembers() {
+  const { projectId } = useParams();
+  const [members, setMembers] = useState<Member[]>([]);
+  const [newUser, setNewUser] = useState('');
+  const [newRole, setNewRole] = useState('member');
+  const [newSign, setNewSign] = useState(false);
+
+  async function load() {
+    const data = await apiGet<{members: Member[]}>('/members/list', { project_id: projectId! });
+    setMembers(data.members);
+  }
+  useEffect(() => { load(); }, [projectId]);
+
+  async function upsert(u: string, role: string, can_sign: boolean) {
+    await apiPost('/members/upsert', { user_id: u, role, can_sign }, { project_id: projectId! });
+    await load();
+  }
+  async function remove(u: string) {
+    await apiPost('/members/remove', undefined, { project_id: projectId!, user_id: u });
+    await load();
+  }
+
+  return (
+    <div className="p-6 space-y-6">
+      <h1 className="text-xl font-semibold">Project Members</h1>
+
+      <div className="flex gap-2 items-center">
+        <Input placeholder="User UUID" value={newUser} onChange={e=>setNewUser(e.target.value)} />
+        <Select value={newRole} onValueChange={setNewRole}>
+          <SelectTrigger className="w-48"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            {['owner','admin','pm','lead','member','guest'].map(r=>(
+              <SelectItem key={r} value={r}>{r}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <div className="flex items-center gap-2">
+          <Switch checked={newSign} onCheckedChange={setNewSign} /> <span>Signer</span>
+        </div>
+        <Button onClick={()=>upsert(newUser, newRole, newSign)}>Add/Update</Button>
+      </div>
+
+      <div className="space-y-2">
+        {members.map(m=>(
+          <div key={m.user_id} className="flex items-center justify-between border rounded-lg p-3">
+            <div>
+              <div className="font-medium">{m.user_id}</div>
+              <div className="text-sm text-muted-foreground">{m.role} {m.can_sign ? '• signer' : ''}</div>
+            </div>
+            <div className="flex items-center gap-2">
+              <Select value={m.role} onValueChange={(r)=>upsert(m.user_id, r, m.can_sign)}>
+                <SelectTrigger className="w-40"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {['owner','admin','pm','lead','member','guest'].map(r=><SelectItem key={r} value={r}>{r}</SelectItem>)}
+                </SelectContent>
+              </Select>
+              <div className="flex items-center gap-2">
+                <Switch checked={m.can_sign} onCheckedChange={(v)=>upsert(m.user_id, m.role, v)} />
+                <span>Signer</span>
+              </div>
+              <Button variant="destructive" onClick={()=>remove(m.user_id)}>Remove</Button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
+Add route + sidebar link under Admin:
+
+// route
+{ path: "/projects/:projectId/admin/members", element: <AdminMembers/> }
+
+// sidebar item (visible only for owner/admin)
+
+5) Quick seed & test
+
+Seed Kris as owner (one time):
+
+insert into public.project_members (org_id, project_id, user_id, role, can_sign)
+values ('<ORG_UUID>', '<PROJ_UUID>', '<KRIS_USER_UUID>', 'owner', true)
+on conflict (org_id, project_id, user_id) do update set role=excluded.role, can_sign=excluded.can_sign;
+
+select pg_notify('pgrst','reload schema');
+
+
+Member read-only leak test (expect 403 on writes):
+
+# As a MEMBER token (or dev headers for a member):
+curl -s -i -H "Authorization: Bearer $MEMBER_JWT" \
+  -X POST "$APP/api/stages/create?project_id=<PROJ_UUID>" \
+  -H "Content-Type: application/json" -d '{"title":"Nope"}'
+# -> 403
+
+
+Admin write test (expect 200):
+
+curl -s -i -H "Authorization: Bearer $ADMIN_JWT" \
+  -X POST "$APP/api/stages/create?project_id=<PROJ_UUID>" \
+  -H "Content-Type: application/json" -d '{"title":"Discovery"}'
+# -> 200
+
+What you get right now
+
+Members (view-only + Ask Kap): can see dashboards, documents, Meeting Summaries, search RAG; cannot mutate.
+
+Admins (you): everything, including Kap-writes (guarded by AGENT_API_KEY).
+
+Signer: toggle per member; lets a customer (or you) approve stages without admin power.
+
+Clean growth path: owner/pm/lead/guest are wired and can be used as you scale.
+
+If you hit a file path mismatch, drop me your exact filenames and I’ll patch them 1:1. Want me to add a tiny Role Matrix card on the Members page (what each role can/can’t do) and hide buttons client-side to match the server rules?

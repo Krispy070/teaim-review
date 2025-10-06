@@ -1,0 +1,351 @@
+Next Big Build v2.12.12 (two sprints in one). Everything is copy-paste ready, Brand v2–aware, and dev-safe (new endpoints catch/return gracefully if a table/column is missing).
+
+Landing now:
+
+Request Sign-Off v4.1 → pending table: Revoke expired, domain search, Resend templates (remembered per project: subject/body) + custom resend using template
+
+Stages batch → Apply template to start+end (per-area) with diff warnings, plus Lock durations (min/max guardrails) while editing
+
+Digests → in-app Digest Preview page (brand header), and Send test to me
+
+Wellness Admin → Compare-both CSV (7d & 30d in one file) + tidy print CSS for per-user PDF (uses existing HTML export)
+
+1) Request Sign-Off v4.1 — Revoke expired + Resend templates + domain search
+1A) Backend: revoke expired & domain search
+
+server/routers/signoff_pending.py (extend your existing file)
+
+# add imports at top if missing
+from fastapi import APIRouter, Depends, Query
+from datetime import datetime, timezone, timedelta
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/signoff", tags=["signoff"])
+
+@router.get("/pending_list")
+def pending_list(
+    project_id: str = Query(...),
+    stage_id: str | None = None,
+    within_hours: int = 48,
+    q: str | None = None,
+    domain: str | None = None,   # NEW
+    page: int = 1, page_size: int = 50,
+    ctx: TenantCtx = Depends(member_ctx)
+):
+    sb = get_user_supabase(ctx)
+    try:
+        doc_ids=[]
+        if stage_id:
+            d = sb.table("signoff_docs").select("id").eq("org_id", ctx.org_id)\
+                 .eq("project_id", project_id).eq("stage_id", stage_id).limit(1).execute().data or []
+            if not d: return {"items": [], "total": 0, "page": 1, "page_size": page_size}
+            doc_ids=[d[0]["id"]]
+        qbase = sb.table("signoff_doc_tokens").select("token,doc_id,signer_email,created_at,expires_at")\
+                 .eq("org_id", ctx.org_id).eq("project_id", project_id).is_("used_at","null").is_("revoked_at","null")
+        if doc_ids: qbase = qbase.in_("doc_id", doc_ids)
+        if q: qbase = qbase.ilike("signer_email", f"%{q}%")
+        if domain: qbase = qbase.ilike("signer_email", f"%@{domain}%")
+        rows = qbase.order("created_at", desc=True).limit(2000).execute().data or []
+
+        total = len(rows)
+        rows = rows[(page-1)*page_size : page*page_size]
+
+        now = datetime.now(timezone.utc)
+        for r in rows:
+            exp = r.get("expires_at")
+            try:
+                if exp:
+                    ed = datetime.fromisoformat(exp.replace("Z","+00:00"))
+                    r["expiring_soon"] = (ed - now) <= timedelta(hours=within_hours)
+                    r["hours_left"] = round(((ed - now).total_seconds())/3600, 1)
+                else:
+                    r["expiring_soon"], r["hours_left"] = False, None
+            except Exception:
+                r["expiring_soon"], r["hours_left"] = False, None
+        return {"items": rows, "total": total, "page": page, "page_size": page_size}
+    except Exception:
+        return {"items": [], "total": 0, "page": 1, "page_size": page_size}
+
+@router.post("/revoke_expired")
+def revoke_expired(project_id: str = Query(...), stage_id: str | None = None,
+                   ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    sb = get_user_supabase(ctx)
+    try:
+        q = sb.table("signoff_doc_tokens").update({"revoked_at":"now()"})\
+             .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+             .is_("used_at","null").lt("expires_at", datetime.now(timezone.utc).isoformat())
+        if stage_id:
+            d = sb.table("signoff_docs").select("id").eq("org_id", ctx.org_id)\
+                 .eq("project_id", project_id).eq("stage_id", stage_id).limit(1).execute().data or []
+            if not d: return {"ok": True, "updated": 0}
+            q = q.eq("doc_id", d[0]["id"])
+        r = q.execute()
+        return {"ok": True, "updated": getattr(r, "count", None)}
+    except Exception:
+        return {"ok": False, "updated": 0}
+
+
+(Already mounted earlier.)
+
+1B) Frontend: pending search by domain + Revoke expired + Resend templates
+
+Patch client/src/components/SignoffRequestModal.tsx (pending control section)
+
+Add local resend template storage (per project):
+
+const storeTpl = `kap.signoff.resendTpl.${projectId}`;
+const [tplSubj,setTplSubj]=useState("[Reminder] Sign-off request pending");
+const [tplHtml,setTplHtml]=useState("<p>Please sign: {{LINK}}</p>");
+useEffect(()=>{ try{
+  const t = JSON.parse(localStorage.getItem(storeTpl) || "{}");
+  if (t.subj) setTplSubj(t.subj); if (t.html) setTplHtml(t.html);
+}catch{} },[projectId]);
+function saveTpl(){ localStorage.setItem(storeTpl, JSON.stringify({subj: tplSubj, html: tplHtml})); alert("Template saved"); }
+
+
+Add domain filter + revoke expired button:
+
+const [qTok,setQTok]=useState(""); const [domain,setDomain]=useState("");
+// …
+<div className="flex items-center gap-2 text-xs mb-1">
+  <input className="border rounded p-1 text-xs" placeholder="Search email…" value={qTok} onChange={e=>{setPage(1); setQTok(e.target.value)}} />
+  <input className="border rounded p-1 text-xs" placeholder="domain (acme.com)" value={domain} onChange={e=>{setPage(1); setDomain(e.target.value)}} />
+  <button className="brand-btn text-[11px]" onClick={()=>downloadGET(`/api/signoff/pending_export.csv?project_id=${projectId}&stage_id=${stageId}`, "pending.csv")}>Export CSV</button>
+  <button className="brand-btn text-[11px]" onClick={async()=>{
+    await fetch(`/api/signoff/revoke_expired?project_id=${projectId}&stage_id=${stageId}`, {method:"POST",credentials:"include"});
+    loadPending(); alert("Revoked expired tokens");
+  }}>Revoke expired</button>
+  <div className="ml-auto flex items-center gap-1">
+    <button className="brand-btn text-[11px]" disabled={page<=1} onClick={()=>setPage(p=>Math.max(1,p-1))}>Prev</button>
+    <span>{page} / {Math.max(1, Math.ceil(total/pageSize))}</span>
+    <button className="brand-btn text-[11px]" disabled={page*pageSize>=total} onClick={()=>setPage(p=>p+1)}>Next</button>
+  </div>
+</div>
+
+
+Make loadPending include domain:
+
+const qs = new URLSearchParams({ project_id, stage_id: stageId, page:String(page), page_size:String(pageSize) });
+if (qTok.trim()) qs.set("q", qTok.trim());
+if (domain.trim()) qs.set("domain", domain.trim());
+
+
+Template resend UI:
+
+<div className="border rounded p-2 mt-2">
+  <div className="text-xs font-medium mb-1">Custom resend template</div>
+  <div className="grid md:grid-cols-2 gap-2">
+    <input className="border rounded p-2 text-sm" placeholder="Subject" value={tplSubj} onChange={e=>setTplSubj(e.target.value)} />
+    <button className="brand-btn text-xs" onClick={saveTpl}>Save template</button>
+  </div>
+  <textarea className="border rounded p-2 w-full text-sm mt-1" rows={2} placeholder="HTML ({{LINK}} placeholder)" value={tplHtml} onChange={e=>setTplHtml(e.target.value)} />
+  <div className="flex items-center gap-2 mt-1">
+    <button className="brand-btn text-[11px]" disabled={!anySel} onClick={async()=>{
+      const tokens = Object.keys(selTok).filter(k=>selTok[k]);
+      await fetch(`/api/signoff/resend_selected_custom?project_id=${projectId}`, {
+        method:"POST", credentials:"include", headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ tokens, subject: tplSubj, html: tplHtml, min_hours_between: 12 })
+      });
+      alert("Custom reminders sent (throttled)");
+    }}>Resend (template ⟶ selected)</button>
+  </div>
+</div>
+
+2) Stages batch — template apply to start+end (per-area) + diff warnings + Lock durations
+2A) Use the StageTemplateApply you added in v2.12.10 (per-area).
+
+Add warning style in preview rows where duration < min or > max:
+
+// in preview row:
+const dur = (diffDays(p.new_start, p.new_end) || 0);
+<td className={`p-1 ${dur<rails.min_days || dur>rails.max_days ? 'text-red-500 font-medium' : ''}`}>{p.new_end||"—"}</td>
+
+2B) Lock durations (client-side guard)
+
+Patch client/src/pages/Stages.tsx:
+
+const [lockDurations,setLockDurations]=useState(true);
+// toolbar toggle (top-level)
+<label className="text-xs flex items-center gap-1"><input type="checkbox" checked={lockDurations} onChange={e=>setLockDurations(e.target.checked)} /> Lock durations (min/max)</label>
+
+
+Wrap end_date/saveField calls:
+
+async function safeSaveField(id:string, patch:any){
+  if (lockDurations && (patch.start_date || patch.end_date)){
+    const s = stages.find(x=>x.id===id);
+    const newStart = patch.start_date || s?.start_date;
+    const newEnd   = patch.end_date   || s?.end_date;
+    const span = diffDays(newStart, newEnd);
+    if (span!=null && (span < rails.min_days || span > rails.max_days)){
+      alert(`Duration ${span}d violates guardrails (${rails.min_days}–${rails.max_days})`); return;
+    }
+  }
+  await saveField(id, patch);
+}
+
+
+Use safeSaveField everywhere you previously called saveField for dates.
+
+3) Digests — in-app Digest Preview + “Send test to me”
+3A) Backend: preview HTML + send test
+
+server/routers/digest_preview.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import HTMLResponse
+import os
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+from ..brand.export_header import export_header_html
+from .digest import _compose_counts_filtered  # reuse your internal helpers as appropriate
+
+router = APIRouter(prefix="/api/digest", tags=["digest"])
+
+@router.get("/preview_html", response_class=HTMLResponse)
+def preview_html(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    org = sb.table("org_branding").select("*").eq("org_id", ctx.org_id).single().execute().data or {}
+    proj = sb.table("projects").select("code").eq("id", project_id).single().execute().data or {}
+    code = proj.get("code") or project_id
+    hdr = export_header_html(org, code)
+
+    # naive counts demo (dev-safe)
+    counts = {"actions":0,"risks":0,"decisions":0}
+    try:
+        counts["actions"] = sb.table("actions").select("id", count="exact").eq("org_id", ctx.org_id).eq("project_id", project_id).execute().count or 0
+        counts["risks"] = sb.table("risks").select("id", count="exact").eq("org_id", ctx.org_id).eq("project_id", project_id).execute().count or 0
+        counts["decisions"] = sb.table("decisions").select("id", count="exact").eq("org_id", ctx.org_id).eq("project_id", project_id).execute().count or 0
+    except Exception: ...
+
+    chips = "".join([f"<span style='border:1px solid #ddd;border-radius:6px;padding:6px 10px;margin-right:6px'>{k}: <b>{v}</b></span>" for k,v in counts.items()])
+    html = f"<html><body style='font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:880px;margin:auto'>{hdr}<h2>Digest Preview</h2><div>{chips}</div><hr/><div style='color:#666;font-size:12px'>This is a preview. Actual email content may include deltas & change lists.</div></body></html>"
+    return HTMLResponse(html)
+
+@router.post("/send_test")
+def send_test(project_id: str = Query(...), ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    sb = get_user_supabase(ctx)
+    try:
+        # best effort find user email
+        em = sb.table("users_profile").select("email").eq("user_id", ctx.user_id).single().execute().data or {}
+        email = em.get("email")
+        if not email: return {"ok": False, "reason": "no email"}
+        from ..email.util import mailgun_send_html, send_guard
+        ok,_ = send_guard(sb, ctx.org_id, project_id, "digest_test", email)
+        if ok:
+            base = os.getenv("APP_BASE_URL","").rstrip("/")
+            link = f"{base}/projects/{project_id}/dashboard"
+            mailgun_send_html([email], "[Test] Digest Preview", f"<p>Your digest preview is ready.</p><p><a href='{link}'>Open TEAIM</a></p>")
+            return {"ok": True}
+        return {"ok": False, "reason": "guard blocked"}
+    except Exception:
+        return {"ok": False}
+
+
+Mount in server/main.py:
+
+from .routers import digest_preview
+app.include_router(digest_preview.router)
+
+3B) Frontend: DigestPreview page
+
+client/src/pages/DigestPreview.tsx (new)
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+
+export default function DigestPreview(){
+  const { projectId } = useParams();
+  const [html,setHtml]=useState("<div class='p-3'>Loading…</div>");
+  useEffect(()=>{ (async()=>{
+    const r = await fetch(`/api/digest/preview_html?project_id=${projectId}`, { credentials:"include" });
+    setHtml(await r.text());
+  })(); },[projectId]);
+
+  async function sendTest(){
+    const r = await fetch(`/api/digest/send_test?project_id=${projectId}`, { method:"POST", credentials:"include" });
+    const d = await r.json().catch(()=>({ok:false}));
+    alert(d.ok ? "Sent" : "Failed to send test");
+  }
+
+  return (
+    <div className="brand-card p-3 space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="text-sm font-medium">Digest Preview</div>
+        <button className="brand-btn text-xs" onClick={sendTest}>Send test to me</button>
+      </div>
+      <iframe title="digest" className="w-full h-[70vh] border rounded bg-white" srcDoc={html}/>
+    </div>
+  );
+}
+
+
+Route in client/src/App.jsx:
+
+import DigestPreview from "@/pages/DigestPreview";
+// …
+<Route path="/projects/:projectId/admin/digest-preview" element={<DigestPreview/>} />
+
+4) Wellness Admin — Compare-both CSV (7 & 30 together)
+
+server/routers/wellness_compare_both_csv.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
+import io, csv
+from datetime import datetime, timedelta, timezone
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/wellness", tags=["wellness"])
+
+def count_in_range(sb, org_id, project_id, start, end=None):
+    q = sb.table("team_wellness").select("created_at").eq("org_id", org_id).eq("project_id", project_id).gte("created_at", start.isoformat())
+    if end: q = q.lte("created_at", end.isoformat())
+    try: return len(q.execute().data or [])
+    except Exception: return 0
+
+@router.get("/compare_both.csv")
+def compare_both(project_id: str = Query(...), ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    sb = get_user_supabase(ctx)
+    now = datetime.now(timezone.utc).date()
+
+    def row(days):
+        end = now; start = end - timedelta(days=days-1)
+        prev_start = start - timedelta(days=days); prev_end = start - timedelta(days=1)
+        cur = count_in_range(sb, ctx.org_id, project_id, start)
+        prv = count_in_range(sb, ctx.org_id, project_id, prev_start, prev_end)
+        delta = cur - prv; pct = (delta/prv*100.0) if prv>0 else None
+        return [days, cur, prv, delta, f"{pct:.1f}%" if pct is not None else "n/a"]
+
+    s = io.StringIO(); w = csv.writer(s); w.writerow(["days","current","previous","delta","pct"])
+    w.writerow(row(7)); w.writerow(row(30)); s.seek(0)
+    return StreamingResponse(iter([s.read()]), media_type="text/csv",
+      headers={"Content-Disposition": 'attachment; filename="wellness_compare_7_30.csv"'})
+
+
+Mount in server/main.py:
+
+from .routers import wellness_compare_both_csv
+app.include_router(wellness_compare_both_csv.router)
+
+
+Admin UI — add a combined CSV button:
+
+<button className="brand-btn text-xs" onClick={()=>downloadGET(`/api/wellness/compare_both.csv?project_id=${projectId}`, "wellness_compare_7_30.csv")}>
+  Export Compare 7 & 30 CSV
+</button>
+
+5) 120-second validation
+
+Sign-Off v4.1: pending search & domain filter; Revoke expired; selected Resend using saved templates; pagination & CSV export work
+
+Stages: Apply Template (Preview) to start+end per area with guardrail warnings; Lock durations toggle blocks invalid edits; Shift by weeks works
+
+Digests: in-app Digest Preview with brand header; Send test to me works (dev-safe guards); links already open pages with filters & anchors
+
+Wellness: Compare 7 & 30 CSV; per-user modals still print HTML → PDF cleanly (brand header)

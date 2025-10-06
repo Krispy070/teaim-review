@@ -1,0 +1,452 @@
+Next Big Build v2.13 — Data & Reporting foundation (two sprints in one). It gives you a framework for both Data (Workbooks) and Reporting (Legacy → Workday) with CRUD, runs/iterations, metrics, CSV import/export, and a clean UI under Data & Reporting. Everything is copy-paste ready, Brand v2–aware, and dev-safe (new endpoints gracefully no-op if tables/columns are missing).
+
+What lands now (you’ll feel it immediately)
+
+Workbooks tracker (Data migration): workbook name, area, intro/start/as-of/due dates, status, iterations planned/done, run logs (each iteration), metrics & upcoming dues, CSV export/import (optional import stub)
+
+Reports registry (Legacy → Workday): name, legacy system, owner, frequency, due, status, delivered vs custom, Workday report name/type, design/sample links, notes, CSV export
+
+Data & Reporting page with tabs (Workbooks / Reports), bulk actions, KPI header
+
+Mounts into /projects/:projectId/reporting (your sidebar link is already there)
+
+This is a framework: we can add workbook-file validation & ingest hooks later when you’re ready to wire real Excel flows.
+
+1) Backend — Workbooks (data migration) + runs/iterations
+1A) Workbooks API (dev-safe CRUD + metrics + export)
+
+server/routers/workbooks.py (new)
+
+from fastapi import APIRouter, Depends, Query, HTTPException
+from pydantic import BaseModel
+from typing import Optional, List
+from datetime import datetime, date, timedelta
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+import io, csv
+
+router = APIRouter(prefix="/api/workbooks", tags=["workbooks"])
+PM_PLUS = require_role({"owner","admin","pm"})
+
+class Workbook(BaseModel):
+    id: Optional[str] = None
+    name: str
+    area: Optional[str] = None
+    intro_date: Optional[str] = None
+    start_date: Optional[str] = None
+    asof_date: Optional[str] = None
+    due_date: Optional[str] = None
+    iterations_planned: Optional[int] = 0
+    iterations_done: Optional[int] = 0
+    status: Optional[str] = "planned"  # planned|in_progress|done|blocked
+    notes: Optional[str] = None
+
+@router.get("/list")
+def list_workbooks(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        rows = sb.table("workbooks").select("*")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+               .order("due_date", desc=True).limit(1000).execute().data or []
+        return {"items": rows}
+    except Exception:
+        return {"items": []}
+
+@router.post("/upsert")
+def upsert_workbook(body: Workbook, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    try:
+        data = body.model_dump()
+        data.update({"org_id": ctx.org_id, "project_id": project_id})
+        if body.id:
+            sb.table("workbooks").update(data).eq("org_id", ctx.org_id)\
+              .eq("project_id", project_id).eq("id", body.id).execute()
+        else:
+            sb.table("workbooks").insert(data).execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+@router.post("/delete")
+def delete_workbook(id: str = Query(...), project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    try:
+        sb.table("workbooks").delete().eq("org_id", ctx.org_id)\
+          .eq("project_id", project_id).eq("id", id).execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+# iterations / runs
+class RunLog(BaseModel):
+    workbook_id: str
+    run_no: Optional[int] = None
+    pulled_on: Optional[str] = None  # date
+    rows: Optional[int] = None
+    status: Optional[str] = "pulled"  # pulled|validated|loaded|failed
+    notes: Optional[str] = None
+
+@router.get("/runs")
+def runs(workbook_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        rows = sb.table("workbook_runs").select("*").eq("org_id", ctx.org_id)\
+               .eq("workbook_id", workbook_id).order("run_no", desc=True).limit(500).execute().data or []
+        return {"items": rows}
+    except Exception:
+        return {"items": []}
+
+@router.post("/runs/add")
+def add_run(body: RunLog, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    try:
+        # auto run_no
+        r = sb.table("workbook_runs").select("run_no", count="exact")\
+             .eq("org_id", ctx.org_id).eq("workbook_id", body.workbook_id).execute()
+        next_no = (r.count or 0) + 1
+        data = body.model_dump()
+        data.update({"org_id": ctx.org_id, "project_id": project_id, "run_no": data.get("run_no") or next_no})
+        sb.table("workbook_runs").insert(data).execute()
+        # bump iterations_done
+        sb.table("workbooks").update({"iterations_done": (next_no)})\
+          .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", body.workbook_id).execute()
+        return {"ok": True, "run_no": next_no}
+    except Exception:
+        return {"ok": False}
+
+@router.get("/metrics")
+def metrics(project_id: str = Query(...), upcoming_days: int = 14, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        wbs = sb.table("workbooks").select("id,name,area,due_date,iterations_planned,iterations_done,status")\
+              .eq("org_id", ctx.org_id).eq("project_id", project_id).execute().data or []
+    except Exception:
+        wbs = []
+    total = len(wbs)
+    done = len([w for w in wbs if (w.get("status") or "")=="done"])
+    inprog = len([w for w in wbs if (w.get("status") or "")=="in_progress"])
+    blocked = len([w for w in wbs if (w.get("status") or "")=="blocked"])
+    # upcoming dues
+    today = datetime.utcnow().date()
+    upcoming = []
+    for w in wbs:
+        dd = w.get("due_date"); 
+        try:
+            if dd:
+                d = datetime.fromisoformat(dd).date()
+                if 0 <= (d - today).days <= upcoming_days:
+                    upcoming.append(w)
+        except Exception:
+            ...
+    return {"summary":{"total":total,"in_progress":inprog,"done":done,"blocked":blocked}, "upcoming": upcoming[:10]}
+
+@router.get("/export.csv")
+def export_csv(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        rows = sb.table("workbooks").select("*").eq("org_id", ctx.org_id)\
+               .eq("project_id", project_id).order("due_date", desc=True).limit(5000).execute().data or []
+    except Exception:
+        rows = []
+    cols = ["id","name","area","intro_date","start_date","asof_date","due_date",
+            "iterations_planned","iterations_done","status","notes"]
+    s = io.StringIO(); w = csv.writer(s); w.writerow(cols)
+    for r in rows: w.writerow([r.get(c) for c in cols])
+    s.seek(0)
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(iter([s.read()]), media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="workbooks.csv"'})
+
+
+Mount in server/main.py:
+
+from .routers import workbooks
+app.include_router(workbooks.router)
+
+
+Optional DDL (run later when ready)
+workbooks columns: id (uuid), org_id, project_id, name, area, intro_date, start_date, asof_date, due_date, iterations_planned int, iterations_done int, status text, notes text
+workbook_runs columns: id, org_id, project_id, workbook_id, run_no int, pulled_on date, rows int, status text, notes text
+
+2) Backend — Reports registry (legacy → Workday)
+
+server/routers/reports_registry.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from typing import Optional
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+import io, csv
+
+router = APIRouter(prefix="/api/reports", tags=["reports"])
+PM_PLUS = require_role({"owner","admin","pm"})
+
+class Report(BaseModel):
+    id: Optional[str] = None
+    name: str
+    legacy_system: Optional[str] = None
+    owner: Optional[str] = None
+    frequency: Optional[str] = None # ad-hoc|daily|weekly|monthly|quarterly
+    due_date: Optional[str] = None
+    status: Optional[str] = "planned"  # planned|mapped|built|validated|delivered|blocked
+    wd_type: Optional[str] = None      # delivered|custom
+    wd_report_name: Optional[str] = None
+    design_doc_url: Optional[str] = None
+    sample_url: Optional[str] = None
+    notes: Optional[str] = None
+
+@router.get("/list")
+def list_reports(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        rows = sb.table("reports").select("*").eq("org_id", ctx.org_id).eq("project_id", project_id)\
+               .order("due_date", desc=True).limit(1000).execute().data or []
+        return {"items": rows}
+    except Exception:
+        return {"items": []}
+
+@router.post("/upsert")
+def upsert_report(body: Report, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    try:
+        data = body.model_dump(); data.update({"org_id": ctx.org_id, "project_id": project_id})
+        if body.id:
+            sb.table("reports").update(data).eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", body.id).execute()
+        else:
+            sb.table("reports").insert(data).execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+@router.post("/delete")
+def delete_report(id: str = Query(...), project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    try:
+        sb.table("reports").delete().eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", id).execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+@router.get("/export.csv")
+def export_csv(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        rows = sb.table("reports").select("*").eq("org_id", ctx.org_id).eq("project_id", project_id)\
+               .order("due_date", desc=True).limit(5000).execute().data or []
+    except Exception:
+        rows = []
+    cols = ["id","name","legacy_system","owner","frequency","due_date","status","wd_type","wd_report_name",
+            "design_doc_url","sample_url","notes"]
+    s = io.StringIO(); w = csv.writer(s); w.writerow(cols)
+    for r in rows: w.writerow([r.get(c) for c in cols])
+    s.seek(0)
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(iter([s.read()]), media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="reports.csv"'})
+
+
+Mount in server/main.py:
+
+from .routers import reports_registry
+app.include_router(reports_registry.router)
+
+
+Optional DDL (later): see the fields above; add RLS on org_id + project_id.
+
+3) Frontend — Data & Reporting page (tabs)
+
+client/src/pages/Reporting.tsx (new)
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { getJSON, postJSON } from "@/lib/authFetch";
+import { downloadGET } from "@/lib/download";
+import PageHeading from "@/components/PageHeading";
+
+type WB = {
+  id?:string; name:string; area?:string; intro_date?:string; start_date?:string; asof_date?:string; due_date?:string;
+  iterations_planned?:number; iterations_done?:number; status?:string; notes?:string;
+};
+type RP = {
+  id?:string; name:string; legacy_system?:string; owner?:string; frequency?:string; due_date?:string; status?:string;
+  wd_type?:string; wd_report_name?:string; design_doc_url?:string; sample_url?:string; notes?:string;
+};
+
+export default function Reporting(){
+  const { projectId } = useParams();
+  const [tab,setTab]=useState<"workbooks"|"reports">("workbooks");
+
+  return (
+    <div>
+      <PageHeading title="Data & Reporting" crumbs={[{label:"Execution"},{label:"Data & Reporting"}]} />
+      <div className="flex items-center gap-2 mb-2">
+        <button className={`brand-btn text-xs ${tab==='workbooks'?'pulse-once':''}`} onClick={()=>setTab("workbooks")}>Workbooks</button>
+        <button className={`brand-btn text-xs ${tab==='reports'?'pulse-once':''}`} onClick={()=>setTab("reports")}>Reports</button>
+      </div>
+      {tab==="workbooks" ? <WorkbooksCard projectId={projectId!}/> : <ReportsCard projectId={projectId!}/>}
+    </div>
+  );
+}
+
+function WorkbooksCard({projectId}:{projectId:string}){
+  const [items,setItems]=useState<WB[]>([]); const [form,setForm]=useState<WB>({name:""});
+  const [metrics,setMetrics]=useState<any>(null);
+
+  async function load(){ try{ const d = await getJSON(`/api/workbooks/list?project_id=${projectId}`); setItems(d.items||[]); }catch{ setItems([]); } }
+  async function loadMetrics(){ try{ const d = await getJSON(`/api/workbooks/metrics?project_id=${projectId}`); setMetrics(d||{}); }catch{ setMetrics(null); } }
+
+  useEffect(()=>{ load(); loadMetrics(); },[projectId]);
+
+  async function save(){
+    await postJSON(`/api/workbooks/upsert?project_id=${projectId}`, form);
+    setForm({name:""}); load(); loadMetrics();
+  }
+  async function del(id:string){ await postJSON(`/api/workbooks/delete?id=${encodeURIComponent(id)}&project_id=${projectId}`, {}); load(); loadMetrics(); }
+
+  return (
+    <div className="brand-card p-3 space-y-3">
+      <div className="grid md:grid-cols-4 gap-2">
+        <KPI label="Total" v={metrics?.summary?.total} />
+        <KPI label="In progress" v={metrics?.summary?.in_progress} />
+        <KPI label="Done" v={metrics?.summary?.done} />
+        <KPI label="Blocked" v={metrics?.summary?.blocked} />
+      </div>
+
+      <div className="border rounded p-2">
+        <div className="text-sm font-medium mb-1">Add / Edit Workbook</div>
+        <div className="grid md:grid-cols-4 gap-2">
+          <input className="border rounded p-2" placeholder="Workbook name" value={form.name||""} onChange={e=>setForm({...form, name:e.target.value})}/>
+          <input className="border rounded p-2" placeholder="Area (e.g., HCM)" value={form.area||""} onChange={e=>setForm({...form, area:e.target.value})}/>
+          <input type="date" className="border rounded p-2" placeholder="As-of date" value={form.asof_date||""} onChange={e=>setForm({...form, asof_date:e.target.value})}/>
+          <input type="date" className="border rounded p-2" placeholder="Due date" value={form.due_date||""} onChange={e=>setForm({...form, due_date:e.target.value})}/>
+          <input type="number" className="border rounded p-2" placeholder="Iterations planned" value={form.iterations_planned||0} onChange={e=>setForm({...form, iterations_planned: parseInt(e.target.value||'0',10)})}/>
+          <select className="border rounded p-2" value={form.status||"planned"} onChange={e=>setForm({...form, status:e.target.value})}>
+            {["planned","in_progress","done","blocked"].map(s=><option key={s} value={s}>{s}</option>)}
+          </select>
+          <input className="border rounded p-2 md:col-span-2" placeholder="Notes" value={form.notes||""} onChange={e=>setForm({...form, notes:e.target.value})}/>
+        </div>
+        <div className="flex items-center gap-2 mt-2">
+          <button className="brand-btn text-xs swoosh" onClick={save}>Save</button>
+          <button className="brand-btn text-xs" onClick={()=>downloadGET(`/api/workbooks/export.csv?project_id=${projectId}`, "workbooks.csv")}>Export CSV</button>
+        </div>
+      </div>
+
+      <div className="border rounded p-2">
+        <div className="text-sm font-medium mb-1">Upcoming due (14d)</div>
+        <ul className="text-xs list-disc pl-4">
+          {(metrics?.upcoming||[]).map((w:any)=><li key={w.id}>{w.name} • {w.area||"—"} • due {w.due_date||"—"} • {w.iterations_done||0}/{w.iterations_planned||0}</li>)}
+          {(!metrics?.upcoming || !metrics.upcoming.length) && <li>None</li>}
+        </ul>
+      </div>
+
+      <div className="border rounded p-2 overflow-auto">
+        <table className="w-full text-sm">
+          <thead><tr><th className="text-left p-1">Name</th><th className="text-left p-1">Area</th><th className="text-left p-1">As-of</th><th className="text-left p-1">Due</th><th className="text-left p-1">Planned</th><th className="text-left p-1">Done</th><th className="text-left p-1">Status</th><th className="p-1"></th></tr></thead>
+          <tbody>
+            {items.map(w=>(
+              <tr key={w.id}>
+                <td className="p-1">{w.name}</td><td className="p-1">{w.area||"—"}</td><td className="p-1">{w.asof_date||"—"}</td>
+                <td className="p-1">{w.due_date||"—"}</td><td className="p-1">{w.iterations_planned||0}</td><td className="p-1">{w.iterations_done||0}</td>
+                <td className="p-1">{w.status||"—"}</td>
+                <td className="p-1"><button className="text-xs underline" onClick={()=>del(w.id!)}>Delete</button></td>
+              </tr>
+            ))}
+            {!items.length && <tr><td className="p-2 text-xs text-muted-foreground" colSpan={8}>No workbooks yet.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function ReportsCard({projectId}:{projectId:string}){
+  const [items,setItems]=useState<RP[]>([]); const [form,setForm]=useState<RP>({name:""});
+
+  async function load(){ try{ const d=await getJSON(`/api/reports/list?project_id=${projectId}`); setItems(d.items||[]); }catch{ setItems([]); } }
+  useEffect(()=>{ load(); },[projectId]);
+
+  async function save(){
+    await postJSON(`/api/reports/upsert?project_id=${projectId}`, form);
+    setForm({name:""}); load();
+  }
+  async function del(id:string){ await postJSON(`/api/reports/delete?id=${encodeURIComponent(id)}&project_id=${projectId}`, {}); load(); }
+
+  return (
+    <div className="brand-card p-3 space-y-3">
+      <div className="border rounded p-2">
+        <div className="text-sm font-medium mb-1">Add / Edit Report</div>
+        <div className="grid md:grid-cols-4 gap-2">
+          <input className="border rounded p-2" placeholder="Report name" value={form.name||""} onChange={e=>setForm({...form, name:e.target.value})}/>
+          <input className="border rounded p-2" placeholder="Legacy system" value={form.legacy_system||""} onChange={e=>setForm({...form, legacy_system:e.target.value})}/>
+          <input className="border rounded p-2" placeholder="Owner" value={form.owner||""} onChange={e=>setForm({...form, owner:e.target.value})}/>
+          <select className="border rounded p-2" value={form.frequency||"ad-hoc"} onChange={e=>setForm({...form, frequency:e.target.value})}>
+            {["ad-hoc","daily","weekly","monthly","quarterly"].map(f=><option key={f} value={f}>{f}</option>)}
+          </select>
+          <input type="date" className="border rounded p-2" placeholder="Due date" value={form.due_date||""} onChange={e=>setForm({...form, due_date:e.target.value})}/>
+          <select className="border rounded p-2" value={form.status||"planned"} onChange={e=>setForm({...form, status:e.target.value})}>
+            {["planned","mapped","built","validated","delivered","blocked"].map(s=><option key={s} value={s}>{s}</option>)}
+          </select>
+          <select className="border rounded p-2" value={form.wd_type||"delivered"} onChange={e=>setForm({...form, wd_type:e.target.value})}>
+            {["delivered","custom"].map(s=><option key={s} value={s}>{s}</option>)}
+          </select>
+          <input className="border rounded p-2" placeholder="Workday report name" value={form.wd_report_name||""} onChange={e=>setForm({...form, wd_report_name:e.target.value})}/>
+          <input className="border rounded p-2" placeholder="Design doc URL" value={form.design_doc_url||""} onChange={e=>setForm({...form, design_doc_url:e.target.value})}/>
+          <input className="border rounded p-2" placeholder="Sample URL" value={form.sample_url||""} onChange={e=>setForm({...form, sample_url:e.target.value})}/>
+          <input className="border rounded p-2 md:col-span-2" placeholder="Notes" value={form.notes||""} onChange={e=>setForm({...form, notes:e.target.value})}/>
+        </div>
+        <div className="flex items-center gap-2 mt-2">
+          <button className="brand-btn text-xs swoosh" onClick={save}>Save</button>
+          <button className="brand-btn text-xs" onClick={()=>downloadGET(`/api/reports/export.csv?project_id=${projectId}`, "reports.csv")}>Export CSV</button>
+        </div>
+      </div>
+
+      <div className="border rounded p-2 overflow-auto">
+        <table className="w-full text-sm">
+          <thead><tr><th className="text-left p-1">Name</th><th className="text-left p-1">Legacy</th><th className="text-left p-1">Owner</th><th className="text-left p-1">Freq</th><th className="text-left p-1">Due</th><th className="text-left p-1">Status</th><th className="text-left p-1">WD type</th><th className="text-left p-1">WD name</th><th className="p-1"></th></tr></thead>
+          <tbody>
+            {items.map(r=>(
+              <tr key={r.id}>
+                <td className="p-1">{r.name}</td><td className="p-1">{r.legacy_system||"—"}</td><td className="p-1">{r.owner||"—"}</td>
+                <td className="p-1">{r.frequency||"—"}</td><td className="p-1">{r.due_date||"—"}</td><td className="p-1">{r.status||"—"}</td>
+                <td className="p-1">{r.wd_type||"—"}</td><td className="p-1">{r.wd_report_name||"—"}</td>
+                <td className="p-1"><button className="text-xs underline" onClick={()=>del(r.id!)}>Delete</button></td>
+              </tr>
+            ))}
+            {!items.length && <tr><td className="p-2 text-xs text-muted-foreground" colSpan={9}>No reports yet.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function KPI({label,v}:{label:string;v:any}){ return (
+  <div className="brand-card p-2">
+    <div className="text-xs text-muted-foreground">{label}</div>
+    <div className="text-lg font-semibold">{v ?? "—"}</div>
+  </div>
+); }
+
+
+Add route in client/src/App.jsx:
+
+import Reporting from "@/pages/Reporting";
+// …
+<Route path="/projects/:projectId/reporting" element={<Reporting/>} />
+
+4) Optional — seed Command Palette with “Data & Reporting”
+
+Your palette already knows routes; ensure “Data & Reporting” appears (path reporting).
+
+5) 90-second validation
+
+Workbooks: add workbooks; run logs bump iterations_done; metrics show upcoming due; CSV export works
+
+Reports: track legacy → Workday mapping; CSV export works
+
+UI: Data & Reporting page with tabs, KPIs, lists & forms
+
+Dev-safe: endpoints return empty lists if tables don’t exist; no hard crashes

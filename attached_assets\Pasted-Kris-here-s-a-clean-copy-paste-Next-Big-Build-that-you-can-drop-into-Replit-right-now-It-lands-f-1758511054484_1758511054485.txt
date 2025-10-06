@@ -1,0 +1,436 @@
+Kris — here’s a clean, copy-paste Next Big Build that you can drop into Replit right now. It lands four high-impact systems and ties them into the events you already emit:
+
+Webhooks (Slack / Teams / Generic) — configurable per org; fires on review.applied, signoff.doc.signed, reminder.sent
+
+Invite / Membership Seeding — add a person, set role + initial access/areas/sign authority
+
+Classifier Ingest Hook — endpoint to accept ML outputs → enqueue /updates (with auto-apply rule)
+
+Visibility Guard for Risk/Decision mutations — mirror of your Actions enforcement (fail-closed)
+
+All patches are small and dev-safe (use AuthFetch; DEV_AUTH falls back cleanly).
+
+1) Webhooks (Slack/Teams/Generic) + event emitters
+1A) DB: org-level webhook config
+
+Run in Supabase SQL:
+
+create table if not exists public.org_webhooks (
+  org_id uuid primary key,
+  slack_url text,
+  teams_url text,
+  generic_url text,
+  enabled boolean not null default false,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+alter table public.org_webhooks enable row level security;
+
+create policy "webhooks_read_admin" on public.org_webhooks
+for select using (org_id = public.current_org() and public.has_role(org_id, null, array['owner','admin']));
+create policy "webhooks_upsert_admin" on public.org_webhooks
+for insert with check (org_id = public.current_org() and public.has_role(org_id, null, array['owner','admin']));
+create policy "webhooks_update_admin" on public.org_webhooks
+for update using (org_id = public.current_org() and public.has_role(org_id, null, array['owner','admin']))
+with check (org_id = public.current_org());
+
+select pg_notify('pgrst','reload schema');
+
+1B) Router: configure + test
+
+server/routers/webhooks.py
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+import requests, json
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/webhooks", tags=["webhooks"])
+ADMIN = require_role({"owner","admin"})
+
+class WebhookBody(BaseModel):
+    enabled: bool
+    slack_url: str | None = None
+    teams_url: str | None = None
+    generic_url: str | None = None
+
+@router.get("/settings")
+def get_settings(ctx: TenantCtx = Depends(ADMIN)):
+    sb = get_user_supabase(ctx)
+    r = sb.table("org_webhooks").select("*").eq("org_id", ctx.org_id).single().execute()
+    return r.data or {"org_id": ctx.org_id, "enabled": False, "slack_url": None, "teams_url": None, "generic_url": None}
+
+@router.post("/settings")
+def set_settings(body: WebhookBody, ctx: TenantCtx = Depends(ADMIN)):
+    sb = get_user_supabase(ctx)
+    sb.table("org_webhooks").upsert({
+        "org_id": ctx.org_id,
+        "enabled": body.enabled,
+        "slack_url": body.slack_url,
+        "teams_url": body.teams_url,
+        "generic_url": body.generic_url
+    }, on_conflict="org_id").execute()
+    return {"ok": True}
+
+@router.post("/test")
+def test(ctx: TenantCtx = Depends(ADMIN)):
+    from ..utils.events import emit_event
+    emit_event(ctx.org_id, None, "webhook.test", {"msg":"Hello from TEAIM"})
+    return {"ok": True}
+
+
+Mount in server/main.py:
+
+from .routers import webhooks
+app.include_router(webhooks.router)
+
+1C) Event util — call from anywhere
+
+server/utils/events.py
+
+import requests, json, os, logging
+from ..deps import get_service_supabase
+
+log = logging.getLogger("events")
+
+def _post(url: str, payload: dict):
+    try:
+        requests.post(url, json=payload, timeout=6)
+    except Exception as e:
+        log.warning(f"[webhook] post failed: {e}")
+
+def emit_event(org_id: str, project_id: str | None, kind: str, details: dict):
+    sbs = get_service_supabase()
+    try:
+        r = sbs.table("org_webhooks").select("*").eq("org_id", org_id).single().execute()
+        cfg = r.data
+    except Exception:
+        cfg = None
+    if not cfg or not cfg.get("enabled"): return
+
+    payload = {"org_id": org_id, "project_id": project_id, "kind": kind, "details": details}
+    # Slack
+    if cfg.get("slack_url"):
+        slack = {"text": f"*{kind}*\n```{json.dumps(details, indent=2)}```"}
+        _post(cfg["slack_url"], slack)
+    # Teams (simple text card)
+    if cfg.get("teams_url"):
+        teams = {"text": f"{kind}: {json.dumps(details)}"}
+        _post(cfg["teams_url"], teams)
+    # Generic
+    if cfg.get("generic_url"):
+        _post(cfg["generic_url"], payload)
+
+1D) Emit on key events
+
+Add a call to emit_event in:
+
+Updates approval (server/routers/updates.py, inside approve_update after success):
+
+from ..utils.events import emit_event
+emit_event(ctx.org_id, project_id, "review.applied",
+           {"update_id": update_id, "table": row["target_table"], "target_id": row.get("target_id")})
+
+
+Sign-off doc signed (server/routers/signoff_docs.py, in token_sign right after audit insert):
+
+from ..utils.events import emit_event
+emit_event(d["org_id"], d["project_id"], "signoff.doc.signed",
+           {"doc_id": row["doc_id"], "email": row["signer_email"], "name": signed_name})
+
+
+Reminders tick (your reminders scheduler, after send):
+
+from .routers.digest import _get_local_now  # if needed
+from ..utils.events import emit_event
+emit_event(org, proj, "reminder.sent", {"action_id": a["id"], "email": email})
+
+1E) Admin UI to manage webhooks
+
+client/src/pages/WebhookSettings.tsx
+
+import { useEffect, useState } from "react";
+import { getJSON, postJSON } from "@/lib/authFetch";
+import PageHeaderHint from "@/components/PageHeaderHint";
+
+export default function WebhookSettings(){
+  const [s,setS] = useState<any>({ enabled:false });
+  useEffect(()=>{ (async()=>{ setS(await getJSON("/api/webhooks/settings")); })(); },[]);
+  async function save(){ await postJSON("/api/webhooks/settings", s); alert("Saved"); }
+  async function test(){ await postJSON("/api/webhooks/test", {}); alert("Sent test"); }
+  return (
+    <div className="p-6 space-y-3">
+      <PageHeaderHint id="webhooks" title="Webhooks" intro="Send events to Slack, Teams, or a custom URL." bullets={[
+        "Events: review.applied, signoff.doc.signed, reminder.sent", "Use the Test button to verify connectivity"
+      ]}/>
+      <label className="flex items-center gap-2 text-sm">
+        <input type="checkbox" checked={!!s.enabled} onChange={e=>setS({...s, enabled: e.target.checked})}/> Enable webhooks
+      </label>
+      <input className="border rounded p-2 w-full" placeholder="Slack webhook URL" value={s.slack_url||""} onChange={e=>setS({...s, slack_url:e.target.value})}/>
+      <input className="border rounded p-2 w-full" placeholder="Teams webhook URL" value={s.teams_url||""} onChange={e=>setS({...s, teams_url:e.target.value})}/>
+      <input className="border rounded p-2 w-full" placeholder="Generic webhook URL" value={s.generic_url||""} onChange={e=>setS({...s, generic_url:e.target.value})}/>
+      <div className="flex gap-2">
+        <button className="px-3 py-2 border rounded" onClick={save}>Save</button>
+        <button className="px-3 py-2 border rounded" onClick={test}>Send Test</button>
+      </div>
+    </div>
+  );
+}
+
+
+Route:
+
+{ path: "/admin/webhooks", element: <WebhookSettings/> }  // Admin-only link
+
+2) Invite / Membership seeding
+2A) Router
+
+server/routers/invite.py
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/invite", tags=["invite"])
+ADMIN = require_role({"owner","admin"})
+
+class InviteBody(BaseModel):
+  user_id: str            # email or UUID
+  role: str               # owner|admin|pm|lead|member|guest
+  can_view_all: bool = True
+  visibility_areas: list[str] = []
+  can_sign_all: bool = False
+  sign_areas: list[str] = []
+
+@router.post("/add")
+def add_member(body: InviteBody, project_id: str = Query(...), ctx: TenantCtx = Depends(ADMIN)):
+  sb = get_user_supabase(ctx)
+  # seed membership
+  sb.table("project_members").upsert({
+    "org_id": ctx.org_id, "project_id": project_id, "user_id": body.user_id, "role": body.role
+  }, on_conflict="org_id,project_id,user_id").execute()
+  # seed access
+  sb.table("project_member_access").upsert({
+    "org_id": ctx.org_id, "project_id": project_id, "user_id": body.user_id,
+    "can_view_all": body.can_view_all, "visibility_areas": body.visibility_areas,
+    "can_sign_all": body.can_sign_all, "sign_areas": body.sign_areas
+  }, on_conflict="org_id,project_id,user_id").execute()
+  # subscriptions default (optional)
+  try:
+    sb.table("team_subscriptions").upsert({
+      "org_id": ctx.org_id, "project_id": project_id, "user_id": body.user_id,
+      "digest_weekly": True, "digest_monthly": False,
+      "notify_actions": True, "notify_risks": True, "notify_decisions": True, "notify_reminders": True
+    }, on_conflict="org_id,project_id,user_id").execute()
+  except Exception:
+    pass
+  return {"ok": True}
+
+
+Mount in server/main.py:
+
+from .routers import invite
+app.include_router(invite.router)
+
+2B) UI (tiny)
+
+client/src/pages/AdminInvite.tsx
+
+import { useState } from "react";
+import { useParams } from "react-router-dom";
+import { postJSON } from "@/lib/authFetch";
+import PageHeaderHint from "@/components/PageHeaderHint";
+
+export default function AdminInvite(){
+  const { projectId } = useParams();
+  const [email,setEmail]=useState(""); const [role,setRole]=useState("member");
+  const [areas,setAreas]=useState("HCM,Payroll,Time,Financials,Integrations,Reporting,Security,Data");
+  const [viewAll,setViewAll]=useState(true); const [signAll,setSignAll]=useState(false);
+  async function add(){
+    await postJSON(`/api/invite/add?project_id=${projectId}`,{
+      user_id: email, role,
+      can_view_all: viewAll,
+      visibility_areas: viewAll?[]:areas.split(",").map(s=>s.trim()).filter(Boolean),
+      can_sign_all: signAll, sign_areas: signAll?[]:areas.split(",").map(s=>s.trim()).filter(Boolean)
+    });
+    alert("Member added");
+  }
+  return (
+    <div className="p-6 space-y-3">
+      <PageHeaderHint id="invite" title="Invite / Add Member" intro="Seed project membership, access areas, and signer authority." />
+      <input className="border rounded p-2 w-full" placeholder="email or user id" value={email} onChange={e=>setEmail(e.target.value)}/>
+      <div className="flex gap-2">
+        <select className="border rounded p-2" value={role} onChange={e=>setRole(e.target.value)}>
+          {["owner","admin","pm","lead","member","guest"].map(r=><option key={r} value={r}>{r}</option>)}
+        </select>
+        <label className="text-sm flex items-center gap-2">
+          <input type="checkbox" checked={viewAll} onChange={e=>setViewAll(e.target.checked)}/> Can view all
+        </label>
+        <label className="text-sm flex items-center gap-2">
+          <input type="checkbox" checked={signAll} onChange={e=>setSignAll(e.target.checked)}/> Can sign all
+        </label>
+      </div>
+      {!viewAll || !signAll ? (
+        <input className="border rounded p-2 w-full" placeholder="Areas (comma-separated)"
+               value={areas} onChange={e=>setAreas(e.target.value)}/>
+      ):null}
+      <button className="px-3 py-2 border rounded" onClick={add}>Add Member</button>
+    </div>
+  );
+}
+
+
+Route:
+
+{ path: "/projects/:projectId/admin/invite", element: <AdminInvite/> }
+
+3) Classifier ingest hook → Updates Monitor
+
+server/routers/classifier_ingest.py
+
+from fastapi import APIRouter, Depends, HTTPException, Header, Query
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
+import os
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+import requests
+
+router = APIRouter(prefix="/api/classifier", tags=["classifier"])
+
+class ProposedChange(BaseModel):
+  change_type: str
+  operation: str
+  target_table: str
+  payload: Dict[str, Any]
+  target_id: Optional[str] = None
+  confidence: float = 0.7
+  source_artifact_id: Optional[str] = None
+
+class IngestBody(BaseModel):
+  changes: List[ProposedChange]
+
+@router.post("/ingest")
+def ingest(body: IngestBody, project_id: str = Query(...),
+           ctx: TenantCtx = Depends(member_ctx),
+           x_internal_key: str | None = Header(None)):
+  # prod: require INTERNAL_API_BEARER or PM/ADMIN caller
+  need_key = os.getenv("REQUIRE_CLASSIFIER_KEY","0") == "1"
+  if need_key and x_internal_key != os.getenv("INTERNAL_API_BEARER"):
+    raise HTTPException(401, "Classifier key invalid")
+
+  # Enqueue & optional auto-apply
+  base = os.getenv("FASTAPI_URL","http://127.0.0.1:5000")
+  headers = {}
+  if os.getenv("DEV_AUTH","0")=="1":
+    headers = {"X-Dev-User": ctx.user_id or "dev-user", "X-Dev-Org": ctx.org_id, "X-Dev-Role": ctx.role or "admin"}
+  elif os.getenv("INTERNAL_API_BEARER"):
+    headers = {"Authorization": f"Bearer {os.getenv('INTERNAL_API_BEARER')}"}
+
+  # fetch rules
+  rules = requests.get(f"{base}/api/updates/rules", headers=headers, timeout=10)
+  auto_apply = False; min_conf = 0.85
+  if rules.ok:
+    data = rules.json()
+    auto_apply = bool(data.get("auto_apply_updates"))
+    try: min_conf = float(data.get("auto_apply_min_conf", 0.85))
+    except: pass
+
+  applied = []; queued = []
+  for c in body.changes:
+    r = requests.post(f"{base}/api/updates/enqueue?project_id={project_id}", headers=headers, json={
+      "change_type": c.change_type, "operation": c.operation, "target_table": c.target_table,
+      "target_id": c.target_id, "payload": c.payload, "confidence": c.confidence,
+      "source_artifact_id": c.source_artifact_id, "created_by":"classifier"
+    }, timeout=20)
+    if not r.ok: continue
+    uid = r.json()["update"]["id"]
+    queued.append(uid)
+    if auto_apply and c.confidence >= min_conf:
+      requests.post(f"{base}/api/updates/{uid}/approve?project_id={project_id}", headers=headers, timeout=20)
+      applied.append(uid)
+  return {"ok": True, "queued": queued, "applied": applied}
+
+
+Mount:
+
+from .routers import classifier_ingest
+app.include_router(classifier_ingest.router)
+
+4) Risks/Decisions mutations — visibility enforcement (fail-closed)
+
+If you have mutation endpoints, use the same pattern you added for Actions:
+
+Fetch record (org_id, project_id, id) → get area
+
+If user is not owner/admin, read project_member_access:
+
+If can_view_all is false and area not in visibility_areas, return generic 404 (“not found”)
+
+Then proceed update
+
+Example patch (server/routers/risks_update.py):
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/risks", tags=["risks"])
+PM_PLUS = require_role({"owner","admin","pm","lead"})
+
+class RiskEdit(BaseModel):
+  title: str | None = None
+  severity: str | None = None
+  owner: str | None = None
+  area: str | None = None
+
+@router.post("/update")
+def update_risk(risk_id: str, body: RiskEdit, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+  sb = get_user_supabase(ctx)
+  # fetch with area
+  r = sb.table("risks").select("id,area").eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", risk_id).limit(1).execute().data
+  if not r: raise HTTPException(404, "Not found")
+  rec = r[0]
+  if ctx.role not in {"owner","admin"}:
+    acc = sb.table("project_member_access").select("can_view_all,visibility_areas").eq("org_id", ctx.org_id).eq("project_id", project_id).eq("user_id", ctx.user_id).limit(1).execute().data
+    if not acc or (not acc[0].get("can_view_all", False) and rec.get("area") not in (acc[0].get("visibility_areas") or [])):
+      raise HTTPException(404, "Not found")
+  patch = {k:v for k,v in body.dict().items() if v is not None}
+  sb.table("risks").update(patch).eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", risk_id).execute()
+  return {"ok": True}
+
+
+(Repeat pattern for decisions edit endpoints.)
+
+5) Composer: Stage-Area dropdown (already added) ✅
+
+(Keep as is; no changes if you already implemented.)
+
+6) Routes & Proxy
+
+You already implemented route aliases and removed duplicate mounts — keep it that way.
+
+Ensure proxy doesn’t pathRewrite /api and forwards X-Dev-* headers with DEV_AUTH=1.
+
+7) 90-second test
+
+RLS Self-Test → Admin link visible; PASS/INCONCLUSIVE shows as expected.
+
+Aliases → /api/analytics/summary and /analytics/summary both reachable (401 in dev is fine).
+
+CSV → /api/export/risks.csv & /api/export/decisions.csv filtered by areas.
+
+Composer → Stage area dropdown populated from Stages.
+
+Webhooks → set Slack URL; click “Test” → message appears. Aprove a review → Slack gets review.applied.
+
+Invite → add member; role + areas seeded; verify Team Access page shows them.
+
+Classifier ingest → POST to /api/classifier/ingest with a couple “insert action” changes; verify Updates Review queue receives; auto-applies if ≥ threshold.

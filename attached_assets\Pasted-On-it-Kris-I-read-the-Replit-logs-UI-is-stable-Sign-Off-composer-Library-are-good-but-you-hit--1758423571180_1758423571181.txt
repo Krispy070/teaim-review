@@ -1,0 +1,374 @@
+On it, Kris. I read the Replit logs—UI is stable, Sign-Off composer + Library are good, but you hit a couple 404/403s in dev because a few fetches still bypass the auth headers and one router prefix alias was missing. I’m shipping the next big build and a small hardening layer:
+
+AuthFetch: one tiny client util so every fetch (chips, bells, cards) carries dev headers/JWT
+
+Revocable Share Links: proxy-backed links with revoke + admin list (no more “can’t revoke” problem)
+
+SLA thresholds: org-level “Due soon (≤N days)” in settings; chip reads it
+
+Integrations “Check Now” + status coloring
+
+Actions quick assign (owner dropdown) + owner filter
+
+Router aliases helper (optional) if your Node proxy strips /api
+
+All patches are drop-in. If any paths differ, ping me and I’ll refit 1:1.
+
+A) Hardening: AuthFetch (dev headers everywhere)
+
+client/src/lib/authFetch.ts
+
+import { supabase } from "@/lib/supabase";
+
+const DEV = import.meta.env.VITE_DEV_AUTH === "1";
+const devOv = () => { try { return JSON.parse(localStorage.getItem("kap.devAuth") || "null"); } catch { return null; } };
+
+async function authHeaders() {
+  const ov = devOv();
+  if (DEV || ov?.dev) {
+    return {
+      "X-Dev-User": ov?.user || import.meta.env.VITE_DEV_USER || "",
+      "X-Dev-Org":  ov?.org  || import.meta.env.VITE_DEV_ORG  || "",
+      "X-Dev-Role": ov?.role || import.meta.env.VITE_DEV_ROLE || "admin",
+    } as Record<string,string>;
+  }
+  const { data } = await supabase.auth.getSession();
+  const token = data.session?.access_token;
+  if (!token) throw new Error("Not authenticated");
+  return { Authorization: `Bearer ${token}` };
+}
+
+export async function authFetch(input: string, init: RequestInit = {}) {
+  const h = await authHeaders();
+  return fetch(input, { ...init, headers: { ...(init.headers || {}), ...h }, credentials: "include" });
+}
+
+export async function getJSON<T=any>(url: string) {
+  const r = await authFetch(url);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<T>;
+}
+
+export async function postJSON<T=any>(url: string, body: any) {
+  const r = await authFetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<T>;
+}
+
+
+Patch callers that were using bare fetch:
+
+NotificationBell.tsx → getJSON('/api/audit/list?...')
+
+OverdueChip.tsx → getJSON('/api/actions/overdue?...')
+
+DueSoonChip.tsx → getJSON('/api/actions/soon?...')
+
+AnalyticsCards.tsx → getJSON('/api/analytics/summary?...'), getJSON('/api/analytics/burnup?...')
+
+any other fetch in chips/widgets → swap to getJSON/postJSON
+
+This kills the “undefined@undefined” dev-auth header problem and the 403s.
+
+B) Revocable Share Links (proxy + revoke)
+B1) SQL
+create table if not exists public.share_links (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid not null,
+  project_id uuid not null,
+  artifact_id uuid not null,
+  token text not null unique,
+  expires_at timestamptz not null,
+  revoked_at timestamptz,
+  created_by uuid,
+  created_at timestamptz not null default now()
+);
+alter table public.share_links enable row level security;
+
+create policy "sl_read_member" on public.share_links
+for select using (org_id = public.current_org() and public.is_member(org_id, project_id));
+
+create policy "sl_write_pmplus" on public.share_links
+for insert with check (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm','lead']));
+create policy "sl_update_pmplus" on public.share_links
+for update using (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm','lead']))
+with check (org_id = public.current_org());
+
+select pg_notify('pgrst','reload schema');
+
+B2) Router
+
+server/routers/share_links.py
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Path
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from datetime import datetime, timedelta, timezone
+import secrets, os
+
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase, get_service_supabase
+
+router = APIRouter(prefix="/api/share", tags=["share"])
+ADMIN_OR_PM = require_role({"owner","admin","pm","lead"})
+
+class CreateBody(BaseModel):
+    artifact_id: str
+    expires_sec: int = 3600
+
+@router.post("/create")
+def create_link(body: CreateBody, project_id: str = Query(...), ctx: TenantCtx = Depends(ADMIN_OR_PM)):
+    sb = get_user_supabase(ctx); sbs = get_service_supabase()
+    # ensure artifact belongs to this project/org
+    a = sb.table("artifacts").select("id").eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", body.artifact_id).limit(1).execute().data
+    if not a: raise HTTPException(404, "Artifact not found")
+    token = secrets.token_urlsafe(32)
+    expires = datetime.now(timezone.utc) + timedelta(seconds=int(body.expires_sec))
+    sbs.table("share_links").insert({
+        "org_id": ctx.org_id, "project_id": project_id, "artifact_id": body.artifact_id,
+        "token": token, "expires_at": expires.isoformat(), "created_by": ctx.user_id
+    }).execute()
+    # public URL via proxy endpoint
+    base = os.getenv("APP_BASE_URL","").rstrip("/")
+    url = f"{base}/share/{token}"
+    return {"ok": True, "url": url, "expires_at": expires.isoformat()}
+
+@router.get("/list")
+def list_links(project_id: str = Query(...), ctx: TenantCtx = Depends(ADMIN_OR_PM)):
+    sb = get_user_supabase(ctx)
+    rows = sb.table("share_links").select("id,artifact_id,token,expires_at,revoked_at,created_at,created_by")\
+            .eq("org_id", ctx.org_id).eq("project_id", project_id).order("created_at", desc=True).limit(200).execute().data or []
+    return {"items": rows}
+
+@router.post("/revoke")
+def revoke_link(token: str = Query(...), project_id: str = Query(...), ctx: TenantCtx = Depends(ADMIN_OR_PM)):
+    sbs = get_service_supabase()
+    out = sbs.table("share_links").update({"revoked_at": datetime.now(timezone.utc).isoformat()})\
+          .eq("token", token).eq("org_id", ctx.org_id).eq("project_id", project_id).execute()
+    if not out.data: raise HTTPException(404, "Not found")
+    return {"ok": True}
+
+# --- Public download proxy ---
+pub = APIRouter(tags=["share-public"])
+
+@pub.get("/share/{token}")
+def share_public(token: str = Path(...)):
+    sbs = get_service_supabase()
+    row = sbs.table("share_links").select("*").eq("token", token).limit(1).execute().data
+    if not row: raise HTTPException(404, "Invalid token")
+    r = row[0]
+    if r.get("revoked_at"): raise HTTPException(403, "Link revoked")
+    if datetime.now(timezone.utc) > datetime.fromisoformat(r["expires_at"]): raise HTTPException(403, "Link expired")
+    # stream file
+    art = sbs.table("artifacts").select("name,storage_bucket,storage_path").eq("id", r["artifact_id"]).limit(1).execute().data
+    if not art: raise HTTPException(404, "Artifact missing")
+    a = art[0]
+    b = sbs.storage().from_(a["storage_bucket"]).download(a["storage_path"])
+    fname = a.get("name") or "document"
+    return StreamingResponse(iter([b]), media_type="application/octet-stream",
+      headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
+Mount both:
+
+from .routers import share_links
+app.include_router(share_links.router)
+app.include_router(share_links.pub)  # public /share/{token}
+
+B3) ShareDialog toggle for Revocable link
+
+In ShareDialog.tsx:
+
+const [revocable, setRevocable] = useState(false);
+...
+<div className="flex items-center gap-2 mb-2">
+  <input type="checkbox" checked={revocable} onChange={e=>setRevocable(e.target.checked)} />
+  <span className="text-xs">Create revocable link (via proxy)</span>
+</div>
+...
+async function create(){
+  try {
+    let d;
+    if (revocable) {
+      d = await fetch(`/api/share/create?project_id=${projectId}`, {
+        method:"POST", credentials:"include",
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ artifact_id: artifactId, expires_sec: sec })
+      }).then(r=>r.json());
+    } else {
+      d = await fetch(`/api/artifacts/share-url?project_id=${projectId}`, {
+        method:"POST", credentials:"include",
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ artifact_id: artifactId, expires_sec: sec })
+      }).then(r=>r.json());
+    }
+    setUrl(d.url);
+    ...
+
+
+(You can add a small “Manage links” page later; this gets you revoke-capable links today.)
+
+C) SLA thresholds in settings + chip reads it
+C1) SQL
+alter table public.org_comms_settings
+  add column if not exists sla_due_soon_days int not null default 3;
+select pg_notify('pgrst','reload schema');
+
+C2) /actions/soon reads org setting when days not provided
+
+In server/routers/actions_list.py, update:
+
+@router.get("/soon")
+def soon(project_id: str = Query(...), days: int | None = None, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    if days is None:
+        s = sb.table("org_comms_settings").select("sla_due_soon_days").eq("org_id", ctx.org_id).single().execute().data or {}
+        days = int(s.get("sla_due_soon_days", 3))
+    ...
+
+C3) AdminComms UI toggle
+
+In client/src/pages/AdminComms.tsx, add a field near daily cap:
+
+<label className="text-sm">Due Soon threshold (days)
+  <input type="number" className="border rounded p-2 w-full"
+         value={s.sla_due_soon_days || 3}
+         onChange={e=>setS({...s, sla_due_soon_days: parseInt(e.target.value||"3")})}/>
+</label>
+
+D) Integrations “Check Now” + status color
+D1) Backend
+
+server/routers/integrations.py (append)
+
+from datetime import datetime, timezone
+
+@router.post("/check")
+def check_integration(integration_id: str, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    # naive “ping”: mark as connected for dev; real pings can be wired by transport later
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("project_integrations").update({"last_checked": now, "status": "connected"})\
+      .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", integration_id).execute()
+    return {"ok": True, "last_checked": now, "status": "connected"}
+
+D2) UI coloring
+
+In client/src/pages/Integrations.tsx row render:
+
+function statusClass(s?:string){
+  if (s==="validated" || s==="connected") return "text-green-600";
+  if (s==="in_progress") return "text-yellow-600";
+  if (s==="blocked") return "text-red-600";
+  return "text-muted-foreground";
+}
+...
+<div className={`text-sm ${statusClass(r.status)}`}>{r.status}</div>
+<button className="px-2 py-1 border rounded text-xs" onClick={async()=>{
+  await apiPost("/integrations/check", undefined, { project_id: projectId!, integration_id: r.id! }); await load();
+}}>Check Now</button>
+
+E) Actions quick assign + filters
+E1) Backend
+
+server/routers/actions_owner.py
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/actions", tags=["actions"])
+PM_PLUS = require_role({"owner","admin","pm","lead"})
+
+class OwnerBody(BaseModel):
+    owner: str | None
+
+@router.post("/set-owner")
+def set_owner(action_id: str, body: OwnerBody, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    sb.table("actions").update({"owner": body.owner})\
+      .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", action_id).execute()
+    return {"ok": True}
+
+
+Mount:
+
+from .routers import actions_owner
+app.include_router(actions_owner.router)
+
+E2) Kanban: owner dropdown + filter
+
+At top of ActionsKanban.tsx:
+
+const [ownerFilter, setOwnerFilter] = useState<string>(""); 
+// assume you can gather owners from items list
+const owners = Array.from(new Set(items.map(i=>i.owner).filter(Boolean))).sort();
+...
+<div className="flex items-end gap-2 mb-3">
+  <label className="text-sm">Owner
+    <select className="border rounded p-2 ml-1" value={ownerFilter} onChange={e=>setOwnerFilter(e.target.value)}>
+      <option value="">All</option>
+      {owners.map(o=><option key={o} value={o}>{o}</option>)}
+    </select>
+  </label>
+</div>
+
+
+Filter list:
+
+{items.filter(a=>!ownerFilter || a.owner===ownerFilter).filter(a=>a.status===col.key).map(...)}
+
+
+Per-card owner editor:
+
+function OwnerEditor({ id, projectId, owner }:{ id:string; projectId:string; owner?:string }){
+  const [val,setVal] = useState(owner||"");
+  async function save(){ await fetch(`/api/actions/set-owner?action_id=${id}&project_id=${projectId}`, { method:"POST", credentials:"include", headers:{'Content-Type':'application/json'}, body: JSON.stringify({owner: val||null}) }); }
+  return (
+    <div className="flex items-center gap-1 text-xs mt-1">
+      <input className="border rounded px-1 py-0.5" placeholder="owner@email" value={val} onChange={e=>setVal(e.target.value)} />
+      <button className="px-1 border rounded" onClick={save}>✓</button>
+    </div>
+  );
+}
+
+
+Use in the card under title:
+
+<OwnerEditor id={a.id} projectId={projectId!} owner={a.owner} />
+
+F) (Optional) Router alias helper (if Node strips /api)
+
+If your proxy strips /api, you can mount alias routers without /api:
+
+def include_with_alias(app, router, alias_prefix: str | None = None):
+    app.include_router(router)
+    if alias_prefix:
+      from fastapi import APIRouter
+      alias = APIRouter(prefix=alias_prefix, tags=getattr(router, "tags", []))
+      for r in router.routes:
+          alias.add_api_route(r.path.replace(router.prefix, "") or "/", r.endpoint, methods=r.methods)
+      app.include_router(alias)
+
+# usage
+include_with_alias(app, share_links.router)             # keeps /api/share/*
+include_with_alias(app, share_links.pub, None)          # /share/* is already public
+include_with_alias(app, actions_list.router, "/actions") # exposes /actions/* too
+
+
+(Use only if you must support both.)
+
+G) Quick validation (2 min)
+
+Open Dashboard → Due soon chip shows when an action due date is within threshold from AdminComms.
+
+Click Bell → unread behaves (last-seen stored); reopen → badge clears.
+
+Library → Share → dialog appears; try Revocable link → open new window; revoke later with the list endpoint (optional next UI).
+
+Kanban → filter by owner; set owner inline; drag between columns still works.
+
+Any widget that used fetch now works in dev because AuthFetch injects headers.

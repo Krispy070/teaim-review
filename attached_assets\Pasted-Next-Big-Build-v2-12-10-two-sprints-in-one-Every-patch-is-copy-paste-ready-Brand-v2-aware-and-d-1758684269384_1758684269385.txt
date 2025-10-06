@@ -1,0 +1,361 @@
+Next Big Build v2.12.10 (two sprints in one). Every patch is copy-paste ready, Brand v2–aware, and dev-safe (new endpoints degrade gracefully when a table/column is missing).
+
+What lands now (you’ll feel it immediately):
+
+Request Sign-Off v3.9 → pending list gains Select / Remind Selected / Set Expiry Selected + expiring-soon badges (throttled; no email spam)
+
+Stages Batch from Template (with Preview) → pick a template + baseline date, see before/after for each stage, apply in one go; guardrails (min/max days) respected
+
+Digests in-app helpers → one tiny helper to build the same deep links with pre-filters you’re sending in email (consistency); owner/area link buttons you can drop anywhere
+
+Wellness → we already added Top Responders HTML/CSV; this drop wires “Print HTML” button in the admin panel (one-click for PDF via browser)
+
+1) Request Sign-Off v3.9 — pending Select + Remind Selected + Expiring soon badges (with throttle)
+1A) Backend — tokens admin: remind_selected, set_expiry_selected, and expiring in list
+
+server/routers/signoff_tokens_admin.py (append new endpoints)
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel, Field
+from datetime import datetime, timedelta, timezone
+import os
+from typing import List
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+PM_PLUS = require_role({"owner","admin","pm"})
+
+router = APIRouter(prefix="/api/signoff", tags=["signoff"])
+
+class TokensBody(BaseModel):
+    tokens: List[str] = Field(min_items=1)
+    # for remind throttle
+    min_hours_between: int = 12
+    # for set expiry
+    hours: int = 120
+
+@router.post("/remind_selected")
+def remind_selected(body: TokensBody, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    base = os.getenv("APP_BASE_URL","").rstrip("/")
+    sent = 0
+    try:
+        # fetch emails for tokens
+        rows = sb.table("signoff_doc_tokens").select("token,signer_email,doc_id")\
+            .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+            .in_("token", body.tokens).is_("used_at","null").is_("revoked_at","null")\
+            .execute().data or []
+        now = datetime.now(timezone.utc)
+        for r in rows:
+            email = r.get("signer_email")
+            if not email: continue
+            # throttle by comms_send_log (per email/kind daily-ish)
+            try:
+                last = sb.table("comms_send_log").select("created_at")\
+                       .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+                       .eq("kind","signoff_reminder").eq("to_email", email)\
+                       .order("created_at", desc=True).limit(1).execute().data
+                if last:
+                    dt_last = datetime.fromisoformat(last[0]["created_at"].replace("Z","+00:00"))
+                    if (now - dt_last) < timedelta(hours=body.min_hours_between): 
+                        continue  # throttled
+            except Exception: ...
+            # send
+            try:
+                from ..email.util import mailgun_send_html, send_guard
+                ok,_ = send_guard(sb, ctx.org_id, project_id, "signoff_reminder", email)
+                if ok:
+                    link = f"{base}/signoff/doc/{r['token']}"
+                    mailgun_send_html([email], "[Reminder] Sign-off request", f"<p>Your sign-off link: <a href='{link}'>Open</a></p>")
+                    sent += 1
+                    # log
+                    try:
+                        sb.table("comms_send_log").insert({
+                          "org_id": ctx.org_id, "project_id": project_id,
+                          "kind": "signoff_reminder", "to_email": email,
+                          "details": {"token": r["token"]}
+                        }).execute()
+                    except Exception: ...
+            except Exception: ...
+        return {"ok": True, "sent": sent}
+    except Exception:
+        return {"ok": False, "sent": 0}
+
+@router.post("/set_expiry_selected")
+def set_expiry_selected(body: TokensBody, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    try:
+        expires = (datetime.now(timezone.utc) + timedelta(hours=body.hours)).isoformat()
+        r = sb.table("signoff_doc_tokens").update({"expires_at": expires})\
+            .eq("org_id", ctx.org_id).eq("project_id", project_id).in_("token", body.tokens).is_("used_at","null").execute()
+        return {"ok": True, "updated": (r.count if hasattr(r,"count") else None)}
+    except Exception:
+        return {"ok": False, "updated": 0}
+
+
+server/routers/signoff_pending.py — mark expiring_soon (within 48h by default):
+
+@router.get("/pending_list")
+def pending_list(project_id: str = Query(...), stage_id: str | None = None, within_hours:int=48, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        doc_ids=[]
+        if stage_id:
+            d = sb.table("signoff_docs").select("id").eq("org_id", ctx.org_id)\
+                 .eq("project_id", project_id).eq("stage_id", stage_id).limit(1).execute().data or []
+            if not d: return {"items": []}
+            doc_ids = [d[0]["id"]]
+        q = sb.table("signoff_doc_tokens").select("token,signer_email,created_at,expires_at")\
+             .eq("org_id", ctx.org_id).eq("project_id", project_id).is_("used_at","null").is_("revoked_at","null")
+        if doc_ids: q = q.in_("doc_id", doc_ids)
+        rows = q.order("created_at", desc=True).limit(200).execute().data or []
+        # expiring flag
+        now = datetime.now(timezone.utc)
+        for r in rows:
+            exp = r.get("expires_at")
+            try:
+                if exp:
+                    ed = datetime.fromisoformat(exp.replace("Z","+00:00"))
+                    r["expiring_soon"] = (ed - now) <= timedelta(hours=within_hours)
+                    r["hours_left"] = round(((ed - now).total_seconds())/3600, 1)
+                else:
+                    r["expiring_soon"] = False
+                    r["hours_left"] = None
+            except Exception:
+                r["expiring_soon"] = False
+                r["hours_left"] = None
+        return {"items": rows}
+    except Exception:
+        return {"items": []}
+
+
+Mount already done (signoff_tokens_admin in prior push).
+
+1B) Frontend — SignoffRequestModal v3.9: select rows, Remind Selected, Set Expiry Selected, badges
+
+Patch client/src/components/SignoffRequestModal.tsx (in pending section)
+
+Add select state:
+
+const [selTok,setSelTok]=useState<Record<string,boolean>>({});
+const anySel = Object.values(selTok).some(Boolean);
+function toggleTok(t:string){ setSelTok(s=> ({...s, [t]: !s[t]})); }
+function setAll(b:boolean){ const n:Record<string,boolean>={}; pending.forEach(p=>{n[p.token]=b}); setSelTok(n); }
+
+
+Enhance header controls:
+
+<div className="flex items-center gap-2">
+  <button className="brand-btn text-[11px]" onClick={()=>setAll(true)}>Select all</button>
+  <button className="brand-btn text-[11px]" onClick={()=>setAll(false)}>Clear</button>
+  <label className="text-[11px]">Expiry (hr)</label>
+  <input className="border rounded p-1 text-[11px] w-[64px]" type="number" value={expiry} onChange={e=>setExpiry(parseInt(e.target.value||'120',10))}/>
+  <button className="brand-btn text-[11px]" disabled={!anySel} onClick={async()=>{
+    const tokens = Object.keys(selTok).filter(k=>selTok[k]);
+    await fetch(`/api/signoff/set_expiry_selected?project_id=${projectId}`, {
+      method:"POST", credentials:"include", headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ tokens, hours: expiry })
+    });
+    alert("Expiry set for selected");
+  }}>Set expiry (selected)</button>
+  <button className="brand-btn text-[11px]" disabled={!anySel} onClick={async()=>{
+    const tokens = Object.keys(selTok).filter(k=>selTok[k]);
+    await fetch(`/api/signoff/remind_selected?project_id=${projectId}`, {
+      method:"POST", credentials:"include", headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ tokens, min_hours_between: 12 })
+    });
+    alert("Reminders sent (throttled)");
+  }}>Remind selected</button>
+</div>
+
+
+Row check & badge:
+
+{pending.map(p=>(
+  <div key={p.token} className="flex items-center justify-between text-xs">
+    <label className="flex items-center gap-2">
+      <input type="checkbox" checked={!!selTok[p.token]} onChange={()=>toggleTok(p.token)} />
+      <span>
+        {p.signer_email} • {new Date(p.created_at).toLocaleString()}
+        {p.expires_at ? ` • exp ${new Date(p.expires_at).toLocaleString()}` : ""}
+        {p.expiring_soon ? <span className="ml-1 text-red-500">(expiring ~{p.hours_left}h)</span> : null}
+      </span>
+    </label>
+    <span className="flex items-center gap-1">
+      <button className="brand-btn text-[11px]" onClick={async()=>{
+        await fetch(`/api/signoff/resend_token?token=${encodeURIComponent(p.token)}`, {method:"POST",credentials:"include"});
+        alert("Resent");
+      }}>Resend</button>
+      <button className="brand-btn text-[11px]" onClick={async()=>{
+        await fetch(`/api/signoff/revoke_token?token=${encodeURIComponent(p.token)}`, {method:"POST",credentials:"include"});
+        setPending(prev=>prev.filter(x=>x.token!==p.token));
+        const ns = {...selTok}; delete ns[p.token]; setSelTok(ns);
+      }}>Revoke</button>
+    </span>
+  </div>
+))}
+
+2) Stages — Template Apply Preview (baseline + duration guardrails)
+2A) Backend — guardrails (min/max days)
+
+server/routers/stages_guardrails.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/stages", tags=["stages"])
+
+@router.get("/guardrails")
+def guardrails(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        s = sb.table("org_settings").select("stage_min_days,stage_max_days")\
+            .eq("org_id", ctx.org_id).single().execute().data or {}
+        return {"min_days": int(s.get("stage_min_days") or 1), "max_days": int(s.get("stage_max_days") or 365)}
+    except Exception:
+        return {"min_days": 1, "max_days": 365}
+
+
+Mount in server/main.py:
+
+from .routers import stages_guardrails
+app.include_router(stages_guardrails.router)
+
+2B) Frontend — “Apply Template (Preview)” dialog (client-side compute)
+
+client/src/components/StageTemplateApply.tsx (new)
+
+import { useEffect, useMemo, useState } from "react";
+import { getJSON, postJSON } from "@/lib/authFetch";
+
+export default function StageTemplateApply({ projectId, stages, onClose }:{
+  projectId:string; stages:{id:string; title:string; area?:string; start_date?:string; end_date?:string}[]; onClose:()=>void
+}){
+  const [templates,setTemplates]=useState<any[]>([]);
+  const [tplKey,setTplKey]=useState<string>("");
+  const [base,setBase]=useState<string>("");
+  const [rails,setRails]=useState<{min_days:number;max_days:number}>({min_days:1,max_days:365});
+
+  useEffect(()=>{ (async()=>{
+    try{ const t = await getJSON(`/stages/templates/org`); setTemplates(t.items||[]); }catch{ setTemplates([]); }
+    try{ const r = await getJSON(`/api/stages/guardrails?project_id=${projectId}`); setRails(r); }catch{}
+  })(); },[projectId]);
+
+  const preview = useMemo(()=>{
+    const t = templates.find((x:any)=>x.key===tplKey);
+    if (!t || !base) return [];
+    // build mapping title -> {start_offset_weeks, duration_weeks}
+    const map:Record<string,{start_offset_weeks?:number;duration_weeks?:number}> = {};
+    (t.stages||[]).forEach((s:any)=> { if (s.title) map[s.title]={ start_offset_weeks:s.start_offset_weeks||0, duration_weeks:s.duration_weeks||2 } });
+    const baseDate = new Date(base+"T00:00:00");
+    function addDays(d:Date, n:number){ const c=new Date(d); c.setDate(c.getDate()+n); return c.toISOString().slice(0,10) }
+    return stages.map(s=>{
+      const m = map[s.title||""]; if (!m) return {...s, new_start:s.start_date, new_end:s.end_date, will_update:false};
+      const start = addDays(baseDate, (m.start_offset_weeks||0)*7);
+      let days = Math.max(rails.min_days, Math.min(rails.max_days, (m.duration_weeks||2)*7));
+      const end = addDays(new Date(start+"T00:00:00"), days);
+      return {...s, new_start:start, new_end:end, will_update: (s.start_date!==start || s.end_date!==end)};
+    });
+  },[templates, tplKey, base, stages, rails]);
+
+  async function apply(){
+    for (const p of preview){
+      if (!p.will_update) continue;
+      await postJSON(`/api/stages/update?stage_id=${p.id}&project_id=${projectId}`, { start_date: p.new_start, end_date: p.new_end });
+    }
+    alert("Applied template"); onClose();
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-[200]" onClick={onClose}>
+      <div className="mx-auto mt-[8vh] w-[860px] max-w-[96%] bg-white dark:bg-neutral-900 rounded shadow-xl border"
+           onClick={e=>e.stopPropagation()}>
+        <div className="p-3 border-b text-sm font-medium">Apply Template (Preview)</div>
+        <div className="p-3 space-y-2 max-h-[70vh] overflow-auto">
+          <div className="flex items-center gap-2">
+            <select className="border rounded p-2 text-sm" value={tplKey} onChange={e=>setTplKey(e.target.value)}>
+              <option value="">Pick template…</option>
+              {templates.map((t:any)=> <option key={t.key} value={t.key}>{t.label}</option>)}
+            </select>
+            <label className="text-xs">Baseline</label>
+            <input type="date" className="border rounded p-2 text-sm" value={base} onChange={e=>setBase(e.target.value)} />
+            <div className="text-xs text-muted-foreground">Guardrails: {rails.min_days}-{rails.max_days} days</div>
+          </div>
+          <table className="w-full text-sm">
+            <thead><tr><th className="text-left p-1">Title</th><th className="text-left p-1">Current Start</th><th className="text-left p-1">Current End</th><th className="text-left p-1">New Start</th><th className="text-left p-1">New End</th><th className="text-left p-1">Update?</th></tr></thead>
+            <tbody>
+              {preview.map((p:any)=>(
+                <tr key={p.id}>
+                  <td className="p-1">{p.title}</td>
+                  <td className="p-1">{p.start_date||"—"}</td>
+                  <td className="p-1">{p.end_date||"—"}</td>
+                  <td className="p-1">{p.new_start||"—"}</td>
+                  <td className="p-1">{p.new_end||"—"}</td>
+                  <td className="p-1">{p.will_update? "✓": "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="p-3 border-t flex justify-end gap-2">
+          <button className="brand-btn text-xs" onClick={onClose}>Cancel</button>
+          <button className="brand-btn text-xs swoosh" onClick={apply} disabled={!preview.some((p:any)=>p.will_update)}>Apply</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+Use it on Stages page: add a “Apply Template (Preview)” button (global or per area):
+
+import StageTemplateApply from "@/components/StageTemplateApply";
+// ...
+const [applyOpen,setApplyOpen]=useState(false);
+// in page header toolbar:
+<button className="brand-btn text-xs" onClick={()=>setApplyOpen(true)}>Apply Template (Preview)</button>
+{applyOpen && <StageTemplateApply projectId={projectId!} stages={stages} onClose={()=>setApplyOpen(false)} />}
+
+3) Digests — tiny helper for composing consistent deep links (owner/area/tab)
+
+client/src/lib/digestLinks.ts (new)
+
+export function actionsLink(projectId:string, id?:string, owner?:string, area?:string){
+  const hash = new URLSearchParams();
+  hash.set("openFilters","1");
+  if (id) hash.set("id", id);
+  if (owner) hash.set("owner", owner);
+  if (area) hash.set("area", area);
+  return `/projects/${projectId}/actions/list#${hash.toString()}`;
+}
+export function auditLink(projectId:string, table:"risks"|"decisions", id?:string, area?:string){
+  const hash = new URLSearchParams();
+  hash.set("openFilters","1"); hash.set("tab", table);
+  if (id) hash.set("id", id);
+  if (area) hash.set("area", area);
+  return `/projects/${projectId}/admin/audit-timeline#${hash.toString()}`;
+}
+
+
+Drop these links anywhere in-app to mirror email deep links.
+
+4) Wellness Admin — Top Responders HTML print button
+
+Already added in the previous build; wire the button (if you haven’t):
+
+<a className="brand-btn text-xs" target="_blank" rel="noreferrer"
+   href={`/api/wellness/top_responders.html?project_id=${projectId}&days=${range}`}>
+  Print Top Responders
+</a>
+
+5) 120-second validation
+
+Sign-Off v3.9: Select pending rows → Remind selected (throttled), Set expiry (selected); expiring soon badges show hours left
+
+Stages: “Apply Template (Preview)” shows before/after (baseline + guardrails) → Apply updates in one go
+
+Digests: in-app code can build deep links with the same pre-filters as email (owner/area/tab + anchor)
+
+Wellness: Top responders print HTML has brand header and is ready to “Print to PDF”

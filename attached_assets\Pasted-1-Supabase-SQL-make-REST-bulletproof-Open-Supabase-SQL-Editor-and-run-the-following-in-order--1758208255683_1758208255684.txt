@@ -1,0 +1,125 @@
+1) Supabase SQL — make REST bulletproof
+
+Open Supabase → SQL Editor and run the following in order:
+
+-- A. Confirm tables exist in the public schema
+select table_schema, table_name
+from information_schema.tables
+where table_schema='public'
+  and table_name in ('artifacts','artifact_chunks','summaries','mem_entries','mem_chunks');
+
+-- B. Ensure roles can see the schema (service_role is what the server uses)
+grant usage on schema public to anon, authenticated, service_role;
+
+-- Tables & sequences privileges (service_role bypasses RLS but needs object privs)
+grant select, insert, update, delete on all tables in schema public to service_role;
+grant usage, select on all sequences in schema public to service_role;
+
+-- Default privileges for anything new you create later
+alter default privileges in schema public
+  grant select, insert, update, delete on tables to service_role;
+alter default privileges in schema public
+  grant usage, select on sequences to service_role;
+
+-- C. Force PostgREST schema reload (fixes 404 on new tables/functions)
+notify pgrst, 'reload schema';
+
+
+If you still get 404 after this: Project Settings → Database → Restart, then rerun the notify pgrst line.
+
+2) Keep DB writes flexible
+
+You already set the runtime switch—perfect:
+
+DB_WRITE_MODE=rest → REST writes (PostgREST)
+
+DB_WRITE_MODE=psycopg → direct socket writes (bypass)
+
+We’ll test with rest first, then flip to psycopg to confirm both paths.
+
+3) Unique storage keys (done, but verify)
+
+Your keys should look like:
+
+{project_id}/{uuid4().hex}_{safe_filename}
+
+
+No 409s, no collisions. ✅
+
+4) Sanity tests (copy/paste exactly)
+
+Run these in Replit shell (no jq required):
+
+BASE="http://localhost:5000/api"
+ORG="d915376c-2bd7-4e79-b9c9-aab9d7fcb5a8"
+PROJ="dced0b98-87b4-46ff-b2a4-2cf8e627e8d2"
+
+echo "[1] DB diag";       curl -s "$BASE/diag/db"; echo
+echo "[2] Storage diag";  curl -s "$BASE/diag/storage"; echo
+
+echo "[3] Ingest-sync (REST mode)"
+echo "Workday SIT exit criteria and payroll retro rules." > /tmp/teaim-sync.txt
+curl -s -X POST "$BASE/ingest-sync" \
+  -F "org_id=$ORG" -F "project_id=$PROJ" \
+  -F "file=@/tmp/teaim-sync.txt"; echo
+
+echo "[4] Index stats"; curl -s "$BASE/diag/index-stats?org_id=$ORG&project_id=$PROJ"; echo
+
+echo "[5] Ask"; curl -s -X POST "$BASE/ask" \
+  -H "Content-Type: application/json" \
+  -d "{\"org_id\":\"$ORG\",\"project_id\":\"$PROJ\",\"question\":\"Summarize the latest document and list any exit criteria.\",\"k\":3}"; echo
+
+
+Pass criteria
+
+[1] → {"ok":true}
+
+[2] → {"ok":true,"signed_url":"https://..."}
+
+[3] → {"ok":true,"artifact_id":"...","chunks":1+}
+
+[4] → "chunks": 1+
+
+[5] → Answer includes Sources: with your uploaded filename
+
+5) If [3] still fails in REST mode
+
+Let’s prove PostgREST visibility by hitting it directly (server key only in shell):
+
+curl -s "https://hixirmwsvbjyeecfclgx.supabase.co/rest/v1/artifacts?select=id,title&limit=1" \
+  -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+  -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY"
+
+
+If this returns data (or []) → schema is visible; try ingest-sync again.
+
+If it 404s → rerun the SQL grants + notify pgrst, or do a DB restart once.
+
+6) Flip to psycopg mode and re-test (optional now, useful later)
+export DB_WRITE_MODE=psycopg
+bash /scripts/sanity.sh
+
+
+You should see the same pass results; this path ignores PostgREST entirely.
+
+7) What I’ll do next once you’re green
+
+Add /ingest-email (allowlist + #proj: subject rule) + test script that sends a sample EML.
+
+Wire Supabase Auth (magic link) with role-checked UI sections and an /api/me sanity endpoint.
+
+Add a tiny /digest/weekly endpoint + fixture to render a sample PDF from your current artifacts, so you can demo to a client immediately.
+
+Send me the outputs for:
+
+/api/diag/db
+
+/api/diag/storage
+
+/api/ingest-sync
+
+/api/diag/index-stats
+
+(optional) the direct /rest/v1/artifacts curl
+
+and I’ll give you the thumbs-up or the exact one-liner to fix anything lingering. Once that’s green, we’ll light up email intake & auth with the same test-first rhythm.

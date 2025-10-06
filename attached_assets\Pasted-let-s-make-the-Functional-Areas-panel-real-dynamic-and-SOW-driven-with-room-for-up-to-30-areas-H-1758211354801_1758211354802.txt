@@ -1,0 +1,218 @@
+let’s make the Functional Areas panel real, dynamic, and SOW-driven, with room for up to 30 areas. Here’s a tight drop-in plan that replaces the hard-coded cards with live, configurable areas you can add/remove as the project evolves.
+
+Backend (FastAPI) — dynamic areas
+1) Table for areas (multi-tenant, up to 30)
+
+Run this in Supabase after your grants/cache reload (safe to run now; it’s idempotent):
+
+create table if not exists workstreams (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid not null,
+  project_id uuid not null,
+  name text not null,
+  description text,
+  sort_order int default 0,
+  is_active boolean default true,
+  created_at timestamptz default now()
+);
+
+-- enforce max 30 active per project (soft via view/endpoint; you can also add a constraint trigger later)
+
+2) Endpoints
+
+Add these to /server/main.py:
+
+from fastapi import Body
+from typing import Optional
+
+@app.get("/workstreams")
+def list_workstreams(org_id: str = Query(...), project_id: str = Query(...)):
+    rows = sb.table("workstreams").select("*")\
+        .eq("org_id", org_id).eq("project_id", project_id)\
+        .order("sort_order", desc=False).limit(60).execute().data or []
+    return {"items": [r for r in rows if r.get("is_active", True)]}
+
+@app.post("/workstreams/set")
+def set_workstreams(org_id: str = Body(...), project_id: str = Body(...),
+                    items: list[dict] = Body(...)):
+    """
+    Overwrite active functional areas for a project, max 30.
+    items = [{name, description?, sort_order?}, ...]
+    """
+    if len(items) > 30:
+        return {"ok": False, "error": "Max 30 functional areas"}
+    # soft reset: mark existing inactive, then upsert new
+    sb.table("workstreams").update({"is_active": False})\
+        .eq("org_id", org_id).eq("project_id", project_id).execute()
+
+    # upsert by (org_id, project_id, name). If you want hard upsert, add a unique index on (org_id,project_id,name).
+    for i, it in enumerate(items):
+        data = {
+            "org_id": org_id, "project_id": project_id,
+            "name": it.get("name","").strip()[:120],
+            "description": it.get("description",""),
+            "sort_order": it.get("sort_order", i),
+            "is_active": True
+        }
+        sb.table("workstreams").insert(data).execute()
+    return {"ok": True, "count": len(items)}
+
+@app.post("/workstreams/add")
+def add_workstream(org_id: str = Body(...), project_id: str = Body(...),
+                   name: str = Body(...), description: Optional[str] = Body(None),
+                   sort_order: int = Body(0)):
+    # enforce 30 cap
+    active = sb.table("workstreams").select("id", count="exact")\
+        .eq("org_id", org_id).eq("project_id", project_id)\
+        .eq("is_active", True).execute()
+    if (active.count or 0) >= 30:
+        return {"ok": False, "error": "Max 30 functional areas"}
+    sb.table("workstreams").insert({
+        "org_id": org_id, "project_id": project_id,
+        "name": name[:120], "description": description or "", "sort_order": sort_order, "is_active": True
+    }).execute()
+    return {"ok": True}
+
+
+Your existing /dashboard/workstreams endpoint can continue to compute “health/overdue”, but now it should join against workstreams so the grid shows exactly what’s configured. Quick tweak:
+
+@app.get("/dashboard/workstreams")
+def dashboard_workstreams(org_id: str = Query(...), project_id: str = Query(...)):
+    configured = sb.table("workstreams").select("*")\
+        .eq("org_id", org_id).eq("project_id", project_id).eq("is_active", True)\
+        .order("sort_order", desc=False).limit(30).execute().data or []
+
+    # fall back to inferred names if none configured yet
+    names = [w["name"] for w in configured] or ["HCM","Payroll","Finance","Integrations","Security","Reporting","Cutover"]
+    ws = {n: {"name": n, "overdue": 0, "updated": None, "health": "green",
+              "description": next((w.get("description") for w in configured if w["name"]==n), "")}
+          for n in names}
+
+    # reuse your artifact/action/summary logic to fill updated/overdue/health...
+    # (keep the rest of your existing code here)
+    # ...
+    return {"workstreams": list(ws.values())}
+
+3) Optional: SOW bootstrap endpoint (one-shot)
+
+When you ingest a SOW, auto-extract functional areas:
+
+@app.post("/workstreams/bootstrap-from-sow")
+def bootstrap_from_sow(org_id: str = Body(...), project_id: str = Body(...),
+                       text: str = Body(...)):
+    # naive extraction: look for capitalized keywords; you can improve with LLM later
+    CANDIDATES = ["HCM","Recruiting","Talent","Compensation","Benefits","Time & Absence",
+                  "Payroll","Finance","Projects","Procurement","Expenses",
+                  "Security","Integrations","Reporting/Prism","Audit/Controls",
+                  "Change Management","Training","Cutover","Data Conversion","Testing"]
+    found = []
+    lower = text.lower()
+    for c in CANDIDATES:
+        key = c.lower().split("/")[0].split("&")[0].strip()
+        if key in lower:
+            found.append({"name": c})
+    if not found:  # default minimal set
+        found = [{"name": n} for n in ["HCM","Payroll","Finance","Integrations","Security","Reporting","Cutover"]]
+    return set_workstreams(org_id=org_id, project_id=project_id, items=found)
+
+Frontend — title + dynamic grid (up to 30)
+
+Where you render your “HCM/Payroll/Benefits” cards, replace that section with:
+
+import { useEffect, useState } from 'react'
+import { getJSON } from '../lib/api'
+
+function FunctionalAreas({ orgId, projectId }:{
+  orgId:string, projectId:string
+}) {
+  const [areas, setAreas] = useState<any[]>([])
+  const [loading, setLoading] = useState(false)
+  const [err, setErr] = useState<string>("")
+
+  useEffect(()=>{
+    if(!orgId || !projectId) return
+    setLoading(true)
+    getJSON("/dashboard/workstreams", { org_id: orgId, project_id: projectId })
+      .then(js => setAreas(js.workstreams || []))
+      .catch(e => setErr(e.message))
+      .finally(()=> setLoading(false))
+  }, [orgId, projectId])
+
+  return (
+    <div className="rounded-2xl border p-4">
+      <div className="flex items-center justify-between">
+        <div className="font-semibold">Functional Areas</div>
+        <div className="text-xs text-slate-500">{areas.length}/30</div>
+      </div>
+      {loading && <div className="text-sm text-slate-500 mt-2">Loading…</div>}
+      {err && <div className="text-sm text-rose-600 mt-2">{err}</div>}
+      <div className="grid sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 mt-3">
+        {areas.map((ws) => (
+          <div key={ws.name} className="p-3 border rounded-xl">
+            <div className="flex items-center justify-between">
+              <div className="font-semibold" title={ws.description || ''}>{ws.name}</div>
+              <span className={`text-xs ${ws.health==='red'?'text-rose-600':ws.health==='amber'?'text-amber-600':'text-emerald-600'}`}>
+                {ws.health || '—'}
+              </span>
+            </div>
+            <div className="text-xs text-slate-500 mt-1">Updated: {ws.updated || '—'}</div>
+            <div className="text-xs mt-1">Overdue: {ws.overdue || 0}</div>
+          </div>
+        ))}
+        {!areas.length && !loading && (
+          <div className="text-sm text-slate-500 col-span-full">
+            No functional areas configured yet. Add them from the SOW or via API.
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+
+Then render <FunctionalAreas orgId={orgId} projectId={projectId} /> under your timeline/KPIs, and you’ll have “Functional Areas” as the title with a live count.
+
+Seed / manage areas (curl tests)
+Set an initial list (15 areas; change as you like)
+BASE="http://localhost:5000/api"
+ORG="d915376c-2bd7-4e79-b9c9-aab9d7fcb5a8"
+PROJ="dced0b98-87b4-46ff-b2a4-2cf8e627e8d2"
+
+curl -s -X POST "$BASE/workstreams/set" -H "Content-Type: application/json" -d @- <<JSON
+{
+  "org_id":"$ORG",
+  "project_id":"$PROJ",
+  "items":[
+    {"name":"HCM","description":"Core HR & business processes"},
+    {"name":"Recruiting"},{"name":"Talent"},{"name":"Compensation"},
+    {"name":"Benefits"},{"name":"Time & Absence"},{"name":"Payroll"},
+    {"name":"Finance"},{"name":"Projects"},{"name":"Procurement"},
+    {"name":"Expenses"},{"name":"Security"},{"name":"Integrations"},
+    {"name":"Reporting/Prism"},{"name":"Cutover"}
+  ]
+}
+JSON
+
+Add one (up to 30)
+curl -s -X POST "$BASE/workstreams/add" -H "Content-Type: application/json" -d @- <<JSON
+{"org_id":"$ORG","project_id":"$PROJ","name":"Data Conversion","description":"ETL & reconciliation","sort_order":99}
+JSON
+
+Bootstrap from SOW text
+SOW="Workday scope includes HCM, Payroll, Benefits, Time & Absence, Integrations, Security, Reporting, Cutover, Data Conversion and Testing."
+curl -s -X POST "$BASE/workstreams/bootstrap-from-sow" -H "Content-Type: application/json" -d @- <<JSON
+{"org_id":"$ORG","project_id":"$PROJ","text":"$SOW"}
+JSON
+
+
+Reload the dashboard—your Functional Areas grid should now list everything, up to 30, with tooltips (descriptions), health, updated, and overdue counts driven by real data.
+
+Where this goes next
+
+When you ingest the SOW via /api/ingest-sync, we can trivially auto-call bootstrap-from-sow using the extracted text.
+
+You’ll be able to add/remove/reorder areas during the project; everything resolves to the workstreams table so the grid stays honest.
+
+As we wire Actions, Summaries, and Integrations, those KPIs will roll into each area’s health (we can color by risk density or overdue %).
+
+If you paste the two backend endpoints and the frontend component above, I’ll give you a quick patch if anything squawks. Want me to also add a minimal Workstreams Admin page (list + add/remove/reorder) so you can update areas without curl?

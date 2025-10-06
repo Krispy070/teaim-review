@@ -1,0 +1,314 @@
+double-sized push: Next Big Build v2.12 (two sprints in one). It upgrades the most “felt” PM flows and keeps everything brand-flag aware + dev-safe.
+
+What lands now (copy-paste ready):
+
+Request Sign-Off modal v3 — searchable, multi-select, custom message + optional CC; signer flags respected
+
+Stage Editor date keyboard v2 — ↑/↓ ±1, ⇧ ±7, ⌃/Ctrl ±30 days, duration-preserving sync (shift end when start changes), per-field undo stack, save toast
+
+Digest “Closed since last week” for risks + decisions (canonicalized status mapping) with deep links
+
+Wellness per-user sparkline in the modal + per-user CSV (admin) — quick “pulse” view
+
+v2.12.1 — Request Sign-Off v3 + Stage Editor date v2
+1) Request Sign-Off modal v3 (batch, CC, custom message)
+1A) Backend: batch endpoint (multiple recipients + message/cc)
+
+server/routers/stages_request_sign.py — add a new batch endpoint (keep your existing /request_signoff for backwards compatibility):
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+from typing import List, Optional
+from datetime import datetime, timezone, timedelta
+import secrets, os
+
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase, get_service_supabase
+from ..routers.signoff_docs_gen import DraftReq
+
+router = APIRouter(prefix="/api/stages", tags=["stages"])
+PM_PLUS = require_role({"owner","admin","pm"})
+
+class RequestBatch(BaseModel):
+    stage_id: str
+    emails: List[str] = Field(min_items=1)
+    cc: Optional[List[str]] = None
+    title: Optional[str] = "Stage Sign-Off"
+    area: Optional[str] = None
+    message: Optional[str] = None
+    expires_hours: int = 120
+
+@router.post("/request_signoff_batch")
+def request_signoff_batch(body: RequestBatch, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx); sbs = get_service_supabase()
+
+    # find or create doc for this stage
+    docq = sbs.table("signoff_docs").select("id,status")\
+             .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+             .eq("stage_id", body.stage_id).limit(1).execute().data
+    if not docq:
+        draft = DraftReq(stage_id=body.stage_id, area=body.area, title=body.title or "Stage Sign-Off",
+                         summary=body.message or "Please review and acknowledge completion of this stage.",
+                         bullets=[], acceptance="I acknowledge and approve the above.", footer="Signed electronically via TEAIM")
+        from ..routers.signoff_docs_gen import generate_from_prompt
+        _ = generate_from_prompt(draft, project_id, ctx)
+        docq = sbs.table("signoff_docs").select("id,status")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+               .eq("stage_id", body.stage_id).limit(1).execute().data
+        if not docq: raise HTTPException(500, "Failed to create sign-off draft")
+    doc_id = docq[0]["id"]
+
+    # create tokens + send mails
+    from ..routers.signoff_docs import request_sign as _req
+    sent = []
+    for email in body.emails:
+        # reuse single-request path to leverage send guards/logging
+        _ = _req(type("B", (), {"doc_id": doc_id, "email_to": email, "expires_hours": body.expires_hours})(), project_id, ctx)
+        sent.append(email)
+
+    # optional CC (no tokens; informational email if you want — dev-safe: no-op)
+    if body.cc:
+        try:
+            from ..email.util import mailgun_send_html, send_guard
+            ok, _ = send_guard(sb, ctx.org_id, project_id, "signoff_cc", ",".join(body.cc))
+            if ok:
+                base = os.getenv("APP_BASE_URL","").rstrip("/")
+                link = f"{base}/projects/{project_id}/signoff/docs"
+                mailgun_send_html(body.cc, f"[FYI] Sign-off requested: {body.title}",
+                                  f"<p>A sign-off was requested for <b>{body.title}</b>.</p><p><a href='{link}'>View in TEAIM</a></p>")
+        except Exception:
+            pass
+
+    # audit
+    try:
+        sbs.table("audit_events").insert({
+            "org_id": ctx.org_id, "project_id": project_id, "actor_id": ctx.user_id,
+            "kind": "stage.request_signoff",
+            "details": {"stage_id": body.stage_id, "emails": body.emails, "cc": body.cc, "title": body.title}
+        }).execute()
+    except Exception: ...
+    return {"ok": True, "sent": sent}
+
+
+Mount already exists (you mounted stages_request_sign earlier). If not:
+
+from .routers import stages_request_sign
+app.include_router(stages_request_sign.router)
+
+1B) Modal v3 — searchable, multi-select, CC, message
+
+client/src/components/SignoffRequestModal.tsx (replace the v2 one)
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { getJSON } from "@/lib/authFetch";
+
+export default function SignoffRequestModal({
+  projectId, stageId, stageTitle, stageArea, onClose
+}:{
+  projectId: string; stageId: string; stageTitle?: string; stageArea?: string; onClose: ()=>void
+}){
+  const [signers,setSigners]=useState<{user_id:string;email:string;role?:string;allowed?:boolean;can_sign_all?:boolean;sign_areas?:string[]}[]>([]);
+  const [q,setQ]=useState("");
+  const [picked,setPicked]=useState<string[]>([]);
+  const [cc,setCc]=useState<string>("");
+  const [msg,setMsg]=useState<string>("");
+  const [busy,setBusy]=useState(false);
+  const inputRef = useRef<HTMLInputElement|null>(null);
+
+  useEffect(()=>{ inputRef.current?.focus(); },[]);
+  useEffect(()=>{ (async()=>{
+    try{
+      const d = await getJSON(`/api/members/signers?project_id=${projectId}${stageArea?`&area=${encodeURIComponent(stageArea)}`:""}`);
+      setSigners(d.items||[]);
+    }catch{ setSigners([]); }
+  })(); },[projectId, stageArea]);
+
+  const hits = useMemo(()=>{
+    if (!q.trim()) return signers;
+    const qq = q.toLowerCase();
+    return signers.filter(s=> (s.email||"").toLowerCase().includes(qq) || (s.role||"").toLowerCase().includes(qq));
+  },[q, signers]);
+
+  function toggle(email:string){
+    setPicked(p => p.includes(email) ? p.filter(x=>x!==email) : [...p, email]);
+  }
+  async function send(){
+    if (!picked.length) return alert("Pick at least one recipient");
+    const ccList = cc.split(",").map(x=>x.trim()).filter(Boolean);
+    setBusy(true);
+    try{
+      await fetch(`/api/stages/request_signoff_batch?project_id=${projectId}`, {
+        method:"POST", credentials:"include", headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ stage_id: stageId, emails: picked, cc: ccList, title: stageTitle, area: stageArea, message: msg })
+      });
+      onClose(); alert(`Request sent to ${picked.length} recipient(s)`);
+    }catch(e:any){ alert(String(e?.message||e)); setBusy(false); }
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-[200]" onClick={onClose}>
+      <div className="mx-auto mt-[8vh] w-[640px] max-w-[95%] bg-white dark:bg-neutral-900 rounded shadow-xl border"
+           onClick={e=>e.stopPropagation()}>
+        <div className="p-3 border-b">
+          <div className="text-sm font-medium">Request Sign-Off</div>
+          <div className="text-xs text-muted-foreground">{stageTitle}{stageArea?` • ${stageArea}`:""}</div>
+        </div>
+        <div className="p-3 space-y-2">
+          <input ref={inputRef} className="border rounded p-2 w-full text-sm"
+                 placeholder="Search recipients (email or role)…" value={q} onChange={e=>setQ(e.target.value)} />
+          <div className="max-h-[36vh] overflow-auto border rounded">
+            {hits.map(s=>(
+              <label key={s.email} className="flex items-center gap-2 px-2 py-1 hover:bg-black/5 dark:hover:bg-white/5">
+                <input type="checkbox" checked={picked.includes(s.email)} onChange={()=>toggle(s.email)} />
+                <span className="text-sm">{s.email}</span>
+                <span className="text-[11px] text-muted-foreground ml-auto">
+                  {s.role || ""} {s.can_sign_all ? "• signer(all)" : s.sign_areas?.length ? `• signer(${s.sign_areas.join(",")})`:""}
+                </span>
+                {!s.allowed && <span className="text-[11px] text-red-500 ml-1">(area mismatch)</span>}
+              </label>
+            ))}
+            {!hits.length && <div className="p-2 text-xs text-muted-foreground">No matches</div>}
+          </div>
+
+          <div className="grid md:grid-cols-2 gap-2">
+            <input className="border rounded p-2 text-sm" placeholder="CC (comma-separated)" value={cc} onChange={e=>setCc(e.target.value)} />
+            <input className="border rounded p-2 text-sm" placeholder="Subject" defaultValue={stageTitle || "Stage Sign-Off"} disabled />
+          </div>
+          <textarea className="border rounded p-2 w-full text-sm" rows={3}
+                    placeholder="Optional message…" value={msg} onChange={e=>setMsg(e.target.value)} />
+        </div>
+        <div className="p-3 border-t flex justify-end gap-2">
+          <button className="brand-btn text-xs" onClick={onClose}>Cancel</button>
+          <button className="brand-btn text-xs swoosh" onClick={send} disabled={busy || picked.length===0}>
+            {busy?"Sending…":`Send (${picked.length})`}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+(No further timeline changes needed; you already render this modal from the Request button.)
+
+2) Stage Editor date v2 — duration-preserving sync + undo + toast
+
+You already added keyboard arrows and undo stack in v2.11. This extends start_date changes to shift end_date to preserve duration, and vice versa.
+
+Patch client/src/pages/Stages.tsx (or your Stages page)
+
+Add util to compute duration & shift:
+
+function diffDays(a:string|undefined,b:string|undefined){
+  if (!a || !b) return null;
+  const A=new Date(a+"T00:00:00"), B=new Date(b+"T00:00:00");
+  return Math.round((+B - +A)/86400000);
+}
+function shiftDate(baseISO:string, days:number){ const d=new Date(baseISO+"T00:00:00"); d.setDate(d.getDate()+days); return iso(d); }
+
+
+In start_date input onChange and arrow handlers, after computing the new v:
+
+const oldSpan = diffDays(s.start_date, s.end_date);
+if (oldSpan!=null && s.end_date){
+  // preserve duration: move end_date by same delta from previous start
+  const delta = diffDays(s.start_date, v) || 0;
+  const newEnd = shiftDate(s.end_date, delta);
+  markDirty(s.id); pushUndo(s.id, { start_date: s.start_date, end_date: s.end_date });
+  saveDebounced(s.id,{ start_date: v, end_date: newEnd });
+} else {
+  markDirty(s.id); pushUndo(s.id, { start_date: s.start_date });
+  saveDebounced(s.id,{ start_date: v });
+}
+
+
+Similarly, in end_date handlers:
+
+const oldSpan = diffDays(s.start_date, s.end_date);
+if (oldSpan!=null && s.start_date){
+  // if end moves; do not change start; only ensure end >= start
+  if (diffDays(s.start_date, v)! < 0){
+    // ensure at least same day (0)
+    const fixed = s.start_date;
+    markDirty(s.id); pushUndo(s.id, { end_date: s.end_date });
+    saveDebounced(s.id,{ end_date: fixed });
+  } else {
+    markDirty(s.id); pushUndo(s.id, { end_date: s.end_date });
+    saveDebounced(s.id,{ end_date: v });
+  }
+} else {
+  markDirty(s.id); pushUndo(s.id, { end_date: s.end_date });
+  saveDebounced(s.id,{ end_date: v });
+}
+
+
+Result: changing start shifts end to keep duration; changing end never flips before start.
+
+v2.12.2 — Digest deep links + Wellness sparkline
+3) Digest closed since last week (risks & decisions) with deep links
+
+You did actions earlier. Add canonicalized status mappings for risks/decisions.
+
+Patch server/routers/digest.py:
+
+RISK_CLOSED_STATUSES = {"closed","retired","mitigated","resolved"}
+DECISION_CLOSED_STATUSES = {"accepted","implemented","closed","approved"}
+
+def closed_since(table, status_field="status", accepted=()):
+    if not last_send: return []
+    try:
+        q = sb.table(table).select("id,title,created_at,"+status_field)\
+             .eq("org_id", ctx.org_id).eq("project_id", project_id).gte("created_at", last_send)
+        rows = q.order("created_at", desc=True).limit(200).execute().data or []
+        return [r for r in rows if str(r.get(status_field,"")).lower() in accepted]
+    except Exception:
+        return []
+
+cl_risks   = closed_since("risks", status_field="status", accepted=RISK_CLOSED_STATUSES) if "risks" in wanted else []
+cl_decis   = closed_since("decisions", status_field="status", accepted=DECISION_CLOSED_STATUSES) if "decisions" in wanted else []
+
+def link_item(table, r):
+    rid = r.get("id"); base = os.getenv("APP_BASE_URL","").rstrip("/")
+    if table=="actions": return f"{base}/projects/{project_id}/actions/list#id={rid}"
+    if table in ("risks","decisions"): return f"{base}/projects/{project_id}/admin/audit-timeline#id={rid}"
+    return f"{base}/projects/{project_id}/dashboard"
+
+def listify_closed(title, arr, table):
+    if not arr: return ""
+    items = "".join([f"<li><a href='{link_item(table,a)}'>{(a.get('title') or a.get('id'))}</a> <span style='color:#666;font-size:12px'>{a.get('created_at')}</span></li>" for a in arr])
+    return f"<h3>Closed since last week — {title}</h3><ul>{items}</ul>"
+
+html += listify_closed("Risks", cl_risks, "risks")
+html += listify_closed("Decisions", cl_decis, "decisions")
+
+4) Wellness per-user sparkline + export in modal
+
+Patch client/src/components/WellnessUserModal.tsx:
+
+Add sparkline bar series:
+
+const series = items.slice().reverse(); // oldest → newest
+// …
+<div className="p-3 space-y-2">
+  <div className="h-[60px] flex items-end gap-1">
+    {series.map((r,i)=>(
+      <div key={i} title={`${new Date(r.created_at).toLocaleString()} • score ${r.score}`}
+           style={{ height: `${(Number(r.score||0)/5)*60}px`, width: '5px',
+                    background: 'var(--brand-accent)', opacity: .8 }} />
+    ))}
+  </div>
+</div>
+
+
+Leave the comments list as is below.
+
+5) 60-second validation
+
+Request Sign-Off v3: pick multiple signers, CC list, optional message; batch email send
+
+Stage Editor date v2: start shifts end to preserve duration; end never moves before start; per-field undo works
+
+Digests: closed risks/decisions appear with deep links
+
+Wellness user modal: last 10 check-ins + comments sparkline; CSV export per user

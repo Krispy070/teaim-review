@@ -1,0 +1,146 @@
+What’s failing and why (most likely)
+
+Digest preview HTML
+
+Endpoint probably requires changes/comments that are published/visible or within a recent window and tied to the current project.
+
+Some builds also check a projects row or a visible=true flag.
+
+Area export ZIP (HCM)
+
+Your endpoint likely looks for an artifact with kind='area_zip' (not just wb_export_csv) for HCM’s area_id.
+
+Notifications unseen count
+
+Many apps scope by current user. If your seed wrote notifications.user_id = null or to a different user than the authenticated one, count returns 0.
+
+Releases ICS
+
+Some stacks generate ICS from calendar_events (date-bounded, e.g., next 60 days) and ignore the releases row unless there are events.
+
+Quick fixes (copy/paste)
+1) Seed: add missing fields + tighter types
+
+Update your Drizzle seed to set the usual suspects:
+
+// inside your tx.insert(...) blocks in seedMinimal()
+
+// changes/comments: add visible/published where present
+await tx.insert(changes).values([
+  { id: ids.change1, projectId, areaId: ids.areaHcm, kind: "update", summary: "Updated HCM position sync",
+    createdAt: now, /* add if columns exist: */ visible: true, published: true },
+  { id: ids.change2, projectId, areaId: ids.areaFin, kind: "add", summary: "Added GL segment validation",
+    createdAt: now, visible: true, published: true },
+]);
+
+await tx.insert(comments).values([
+  { id: ids.cmt1, projectId, areaId: ids.areaHcm, body: "Please verify job catalog mapping.",
+    author: "System", createdAt: now, visible: true },
+  { id: ids.cmt2, projectId, areaId: ids.areaFin, body: "Need sign-off on journal import.",
+    author: "System", createdAt: now, visible: true },
+]);
+
+// artifacts: add a true area ZIP for HCM
+await tx.insert(artifacts).values([
+  {
+    id: ids.artZip,
+    projectId,
+    areaId: ids.areaHcm,
+    kind: "area_zip",                  // <-- critical
+    filename: "hcm_area_export.zip",
+    mime: "application/zip",
+    size: 128,
+    storage: "inline",
+    data: Buffer.from("PK").toString("base64"), // minimal zip signature
+    createdAt: now,
+  },
+]);
+
+// notifications: tie to the actual signed-in user
+await tx.insert(notifications).values([
+  {
+    id: ids.notif1,
+    projectId,
+    kind: "digest_ready",
+    seen: false,
+    userId,                 // <-- pass this from UI; must match req.user.id
+    payload: { areas: ["HCM","FIN"] },
+    createdAt: now,
+  },
+]);
+
+// calendar events: ensure it falls inside endpoint’s window (e.g., next 30 days)
+const starts = dayjs().add(2, "day").toISOString();
+const ends   = dayjs(starts).add(1, "hour").toISOString();
+await tx.insert(calendarEvents).values([
+  { id: ids.cal1, projectId, title: "Stage Gate", startsAt: starts, endsAt: ends, channel: "staging", createdAt: now },
+]);
+
+
+And pass userId from your runner:
+
+// UI runner
+await fetch("/admin/test/seed-v2", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ projectId, userId: currentUserId })
+});
+
+2) Endpoints: make filters match the seed (small guards)
+
+Digest preview: allow visible rows or default visible when column absent.
+
+// where project_id = ? AND (visible = true OR visible IS NULL)
+
+
+Area ZIP: accept either 'area_zip' or 'wb_export_csv' if your seed uses both.
+
+// WHERE project_id = ? AND area_id = ? AND kind IN ('area_zip','wb_export_csv')
+
+
+Notifications unseen: count by (project_id, user_id) but fallback to project-only in dev.
+
+// WHERE project_id = ? AND (user_id = ? OR ? IS NULL) AND seen = false
+
+
+Releases ICS: if you render ICS from calendar_events, don’t require a releases row; filter future 0..60 days.
+
+// SELECT ... FROM calendar_events WHERE project_id = ? AND starts_at BETWEEN now() AND now()+interval '60 days'
+
+3) Tiny debug pings to confirm scope (paste & hit)
+// digest: must return at least one change/comment
+fetch(`/api/digest/preview?projectId=${projectId}`).then(r=>r.json()).then(console.log);
+
+// artifacts for HCM (should show kind 'area_zip')
+fetch(`/api/artifacts?projectId=${projectId}&areaKey=HCM`).then(r=>r.json()).then(console.log);
+
+// notifications unseen for current user
+fetch(`/api/notifications/unseen-count?projectId=${projectId}`).then(r=>r.json()).then(console.log);
+
+// ICS text (should start with BEGIN:VCALENDAR)
+fetch(`/api/releases/ics?projectId=${projectId}`).then(r=>r.text()).then(t=>console.log(t.slice(0,80)));
+
+
+If any returns empty, that’s your exact filter to relax or seed to enhance (usually userId, kind, or date window).
+
+Quick checklist to flip green
+
+ Runner sends { projectId, userId } to /admin/test/seed-v2.
+
+ Seed writes artifacts.kind='area_zip' for HCM, and a future calendar_events row.
+
+ Seed sets visible/published if your schema has those columns.
+
+ Endpoints tolerate dev data (guards above).
+
+ Re-run Seed & Run.
+
+You want, I can prep exact Drizzle table defs and a patch for the endpoints if you tell me the file paths for:
+
+digest preview handler,
+
+area zip export handler,
+
+notifications unseen API,
+
+releases/ICS API.

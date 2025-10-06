@@ -1,0 +1,518 @@
+Ohhh yes — a PM Update Monitor is exactly what TEAIM needs: one place to see every change the app wants to make (from docs & transcripts), review the diffs, edit if needed, approve/apply, reject, or undo. Below is a tight, paste-ready build:
+
+DB + RLS: pending_updates (review queue for changes)
+
+API: list/details/enqueue/edit-approve/approve/reject/batch/undo/dry-run
+
+Apply engine: safely writes to actions/risks/decisions/integrations (extensible)
+
+UI: UpdatesReview page (filters, diff viewer, edit modal, bulk approve) + header hint
+
+Hooks: quick helper to enqueue from your classifier/ingest pipeline
+
+Signal: audit events + NotificationBell picks up (review.*)
+
+I kept everything dev-safe (AuthFetch everywhere, alias if your proxy strips /api).
+
+1) SQL — review queue table + RLS
+
+Run in Supabase SQL:
+
+create table if not exists public.pending_updates (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid not null,
+  project_id uuid not null,
+  change_type text not null,          -- action|risk|decision|integration|workstream|metric|memory
+  operation text not null,            -- insert|update|upsert|delete
+  target_table text not null,         -- e.g., 'actions'
+  target_id uuid,                     -- null for inserts
+  payload jsonb not null,             -- proposed fields
+  old_snapshot jsonb,                 -- captured when applying (for undo)
+  source_artifact_id uuid,            -- provenance
+  source_span text,                   -- optional line/time range
+  confidence numeric,                 -- 0..1
+  status text not null default 'pending',   -- pending|approved|applied|rejected|failed
+  error text,
+  created_by text default 'system',
+  created_at timestamptz not null default now(),
+  approved_by text,
+  approved_at timestamptz,
+  applied_by text,
+  applied_at timestamptz
+);
+
+create index if not exists idx_pu_proj_status on public.pending_updates(project_id, status);
+create index if not exists idx_pu_target on public.pending_updates(target_table, target_id);
+
+alter table public.pending_updates enable row level security;
+
+create policy "pu_select_member" on public.pending_updates
+for select using (org_id = public.current_org() and public.is_member(org_id, project_id));
+
+create policy "pu_write_pmplus" on public.pending_updates
+for insert with check (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm']));
+create policy "pu_update_pmplus" on public.pending_updates
+for update using (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm']))
+with check (org_id = public.current_org());
+
+select pg_notify('pgrst','reload schema');
+
+2) Backend — Updates router
+
+server/routers/updates.py
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any
+from datetime import datetime, timezone
+import copy, os
+
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase, get_service_supabase
+
+router = APIRouter(prefix="/api/updates", tags=["updates"])
+PM_ONLY = require_role({"owner","admin","pm"})
+
+# ---------- Models ----------
+class EnqueueBody(BaseModel):
+    change_type: str                # action|risk|decision|integration|...
+    operation: str                  # insert|update|upsert|delete
+    target_table: str               # 'actions'|'risks'|'decisions'|'project_integrations'...
+    target_id: Optional[str] = None
+    payload: Dict[str, Any]
+    source_artifact_id: Optional[str] = None
+    source_span: Optional[str] = None
+    confidence: Optional[float] = 0.8
+    created_by: Optional[str] = "system"
+
+class EditApproveBody(BaseModel):
+    payload: Dict[str, Any]
+
+class BatchApproveBody(BaseModel):
+    ids: List[str] = Field(default_factory=list)
+
+# ---------- Helpers ----------
+def _now():
+    return datetime.now(timezone.utc).isoformat()
+
+def _apply_change(sbs, org_id: str, project_id: str, change: Dict[str,Any]):
+    """
+    Apply proposed change to the appropriate table.
+    Supports: actions, risks, decisions, project_integrations
+    Returns (applied_record).
+    """
+    table = change["target_table"]
+    op = change["operation"]
+    tid = change.get("target_id")
+    pay = change.get("payload") or {}
+
+    q = sbs.table(table)
+    # ensure project scoping fields exist
+    if op in ("insert","upsert") and "org_id" not in pay:
+        pay["org_id"] = org_id
+    if op in ("insert","upsert") and "project_id" not in pay:
+        pay["project_id"] = project_id
+
+    # capture old snapshot if updating/deleting
+    old = None
+    if tid and op in ("update","upsert","delete"):
+        oldq = sbs.table(table).select("*").eq("org_id", org_id).eq("project_id", project_id).eq("id", tid).limit(1).execute().data
+        old = oldq[0] if oldq else None
+
+    if op == "insert":
+        res = q.insert(pay).execute().data
+        return res[0] if res else None, old
+    elif op == "upsert":
+        res = q.upsert(pay).execute().data
+        return res[0] if res else None, old
+    elif op == "update":
+        if not tid: raise HTTPException(400, "target_id required for update")
+        res = q.update(pay).eq("org_id", org_id).eq("project_id", project_id).eq("id", tid).execute().data
+        return res[0] if res else None, old
+    elif op == "delete":
+        if not tid: raise HTTPException(400, "target_id required for delete")
+        q.delete().eq("org_id", org_id).eq("project_id", project_id).eq("id", tid).execute()
+        return {"deleted_id": tid}, old
+    else:
+        raise HTTPException(400, f"Unsupported operation: {op}")
+
+# ---------- Endpoints ----------
+@router.get("/list")
+def list_updates(project_id: str = Query(...), status: Optional[str] = None,
+                 types: Optional[str] = None, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    q = sb.table("pending_updates").select("*").eq("org_id", ctx.org_id).eq("project_id", project_id)
+    if status: q = q.eq("status", status)
+    if types:
+        arr = [t.strip() for t in types.split(",") if t.strip()]
+        if arr: q = q.in_("change_type", arr)
+    res = q.order("created_at", desc=True).limit(500).execute().data or []
+    return {"items": res}
+
+@router.get("/{update_id}")
+def get_update(update_id: str, project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    res = sb.table("pending_updates").select("*").eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", update_id).limit(1).execute().data
+    if not res: raise HTTPException(404, "Not found")
+    return res[0]
+
+@router.post("/enqueue")
+def enqueue_update(body: EnqueueBody, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_ONLY)):
+    sb = get_user_supabase(ctx)
+    row = {
+        "org_id": ctx.org_id, "project_id": project_id,
+        "change_type": body.change_type, "operation": body.operation, "target_table": body.target_table,
+        "target_id": body.target_id, "payload": body.payload,
+        "source_artifact_id": body.source_artifact_id, "source_span": body.source_span,
+        "confidence": body.confidence, "created_by": body.created_by
+    }
+    out = sb.table("pending_updates").insert(row).execute().data[0]
+    # audit
+    try:
+        sb.table("audit_events").insert({
+          "org_id": ctx.org_id, "project_id": project_id, "actor_id": ctx.user_id,
+          "kind": "review.queued", "details": {"update_id": out["id"], "change_type": body.change_type}
+        }).execute()
+    except Exception: ...
+    return {"ok": True, "update": out}
+
+@router.post("/{update_id}/approve")
+def approve_update(update_id: str, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_ONLY)):
+    # mark approved & attempt apply
+    sbs = get_service_supabase()
+    # fetch
+    rowq = sbs.table("pending_updates").select("*").eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", update_id).limit(1).execute().data
+    if not rowq: raise HTTPException(404, "Not found")
+    row = rowq[0]
+    # apply
+    try:
+        applied, old = _apply_change(sbs, ctx.org_id, project_id, row)
+        sbs.table("pending_updates").update({
+            "status": "applied", "approved_by": ctx.user_id, "approved_at": _now(),
+            "applied_by": ctx.user_id, "applied_at": _now(), "old_snapshot": old, "error": None
+        }).eq("id", update_id).execute()
+        sbs.table("audit_events").insert({
+          "org_id": ctx.org_id, "project_id": project_id, "actor_id": ctx.user_id,
+          "kind": "review.applied", "details": {"update_id": update_id, "target_table": row["target_table"], "target_id": row.get("target_id")}
+        }).execute()
+        return {"ok": True, "applied": applied}
+    except Exception as e:
+        sbs.table("pending_updates").update({
+            "status":"failed", "approved_by": ctx.user_id, "approved_at": _now(), "error": str(e)
+        }).eq("id", update_id).execute()
+        raise HTTPException(500, f"Apply failed: {e}")
+
+@router.post("/{update_id}/edit-approve")
+def edit_and_approve(update_id: str, body: EditApproveBody, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_ONLY)):
+    sbs = get_service_supabase()
+    rowq = sbs.table("pending_updates").select("*").eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", update_id).limit(1).execute().data
+    if not rowq: raise HTTPException(404, "Not found")
+    row = rowq[0]
+    row["payload"] = body.payload
+    try:
+        applied, old = _apply_change(sbs, ctx.org_id, project_id, row)
+        sbs.table("pending_updates").update({
+            "payload": body.payload, "status": "applied", "approved_by": ctx.user_id, "approved_at": _now(),
+            "applied_by": ctx.user_id, "applied_at": _now(), "old_snapshot": old, "error": None
+        }).eq("id", update_id).execute()
+        sbs.table("audit_events").insert({
+          "org_id": ctx.org_id, "project_id": project_id, "actor_id": ctx.user_id,
+          "kind": "review.applied", "details": {"update_id": update_id}
+        }).execute()
+        return {"ok": True, "applied": applied}
+    except Exception as e:
+        sbs.table("pending_updates").update({"status":"failed","error": str(e)}).eq("id", update_id).execute()
+        raise HTTPException(500, f"Apply failed: {e}")
+
+@router.post("/{update_id}/reject")
+def reject_update(update_id: str, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_ONLY)):
+    sb = get_user_supabase(ctx)
+    sb.table("pending_updates").update({
+      "status":"rejected", "approved_by": ctx.user_id, "approved_at": _now()
+    }).eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", update_id).execute()
+    try:
+        sb.table("audit_events").insert({
+          "org_id": ctx.org_id, "project_id": project_id, "actor_id": ctx.user_id,
+          "kind": "review.rejected", "details": {"update_id": update_id}
+        }).execute()
+    except Exception: ...
+    return {"ok": True}
+
+@router.post("/batch_approve")
+def batch_approve(body: BatchApproveBody, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_ONLY)):
+    results = []
+    for uid in body.ids:
+        try:
+            results.append(approve_update(uid, project_id, ctx))  # reuse
+        except Exception as e:
+            results.append({"ok": False, "error": str(e), "id": uid})
+    return {"results": results}
+
+@router.post("/{update_id}/undo")
+def undo_update(update_id: str, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_ONLY)):
+    sbs = get_service_supabase()
+    rowq = sbs.table("pending_updates").select("*")\
+        .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", update_id).limit(1).execute().data
+    if not rowq: raise HTTPException(404, "Not found")
+    row = rowq[0]
+    old = row.get("old_snapshot")
+    if not old: raise HTTPException(400, "No snapshot to undo")
+    table = row["target_table"]
+    tid = old.get("id")
+    if not tid: raise HTTPException(400, "Snapshot missing id")
+    sbs.table(table).upsert(old).execute()
+    sbs.table("audit_events").insert({
+      "org_id": ctx.org_id, "project_id": project_id, "actor_id": ctx.user_id,
+      "kind": "review.undo", "details": {"update_id": update_id, "target_table": table, "target_id": tid}
+    }).execute()
+    return {"ok": True}
+
+@router.post("/{update_id}/dry_run")
+def dry_run(update_id: str, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_ONLY)):
+    sbs = get_service_supabase()
+    rowq = sbs.table("pending_updates").select("*")\
+        .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", update_id).limit(1).execute().data
+    if not rowq: raise HTTPException(404, "Not found")
+    row = rowq[0]
+    table = row["target_table"]; tid = row.get("target_id"); pay = row.get("payload") or {}
+    # fetch current record to compute diff client-side
+    cur = None
+    if tid:
+        curq = sbs.table(table).select("*").eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", tid).limit(1).execute().data
+        cur = curq[0] if curq else None
+    return {"current": cur, "proposed": pay}
+
+
+Mount (with alias if your proxy strips /api):
+
+from .routers import updates
+app.include_router(updates.router)
+
+# Optional alias: /updates/* (if Express forwards /api/* -> /*)
+from fastapi import APIRouter
+updates_alias = APIRouter(prefix="/updates", tags=["updates"])
+for r in updates.router.routes:
+    updates_alias.add_api_route(r.path.replace("/api/updates","") or "/", r.endpoint, methods=r.methods)
+app.include_router(updates_alias)
+
+3) PM Updates Review UI
+
+client/src/pages/UpdatesReview.tsx
+
+import { useEffect, useMemo, useState } from "react";
+import { useParams } from "react-router-dom";
+import { getJSON, postJSON } from "@/lib/authFetch";
+import PageHeaderHint from "@/components/PageHeaderHint";
+
+function fieldDiff(current:any, proposed:any){
+  const keys = Array.from(new Set([...Object.keys(proposed||{}), ...Object.keys(current||{})])).sort();
+  return keys.map(k=>{
+    const a = current?.[k]; const b = proposed?.[k];
+    const changed = JSON.stringify(a) !== JSON.stringify(b);
+    return { key:k, before:a, after:b, changed };
+  });
+}
+
+export default function UpdatesReview(){
+  const { projectId } = useParams();
+  const [items,setItems] = useState<any[]>([]);
+  const [status,setStatus] = useState("pending");
+  const [type,setType] = useState("");
+  const [sel,setSel] = useState<any|null>(null);
+  const [editing,setEditing] = useState<any|null>(null);
+  const [payload,setPayload] = useState<string>("");
+
+  async function load(){
+    const qs = new URLSearchParams({ project_id: projectId!, status });
+    if (type) qs.set("types", type);
+    const d = await getJSON<{items:any[]}>(`/api/updates/list?${qs.toString()}`);
+    setItems(d.items||[]);
+    setSel(null);
+  }
+  useEffect(()=>{ load(); }, [projectId, status, type]);
+
+  async function open(u:any){
+    const d = await getJSON(`/api/updates/${u.id}?project_id=${projectId}`);
+    // also fetch dry-run for diff
+    const r = await postJSON(`/api/updates/${u.id}/dry_run?project_id=${projectId}`, {});
+    setSel({...d, dry: r});
+  }
+
+  async function approve(id:string){ await postJSON(`/api/updates/${id}/approve?project_id=${projectId}`, {}); load(); }
+  async function reject(id:string){ await postJSON(`/api/updates/${id}/reject?project_id=${projectId}`, {}); load(); }
+  async function batchApprove(){
+    const ids = items.map(i=>i.id);
+    await postJSON(`/api/updates/batch_approve?project_id=${projectId}`, { ids });
+    load();
+  }
+  async function undo(id:string){ await postJSON(`/api/updates/${id}/undo?project_id=${projectId}`, {}); load(); }
+
+  function startEdit(){
+    setEditing(sel);
+    setPayload(JSON.stringify(sel?.payload || {}, null, 2));
+  }
+  async function saveEdit(){
+    try{
+      const body = JSON.parse(payload);
+      await postJSON(`/api/updates/${editing.id}/edit-approve?project_id=${projectId}`, { payload: body });
+      setEditing(null); load();
+    }catch(e){ alert("Invalid JSON"); }
+  }
+
+  const byType = useMemo(()=> Array.from(new Set(items.map(i=>i.change_type))), [items]);
+
+  return (
+    <div className="p-6 grid md:grid-cols-2 gap-6">
+      <div className="md:col-span-2">
+        <PageHeaderHint
+          id="updates-review"
+          title="Updates Review (PM)"
+          intro="Monitor and quality-check changes proposed by the AI from documents and transcripts."
+          bullets={[
+            "Filter and inspect pending updates with diffs",
+            "Approve, edit & approve, reject, or undo applied changes",
+            "Batch-approve safe changes; provenance links to source files"
+          ]}
+        />
+      </div>
+
+      {/* Left: list */}
+      <div className="border rounded p-3">
+        <div className="flex items-end gap-2 mb-2">
+          <div>
+            <div className="text-xs text-muted-foreground">Status</div>
+            <select className="border rounded p-2" value={status} onChange={e=>setStatus(e.target.value)}>
+              {["pending","approved","applied","rejected","failed"].map(s=><option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          <div>
+            <div className="text-xs text-muted-foreground">Type</div>
+            <select className="border rounded p-2" value={type} onChange={e=>setType(e.target.value)}>
+              <option value="">All</option>
+              {byType.map(t=><option key={t} value={t}>{t}</option>)}
+            </select>
+          </div>
+          {status==="pending" && items.length>0 && (
+            <button className="ml-auto px-3 py-2 border rounded" onClick={batchApprove}>Batch Approve</button>
+          )}
+        </div>
+
+        <div className="divide-y">
+          {items.map(u=>(
+            <div key={u.id} className="py-2 cursor-pointer hover:bg-neutral-50" onClick={()=>open(u)}>
+              <div className="text-sm"><b>{u.change_type}</b> • {u.operation} • {u.target_table} {u.target_id ? `(${u.target_id.slice(0,8)}…)` : "(new)"} </div>
+              <div className="text-xs text-muted-foreground">conf={u.confidence ?? "—"} • {u.created_at}</div>
+            </div>
+          ))}
+          {!items.length && <div className="text-sm text-muted-foreground py-6">No updates.</div>}
+        </div>
+      </div>
+
+      {/* Right: detail */}
+      <div className="border rounded p-3 min-h-[320px]">
+        {!sel && <div className="text-sm text-muted-foreground">Select an update to view details.</div>}
+        {sel && (
+          <div className="space-y-3">
+            <div className="text-sm">
+              <div><b>{sel.change_type}</b> • {sel.operation} • {sel.target_table}</div>
+              <div className="text-xs text-muted-foreground">Provenance: {sel.source_artifact_id || "—"} {sel.source_span ? `(${sel.source_span})` : ""}</div>
+            </div>
+            {/* diff */}
+            <div className="border rounded">
+              <div className="px-2 py-1 text-xs bg-neutral-50">Diff</div>
+              <div className="p-2 text-sm">
+                {fieldDiff(sel.dry?.current, sel.dry?.proposed).map((d,i)=>(
+                  <div key={i} className={`grid grid-cols-3 gap-2 py-1 ${d.changed?'bg-yellow-50':''}`}>
+                    <div className="font-mono text-xs truncate">{d.key}</div>
+                    <div className="text-xs text-muted-foreground truncate">{JSON.stringify(d.before)}</div>
+                    <div className="text-xs truncate">{JSON.stringify(d.after)}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            {/* actions */}
+            <div className="flex items-center gap-2">
+              {sel.status==="pending" && (<>
+                <button className="px-3 py-2 border rounded" onClick={()=>approve(sel.id)}>Approve</button>
+                <button className="px-3 py-2 border rounded" onClick={startEdit}>Edit & Approve</button>
+                <button className="px-3 py-2 border rounded" onClick={()=>reject(sel.id)}>Reject</button>
+              </>)}
+              {sel.status==="applied" && sel.old_snapshot && (
+                <button className="px-3 py-2 border rounded" onClick={()=>undo(sel.id)}>Undo</button>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* edit modal */}
+      {editing && (
+        <div className="fixed inset-0 bg-black/30 z-[80] flex items-center justify-center" onClick={()=>setEditing(null)}>
+          <div className="w-[640px] bg-white border rounded shadow-xl p-3" onClick={e=>e.stopPropagation()}>
+            <div className="text-sm font-medium mb-1">Edit payload</div>
+            <textarea className="w-full h-[260px] border rounded p-2 font-mono text-xs"
+              value={payload} onChange={e=>setPayload(e.target.value)} />
+            <div className="mt-2 flex items-center gap-2">
+              <button className="px-3 py-2 border rounded" onClick={saveEdit}>Save & Approve</button>
+              <button className="px-3 py-2 border rounded" onClick={()=>setEditing(null)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+Add route + nav (PM/Admin only):
+
+{ path: "/projects/:projectId/updates/review", element: <UpdatesReview/> }
+
+4) Hook the pipeline — enqueue changes instead of blind writes
+
+Where your classifier/ingest currently writes extracted items, swap to enqueue:
+
+# example (inside your classifier result handler)
+import requests, os
+def enqueue_update(host, project_id, dev_headers, change_type, target_table, operation, payload, target_id=None, source_artifact_id=None, confidence=0.7):
+    url = f"{host}/api/updates/enqueue?project_id={project_id}"
+    headers = dev_headers or {}
+    body = {
+      "change_type": change_type,
+      "operation": operation,
+      "target_table": target_table,
+      "target_id": target_id,
+      "payload": payload,
+      "source_artifact_id": source_artifact_id,
+      "confidence": confidence,
+      "created_by": "classifier"
+    }
+    requests.post(url, json=body, headers=headers, timeout=20)
+
+
+High-confidence items (e.g., ≥0.85) you can still auto-apply by calling /approve right after enqueue (or continue your current auto-publish path).
+
+5) Wire to notifications
+
+The router emits review.queued, review.applied, review.rejected, review.undo. Your existing NotificationBell v2 will show them (it already watches stage.*, backup.*, reindex.*, reminder.*; add review. to its filter if you want a badge bump).
+
+6) Optional alias if your proxy strips /api
+
+You can reuse the alias pattern we used for share links to expose /updates/* alongside /api/updates/*.
+
+7) Quick validation
+
+Upload a doc → classifier enqueues 1–2 updates (or hit /enqueue manually).
+
+Updates Review shows “pending”; pick one → diff renders; Approve applies and moves to “applied”.
+
+Edit & Approve tweaks fields before apply.
+
+Reject hides from pending; Undo restores old snapshot.
+
+NotificationBell shows review.applied.
+
+Bonus: Page headers (done)
+
+You can paste the PageHeaderHint stanza at the top of each page now; they’ll guide users even before data flows.

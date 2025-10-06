@@ -1,0 +1,311 @@
+Next Big Build v2.15.2 + v2.15.3 (double-sized, copy-paste ready)
+
+All patches are Brand v2–aware and dev-safe (new endpoints return safe empties if tables/columns aren’t present).
+
+v2.15.2 — CR SLA + Watchers + Alerts
+1) Backend — CR watchers add/remove/list + SLA status + manual alert trigger
+
+server/routers/changes_watchers.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from typing import List
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/changes", tags=["changes"])
+
+@router.get("/watchers")
+def watchers(id: str = Query(...), project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        r = sb.table("changes").select("watchers").eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", id).single().execute().data or {}
+        return {"items": r.get("watchers") or []}
+    except Exception:
+        return {"items": []}
+
+class WatchBody(BaseModel):
+    id: str
+    watchers: List[str]
+
+PM_PLUS = require_role({"owner","admin","pm"})
+
+@router.post("/watchers/set")
+def watchers_set(body: WatchBody, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    try:
+        sb.table("changes").update({"watchers": body.watchers}).eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", body.id).execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+
+server/routers/changes_sla.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from datetime import datetime, timezone
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/changes", tags=["changes"])
+
+def _sla_state(due: str|None, priority: str|None):
+    if not due: return {"state":"none","days_left":None}
+    try:
+        dd = datetime.fromisoformat(due).date()
+    except Exception:
+        return {"state":"none","days_left":None}
+    today = datetime.now(timezone.utc).date()
+    days = (dd - today).days
+    # thresholds by priority
+    thr = {"urgent":2,"high":3,"medium":5,"low":7}
+    t = thr.get((priority or "medium").lower(),5)
+    if days < 0: return {"state":"overdue","days_left":days}
+    if days <= t: return {"state":"breach_soon","days_left":days}
+    return {"state":"ok","days_left":days}
+
+@router.get("/sla")
+def sla(project_id: str = Query(...), area: str|None=None, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        q = sb.table("changes").select("id,title,area,priority,due_date,status,assignee,watchers")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id)
+        if area: q = q.eq("area", area)
+        rows = q.order("due_date", asc=True).limit(1000).execute().data or []
+        for r in rows:
+            s = _sla_state(r.get("due_date"), r.get("priority"))
+            r["sla"] = s
+        return {"items": rows}
+    except Exception:
+        return {"items": []}
+
+@router.post("/sla_alerts")
+def sla_alerts(project_id: str = Query(...), ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    # Manual trigger for demo/dev (scheduler can call this periodically)
+    sb = get_user_supabase(ctx)
+    sent=0
+    try:
+        rows = sb.table("changes").select("id,title,priority,due_date,watchers").eq("org_id", ctx.org_id).eq("project_id", project_id).execute().data or []
+        from ..email.util import mailgun_send_html, send_guard
+        for r in rows:
+            s = _sla_state(r.get("due_date"), r.get("priority"))
+            if s["state"] in ("overdue","breach_soon"):
+                for w in (r.get("watchers") or []):
+                    try:
+                        ok,_ = send_guard(sb, ctx.org_id, project_id, "cr_sla", w)
+                        if ok:
+                            mailgun_send_html([w],
+                                f"[SLA] CR '{r.get('title')}' is {s['state']} ({s['days_left']})",
+                                f"<p>Change Request: <b>{r.get('title')}</b><br/>Due: {r.get('due_date') or 'n/a'}<br/>Priority: {r.get('priority')}</p>")
+                            sent += 1
+                    except Exception: ...
+        return {"ok": True, "sent": sent}
+    except Exception:
+        return {"ok": False, "sent": sent}
+
+
+Mount in server/main.py:
+
+from .routers import changes_watchers, changes_sla
+app.include_router(changes_watchers.router)
+app.include_router(changes_sla.router)
+
+2) Frontend — Kanban card shows SLA badge + watchers (+ add/remove)
+
+Patch client/src/pages/ChangeKanban.tsx (augment card body)
+
+function SlaBadge({s}:{s:any}){
+  if (!s || !s.state || s.state==="none") return null;
+  const cls = s.state==="overdue" ? "text-red-500" : s.state==="breach_soon" ? "text-amber-600" : "text-[var(--brand-good)]";
+  return <span className={`ml-1 ${cls}`}>({s.days_left}d)</span>;
+}
+
+function Watchers({cr}:{cr:any}){
+  const { projectId } = useParams();
+  const [w,setW]=useState<string[]>(cr.watchers||[]);
+  const [add,setAdd]=useState("");
+  async function save(list:string[]){ setW(list); await postJSON(`/api/changes/watchers/set?project_id=${projectId}`, { id: cr.id, watchers: list }); }
+  return (
+    <div className="mt-1 flex items-center gap-1 flex-wrap">
+      {w.map(x=><span key={x} className="text-[11px] px-1.5 py-[1px] rounded bg-slate-500/15 text-slate-600">{x} <button onClick={()=>save(w.filter(y=>y!==x))}>×</button></span>)}
+      <input className="border rounded p-1 text-[11px] w-[140px]" placeholder="add watcher…" value={add} onChange={e=>setAdd(e.target.value)}
+             onKeyDown={e=>{ if(e.key==="Enter" && add.trim()){ save(Array.from(new Set([...w, add.trim()]))); setAdd(""); } }}/>
+    </div>
+  );
+}
+
+
+Use in the card:
+
+<div className="font-medium">{i.title} <SlaBadge s={i.sla}/></div>
+<div className="text-muted-foreground">Area: {i.area||"—"} · P: {i.priority} · R: {i.risk} · Due: {i.due_date||"—"}</div>
+<Watchers cr={i}/>
+
+
+And load SLA with list:
+
+async function load(){
+  const d = await getJSON(`/api/changes/sla?project_id=${projectId}`);
+  setItems(d.items||[]);
+}
+
+
+Manual alert trigger (optional button in heading):
+
+<button className="brand-btn text-xs" onClick={async()=>{ await fetch(`/api/changes/sla_alerts?project_id=${projectId}`, {method:"POST",credentials:"include"}); alert("SLA alerts processed"); }}>
+  Run SLA alerts
+</button>
+
+v2.15.3 — Area Admins UI + Releases Calendar + Area “What changed (7d)”
+3) Backend — area audit (7d)
+
+server/routers/area_audit.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from datetime import datetime, timedelta, timezone
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/areas", tags=["areas"])
+
+@router.get("/audit7d")
+def audit7d(project_id: str = Query(...), area: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    start = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    out=[]
+    # best effort across tables
+    def add(tbl, cols):
+        try:
+            q = sb.table(tbl).select(cols).eq("org_id", ctx.org_id).eq("project_id", project_id).gte("created_at", start).limit(200)
+            if "area" in cols: q = q.eq("area", area)
+            for r in (q.execute().data or []):
+                out.append({"table": tbl, "id": r.get("id"), "title": r.get("title") or r.get("name") or r.get("id"),
+                            "created_at": r.get("created_at")})
+        except Exception: ...
+    add("actions","id,title,area,created_at")
+    add("risks","id,title,area,created_at")
+    add("decisions","id,title,area,created_at")
+    add("workbook_runs","id,workbook_id,created_at")  # no area; still useful
+    try:
+        au = sb.table("audit_events").select("id,created_at,details").eq("org_id",ctx.org_id).eq("project_id",project_id)\
+              .gte("created_at", start).order("created_at", desc=True).limit(200).execute().data or []
+        for a in au: out.append({"table":"audit_events","id":a.get("id"),"title":"event","created_at":a.get("created_at")})
+    except Exception: ...
+    out.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+    return {"items": out[:200]}
+
+
+Mount in server/main.py:
+
+from .routers import area_audit
+app.include_router(area_audit.router)
+
+4) Frontend — Team/Area Owners admin UI
+
+client/src/pages/AdminAreaOwners.tsx (new)
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { getJSON, postJSON } from "@/lib/authFetch";
+import PageHeading from "@/components/PageHeading";
+
+export default function AdminAreaOwners(){
+  const { projectId } = useParams();
+  const [areas,setAreas]=useState<string[]>([]);
+  const [members,setMembers]=useState<{user_id:string,email?:string}[]>([]);
+  const [admins,setAdmins]=useState<Record<string,string[]>>({});
+
+  useEffect(()=>{ (async()=>{
+    try{ const a = await getJSON(`/api/areas/list?project_id=${projectId}`); setAreas(a.items||[]); }catch{}
+    try{ const m = await getJSON(`/api/members/all?project_id=${projectId}`); setMembers((m.items||[]).map((x:any)=>({user_id:x.user_id, email:x.email})) ); }catch{}
+    try{ const ad = await getJSON(`/api/areas/admins?project_id=${projectId}`); 
+      const map:Record<string,string[]> = {}; (ad.items||[]).forEach((r:any)=>{ map[r.area]=[...(map[r.area]||[]), r.user_id]; }); setAdmins(map);
+    }catch{}
+  })(); },[projectId]);
+
+  function isAdmin(area:string, uid:string){ return !!(admins[area]||[]).includes(uid); }
+  async function toggle(area:string, uid:string){
+    const on = isAdmin(area,uid);
+    const url = on? `/api/areas/admins/remove?project_id=${projectId}&area=${encodeURIComponent(area)}&user_id=${encodeURIComponent(uid)}`
+                  : `/api/areas/admins/add?project_id=${projectId}`;
+    const body = on? {} : { area, user_id: uid };
+    await fetch(url, { method:"POST", credentials:"include", headers:{'Content-Type':'application/json'}, body: on? null : JSON.stringify(body)});
+    setAdmins(a=> ({...a, [area]: on? (a[area]||[]).filter(x=>x!==uid) : Array.from(new Set([...(a[area]||[]), uid])) }));
+  }
+
+  return (
+    <div>
+      <PageHeading title="Area Owners" crumbs={[{label:"Team"},{label:"Area Owners"}]} />
+      <div className="space-y-3">
+        {areas.map(a=>(
+          <div key={a} className="brand-card p-3">
+            <div className="text-sm font-medium mb-1">{a}</div>
+            <div className="grid md:grid-cols-4 gap-2">
+              {members.map(m=>(
+                <label key={m.user_id} className="flex items-center gap-2 text-xs">
+                  <input type="checkbox" checked={isAdmin(a, m.user_id)} onChange={()=>toggle(a,m.user_id)} />
+                  <span>{m.email || m.user_id}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
+Route in client/src/App.jsx:
+
+import AdminAreaOwners from "@/pages/AdminAreaOwners";
+// …
+<Route path="/projects/:projectId/team/area-owners" element={<AdminAreaOwners/>} />
+
+
+Badge on Workstreams overview cards (optional quick owner label):
+
+In Workstreams.tsx, after you load areas/summary_all, also load areas/admins and map area → owners:
+
+const [owners,setOwners]=useState<Record<string,string[]>>({});
+useEffect(()=>{ (async()=>{ try{
+  const ad = await getJSON(`/api/areas/admins?project_id=${projectId}`); 
+  const map:Record<string,string[]> = {}; (ad.items||[]).forEach((r:any)=>{ map[r.area]=[...(map[r.area]||[]), r.user_id]; }); setOwners(map);
+}catch{} })(); },[projectId]);
+
+// in the card
+<div className="text-[11px] text-muted-foreground mt-1">Owner(s): {(owners[i.area]||[]).slice(0,2).join(", ") || "—"}</div>
+
+5) Frontend — Area page: What changed (7d)
+
+Patch client/src/pages/WorkstreamArea.tsx:
+
+const [audit,setAudit]=useState<any[]>([]);
+useEffect(()=>{ (async()=>{ try{
+  const d = await getJSON(`/api/areas/audit7d?project_id=${projectId}&area=${encodeURIComponent(area)}`); setAudit(d.items||[]);
+}catch{ setAudit([]);} })(); },[projectId, area]);
+
+<div className="brand-card p-3">
+  <div className="text-sm font-medium">What changed (last 7 days)</div>
+  <div className="text-xs max-h-[32vh] overflow-auto">
+    {(audit||[]).map((e:any)=>(
+      <div key={`${e.table}-${e.id}`} className="border-b py-1">{new Date(e.created_at).toLocaleString()} • <b>{e.table}</b> — {e.title}</div>
+    ))}
+    {!audit.length && <div className="text-muted-foreground">No recent changes.</div>}
+  </div>
+</div>
+
+90-second validation
+
+CRs: Kanban now shows SLA badges and watchers; you can add/remove watchers; manual SLA alerts trigger works (scheduler hook ready)
+
+Area owners: assign per area in Team → Area Owners; owners are shown on Workstreams overview cards
+
+Area hub: “What changed (7d)”, Preview HTML, Export ZIP, Open Items quick edit, Smart Next Meeting
+
+Releases: calendar skeleton exists; attach/export flows from previous drop
+
+Ops: route updates feed + header “Updates (count)” + Mark all seen keep users oriented

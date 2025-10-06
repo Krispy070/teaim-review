@@ -1,0 +1,149 @@
+Drop-in Theme Patch (uses your exact hexes)
+
+Based on your TEAIM Brand Book v2 palette: Charcoal #1C1C1E, Bright Orange #F26B1D, Golden Yellow #FFC933, Success #2ECC71, Warning #FFC107, Error #E74C3C, plus White/Greys. 
+
+TEAIM_Brand_Book_v2_visual
+
+Add to your global CSS (e.g., src/styles.css)
+
+:root{
+  /* Brand (from book) */
+  --brand-charcoal:#1C1C1E;
+  --brand-orange:#F26B1D;   /* primary accent */
+  --brand-gold:#FFC933;     /* secondary accent */
+  --brand-success:#2ECC71;
+  --brand-warn:#FFC107;
+  --brand-error:#E74C3C;
+  --brand-white:#FFFFFF;
+
+  /* Dark UI surfaces */
+  --ui-bg:#0E0F12;              /* app background (deeper than charcoal for contrast) */
+  --ui-panel:#14161D;           /* card surface */
+  --ui-panel-2:#191C26;         /* elevated surface */
+  --ui-border:#2C2F3A;          /* visible border on dark */
+  --ui-divider:#252832;
+
+  /* Text on dark (accessible) */
+  --text-strong:#FFFFFF;
+  --text:#E9ECF1;
+  --text-soft:#C7CCD7;
+  --text-muted:#A7ADBD;
+  --text-dim:#8C93A3;
+
+  /* Tinted pills */
+  --pill-accent:rgba(242,107,29,.18);
+  --pill-gold:rgba(255,201,51,.18);
+  --pill-success:rgba(46,204,113,.18);
+  --pill-warn:rgba(255,193,7,.18);
+  --pill-error:rgba(231,76,60,.18);
+
+  /* Focus outline */
+  --focus:rgba(255,201,51,.65);
+}
+
+/* Base */
+html,body{ background:var(--ui-bg); color:var(--text); }
+
+/* Cards */
+.card{ background:var(--ui-panel); border:1px solid var(--ui-border); border-radius:14px; }
+.card--elevated{ background:var(--ui-panel-2); }
+.card__hd{ padding:12px 16px; border-bottom:1px solid color-mix(in oklab,var(--ui-border),#000 10%); }
+.card__title{ color:var(--text-strong); font-size:15px; font-weight:700; }
+.card__bd{ padding:16px; }
+
+/* KPI tiles */
+.kpi{ background:var(--ui-panel); border:1px solid color-mix(in oklab,var(--ui-border),#000 10%); border-radius:14px; padding:16px 18px; }
+.kpi .label{ color:var(--text-muted); font:600 12px/1.2 Inter,system-ui; letter-spacing:.02em; }
+.kpi .value{ color:var(--text-strong); font:700 22px/1 Inter,system-ui; }
+.kpi--risk .value{ color:var(--brand-error); }
+.kpi--actions .value{ color:var(--brand-gold); }
+.kpi--wellness .value{ color:var(--brand-success); }
+
+/* Buttons */
+.k-btn{ display:inline-flex; align-items:center; gap:.6ch; padding:.55rem .9rem; border-radius:12px;
+        border:1px solid var(--ui-border); background:var(--ui-panel-2); color:var(--text-strong);
+        transition:background .12s ease,border-color .12s ease,transform .06s ease; }
+.k-btn:hover{ background:#1B1E28; border-color:#3A3E4E; }
+.k-btn:active{ transform:translateY(1px); }
+.k-btn--primary{ background:var(--brand-orange); border-color:#C65115; color:#0B0B0D; font-weight:700; }
+.k-btn--ghost{ background:transparent; border-color:var(--ui-border); color:var(--text); }
+
+/* Pills & status tags */
+.k-pill{ display:inline-flex; align-items:center; gap:.4ch; padding:.25rem .5rem; border-radius:10px; font-size:12px; line-height:1; border:1px solid transparent; }
+.k-pill--overdue{ background:var(--pill-error); color:var(--brand-error); border-color:rgba(231,76,60,.35); }
+.k-pill--warn{ background:var(--pill-warn); color:var(--brand-warn); border-color:rgba(255,193,7,.35); }
+.k-pill--ok{ background:var(--pill-success); color:var(--brand-success); border-color:rgba(46,204,113,.35); }
+
+/* Timeline */
+.timeline{ --rail:#222634; --tick:#2C3140; --fill:var(--brand-orange); }
+.timeline .bar-bg{ background:var(--rail); height:8px; border-radius:8px; }
+.timeline .bar-fill{ background:var(--fill); height:8px; border-radius:8px; }
+.timeline .tick{ background:var(--tick); width:1px; opacity:.6; }
+
+/* Header */
+.header{ background:color-mix(in oklab,var(--ui-bg),black 5%); border-bottom:1px solid var(--ui-border); backdrop-filter:saturate(140%) blur(6px); }
+.env-pill{ @apply k-pill; background:var(--pill-gold); color:var(--brand-gold); border-color:rgba(255,201,51,.35); }
+
+/* Sidebar */
+.sidebar{ background:color-mix(in oklab,var(--ui-bg),#000 6%); border-right:1px solid var(--ui-border); }
+.sidebar .section{ color:var(--text-muted); font:600 12px/1.2 Inter,system-ui; padding:8px 14px; letter-spacing:.02em; }
+.sidebar .item{ color:var(--text-soft); font:500 14px/1.2 Inter,system-ui; padding:8px 14px; border-radius:10px; }
+.sidebar .item:hover{ background:rgba(255,255,255,.03); color:var(--text); }
+.sidebar .item.active{ background:rgba(242,107,29,.12); color:var(--text-strong); }
+
+/* Icons & focus */
+.icon{ color:var(--text-soft); }
+.icon--active{ color:var(--brand-orange); }
+:focus-visible{ outline:2px solid var(--focus); outline-offset:2px; border-radius:10px; }
+
+Targeted UI Tweaks (from your screenshot)
+
+Period Switcher
+Only the active period should be orange; others use ghost:
+
+<div className="flex gap-2">
+  <button className="k-btn k-btn--primary">Week</button>
+  <button className="k-btn k-btn--ghost">Month</button>
+  <button className="k-btn k-btn--ghost">Quarter</button>
+  <button className="k-btn k-btn--ghost">Export</button>
+  <button className="k-btn k-btn--ghost">Share</button>
+</div>
+
+
+Overdue List Items
+
+<li className="flex items-center justify-between gap-3 py-2 px-3 rounded-xl hover:bg-[#1B1E28]">
+  <span>Map payroll cost centers</span>
+  <span className="k-pill k-pill--overdue">Overdue</span>
+</li>
+
+
+KPI Tiles
+Make values pop and labels subtle (the CSS above handles it). Ensure the “Risks Open” tile uses .kpi--risk, “Actions Overdue” uses .kpi--actions, “Team Wellness” uses .kpi--wellness.
+
+Header
+Use the 3-logo layout we added earlier; keep the ENV pill gold-tinted (.env-pill), bell/avatar to the right, center the customer identity. Remove extra chips like “Project Dashboard” unless it’s a selector.
+
+Density
+Reduce inner card padding to 16–20px, button gaps to 8px, and keep a single radius system: 14px (cards) / 12px (buttons) / 10px (pills).
+
+Optional Tailwind mapping (if you want utilities)
+// tailwind.config.js
+extend:{
+  colors:{
+    bg:'var(--ui-bg)', panel:'var(--ui-panel)', panel2:'var(--ui-panel-2)', border:'var(--ui-border)',
+    text:{ DEFAULT:'var(--text)', strong:'var(--text-strong)', soft:'var(--text-soft)', muted:'var(--text-muted)' },
+    brand:{ orange:'var(--brand-orange)', gold:'var(--brand-gold)', success:'var(--brand-success)', warn:'var(--brand-warn)', error:'var(--brand-error)' }
+  },
+  borderRadius:{ xl:'14px','2xl':'16px' }
+}
+
+Quick sanity checks after patch
+
+Do small sidebar labels and icons read clearly at a glance? (They should—no more washed-out grey.)
+
+Do primary actions read unmistakably orange? (Only the active one.)
+
+Are Overdue tags visible but not screaming? (Translucent red pill, not a solid block.)
+
+Do the timeline bars jump out immediately? (Orange fill on slightly lighter rails.)

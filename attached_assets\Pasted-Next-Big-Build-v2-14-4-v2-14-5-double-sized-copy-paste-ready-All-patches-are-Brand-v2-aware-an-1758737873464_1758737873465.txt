@@ -1,0 +1,355 @@
+Next Big Build v2.14.4 + v2.14.5 (double-sized, copy-paste ready)
+
+All patches are Brand v2–aware and dev-safe (new endpoints return safe empties if tables/columns aren’t present).
+
+v2.14.4 — Workstreams: Preview + Quick Edit + Smart “Next Meeting”
+1) Backend — Area Package Preview (HTML) + recent meetings auto-suggest
+
+A. Area Package Preview (brand header + mini manifest)
+
+server/routers/area_tools.py (append)
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import HTMLResponse
+from datetime import datetime, timezone
+import json
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+from ..brand.export_header import export_header_html
+
+router = APIRouter(prefix="/api/area", tags=["areas"])
+
+@router.get("/preview.html", response_class=HTMLResponse)
+def preview_html(project_id: str = Query(...), area: str = Query(...),
+                 ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    org = sb.table("org_branding").select("*").eq("org_id", ctx.org_id).single().execute().data or {}
+    proj = sb.table("projects").select("code").eq("id", project_id).single().execute().data or {}
+    hdr = export_header_html(org, proj.get("code") or project_id)
+
+    def _safe(table, select, **flt):
+        try:
+            q = sb.table(table).select(select).eq("org_id", ctx.org_id).eq("project_id", project_id)
+            for k,v in flt.items(): q = q.eq(k, v)
+            return q.limit(50).execute().data or []
+        except Exception: return []
+
+    actions  = _safe("actions", "id,title,owner,area,status,created_at", area=area)
+    risks    = _safe("risks", "id,title,owner,area,status,created_at", area=area)
+    decis    = _safe("decisions", "id,title,decided_by,area,status,created_at", area=area)
+    wbs      = _safe("workbooks", "id,name,area,asof_date,due_date,iterations_planned,iterations_done,status", area=area)
+
+    man = {"org_id": str(ctx.org_id), "project_id": project_id, "area": area,
+           "generated_at": datetime.now(timezone.utc).isoformat(),
+           "counts": {"actions": len(actions), "risks": len(risks),
+                      "decisions": len(decis), "workbooks": len(wbs)}}
+
+    def table(title, rows, cols):
+        if not rows: return f"<h3>{title}</h3><div style='color:#666'>None</div>"
+        th = "".join([f"<th style='text-align:left;padding:4px'>{c}</th>" for c in cols])
+        trs = "".join([ "<tr>"+ "".join([f"<td style='padding:4px'>{(r.get(c,''))}</td>" for c in cols]) + "</tr>" for r in rows ])
+        return f"<h3>{title}</h3><table style='border-collapse:collapse;width:100%'><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table>"
+
+    html = f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1"/></head>
+<body style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:880px;margin:auto">
+{hdr}
+<h2>Area Package Preview — {area}</h2>
+<pre style="background:#fafafa;padding:8px;border:1px solid #eee;border-radius:6px">{json.dumps(man,indent=2)}</pre>
+{table("Open Actions", [r for r in actions if (r.get("status") or "").lower()=="open"], ["id","title","owner","created_at"])}
+{table("Risks", risks, ["id","title","owner","status","created_at"])}
+{table("Decisions", decis, ["id","title","decided_by","created_at"])}
+{table("Workbooks", wbs, ["id","name","asof_date","due_date","iterations_planned","iterations_done","status"])}
+</body></html>"""
+    return HTMLResponse(html)
+
+
+Mount already exists for area_tools (done last drop). If not: add to server/main.py:
+
+from .routers import area_tools
+app.include_router(area_tools.router)
+
+
+B. Recent meetings auto-suggest
+
+server/routers/meetings_recent.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/meetings", tags=["meetings"])
+
+@router.get("/recent")
+def recent(project_id: str = Query(...), limit:int=10, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        rows = sb.table("meetings").select("id,title,starts_at")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+               .order("starts_at", desc=True).limit(min(50, max(1,limit))).execute().data or []
+        return {"items": rows}
+    except Exception:
+        return {"items": []}
+
+
+Mount in server/main.py:
+
+from .routers import meetings_recent
+app.include_router(meetings_recent.router)
+
+2) Backend — Actions Quick Update (owner/status/title)
+
+server/routers/actions_small.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/actions", tags=["actions"])
+PM_PLUS = require_role({"owner","admin","pm"})
+
+@router.post("/update_small")
+def update_small(id: str = Query(...), project_id: str = Query(...),
+                 owner: str | None = None, status: str | None = None, title: str | None = None,
+                 ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    patch = {}
+    if owner is not None: patch["owner"] = owner
+    if status is not None: patch["status"] = status
+    if title is not None: patch["title"] = title
+    try:
+        if not patch: return {"ok": True}
+        sb.table("actions").update(patch).eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", id).execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+
+Mount in server/main.py:
+
+from .routers import actions_small
+app.include_router(actions_small.router)
+
+3) Frontend — Workstream Area: preview, quick edit, smart “next meeting”
+
+Patch client/src/pages/WorkstreamArea.tsx:
+
+Add Preview link + Export buttons at top/bottom:
+
+<div className="flex items-center gap-2">
+  <a className="brand-btn text-xs" target="_blank" rel="noreferrer"
+     href={`/api/area/preview.html?project_id=${projectId}&area=${encodeURIComponent(area)}`}>
+    Preview Area Package
+  </a>
+  <button className="brand-btn text-xs" onClick={()=>downloadGET(`/api/area/export.zip?project_id=${projectId}&area=${encodeURIComponent(area)}`, `area_${area}.zip`)}>
+    Export Area Package
+  </button>
+</div>
+
+
+Open items quick edit (owner/status inline):
+
+function setOwner(aid:string, owner:string){
+  setOpenItems(items=> items.map(i=> i.id===aid? {...i, owner}: i));
+  fetch(`/api/actions/update_small?id=${encodeURIComponent(aid)}&project_id=${projectId}&owner=${encodeURIComponent(owner)}`, {method:"POST",credentials:"include"});
+}
+function setStatus(aid:string, status:string){
+  setOpenItems(items=> items.map(i=> i.id===aid? {...i, status}: i));
+  fetch(`/api/actions/update_small?id=${encodeURIComponent(aid)}&project_id=${projectId}&status=${encodeURIComponent(status)}`, {method:"POST",credentials:"include"});
+}
+
+
+Replace the Open Items table body cells:
+
+<td className="p-1 w-[28%]">
+  <input className="border rounded p-1 w-full" value={a.owner||""} onChange={e=>setOwner(a.id, e.target.value)} />
+</td>
+<td className="p-1 w-[22%]">
+  <select className="border rounded p-1 w-full" value={a.status||"open"} onChange={e=>setStatus(a.id, e.target.value)}>
+    {["open","in_progress","blocked","done"].map(s=> <option key={s} value={s}>{s}</option>)}
+  </select>
+</td>
+
+
+Smart Next Meeting autosuggest:
+
+Add above saveNext():
+
+const [suggest,setSuggest]=useState<any[]>([]);
+useEffect(()=>{ (async()=>{ try{
+  const r = await getJSON(`/api/meetings/recent?project_id=${projectId}&limit=5`); setSuggest(r.items||[]);
+}catch{ setSuggest([]);} })(); },[projectId]);
+
+function applySuggest(s:string){ setNext(s.replace('Z','')); } // ISO handling
+
+
+Render suggestions under date input:
+
+<div className="text-[11px] text-muted-foreground mt-1">Recent:
+  {suggest.map((m:any)=>(<button key={m.id} className="underline ml-2" onClick={()=>applySuggest(m.starts_at)}>
+     {new Date(m.starts_at).toLocaleString()} {m.title?`• ${m.title}`:""}
+  </button>))}
+</div>
+
+v2.14.5 — Update dots counter + Slack/Teams enrichments + Update feed for nav
+4) Backend — Route update feed for nav dots
+
+server/routers/updates_feed.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from datetime import datetime, timezone
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/updates", tags=["updates"])
+
+@router.get("/feed")
+def feed(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    out = {}
+    def upd(table, area=False):
+        try:
+            q = sb.table(table).select("created_at").eq("org_id", ctx.org_id).eq("project_id", project_id)\
+                .order("created_at", desc=True).limit(1).execute().data or []
+            return q and q[0].get("created_at")
+        except Exception:
+            return None
+    # coarse route keys
+    out["dashboard"]   = upd("audit_events") or upd("actions") or upd("risks") or upd("decisions")
+    out["timeline"]    = upd("project_stages")
+    out["documents"]   = upd("artifacts")
+    out["meetings"]    = upd("meetings")
+    out["actions"]     = upd("actions")
+    out["risks"]       = upd("risks")
+    out["decisions"]   = upd("decisions")
+    out["reporting"]   = upd("workbooks") or upd("reports")
+    out["signoff"]     = upd("signoff_doc_tokens") or upd("signoff_docs")
+    return {"items": out}
+
+
+Mount in server/main.py:
+
+from .routers import updates_feed
+app.include_router(updates_feed.router)
+
+5) Frontend — global Updates count & “Mark all seen”
+
+client/src/hooks/useRouteUpdates.ts (new)
+
+import { useEffect, useState } from "react";
+import { getJSON } from "@/lib/authFetch";
+
+export function useRouteUpdates(projectId:string){
+  const [feed,setFeed]=useState<Record<string,string>>({});
+  useEffect(()=>{ (async()=>{ try{
+    const d = await getJSON(`/api/updates/feed?project_id=${projectId}`); setFeed(d.items||{});
+  }catch{ setFeed({}); } })(); },[projectId]);
+  function unseenKeys(){
+    const keys = Object.keys(feed||{});
+    const unseen = [];
+    for (const k of keys){
+      try{
+        const seen = localStorage.getItem(`kap.route.lastSeen.${projectId}.${k}`);
+        const lu = feed[k];
+        if (lu && (!seen || new Date(lu) > new Date(seen))) unseen.push(k);
+      }catch{}
+    }
+    return unseen;
+  }
+  function markAllSeen(){
+    const keys = Object.keys(feed||{});
+    const now = new Date().toISOString();
+    try{ for (const k of keys) localStorage.setItem(`kap.route.lastSeen.${projectId}.${k}`, now); }catch{}
+  }
+  return { feed, unseenKeys, markAllSeen };
+}
+
+
+Patch client/src/components/BrandedHeader.tsx — replace the simple dot button with count + menu:
+
+import { useParams } from "react-router-dom";
+import { useRouteUpdates } from "@/hooks/useRouteUpdates";
+
+const { projectId } = useParams();
+const { unseenKeys, markAllSeen } = useRouteUpdates(projectId || "");
+const count = unseenKeys().length;
+
+<div className="relative">
+  <button className="brand-btn text-xs relative" onClick={markAllSeen} title="Mark all seen">
+    Updates {count>0 ? `(${count})` : ""}
+    {count>0 && <span className="absolute -top-1 -right-1 w-[8px] h-[8px] rounded-full bg-red-500"></span>}
+  </button>
+</div>
+
+
+(If you have a notifications drawer, you can open it first and call markAllSeen() on close.)
+
+6) Slack/Teams webhook — profile attach + channel→area mapping
+
+Patch server/routers/areas_webhook.py** (replace with enriched version)
+
+from fastapi import APIRouter, Depends, Query, Header
+from pydantic import BaseModel
+import os, json
+from ..deps import get_service_supabase
+
+router = APIRouter(prefix="/api/areas", tags=["areas"])
+
+class InMsg(BaseModel):
+  project_id: str
+  area: str | None = None
+  channel: str | None = None   # e.g., "hcm", "payroll"
+  actor: str | None = None     # email or any string
+  text: str
+
+@router.post("/webhook_incoming")
+def webhook_incoming(body: InMsg, token: str | None = Header(default=None)):
+  EXPECT = os.getenv("INCOMING_WEBHOOK_TOKEN", "")
+  if EXPECT and token != EXPECT: 
+    return {"ok": False, "reason": "unauthorized"}
+
+  sbs = get_service_supabase()
+  # channel -> area map (JSON env: {"hcm":"HCM","payroll":"Payroll"})
+  try:
+    amap = json.loads(os.getenv("INCOMING_AREA_MAP","{}") or "{}")
+  except Exception:
+    amap = {}
+  area = body.area or amap.get((body.channel or "").lower()) or "General"
+
+  # enrich actor: if email matches users_profile
+  actor = body.actor or "webhook"
+  try:
+    if body.actor and "@" in body.actor:
+      pr = sbs.table("users_profile").select("user_id,email").eq("email", body.actor).limit(1).execute().data or []
+      if pr and pr[0].get("user_id"):
+        actor = pr[0]["email"]  # keep email; you can store user_id if your schema supports
+  except Exception:
+    ...
+
+  try:
+    sbs.table("area_comments").insert({
+      "org_id": None,  # safe default; if required, add lookup from project
+      "project_id": body.project_id, "area": area,
+      "user_id": actor, "message": body.text
+    }).execute()
+    return {"ok": True}
+  except Exception:
+    return {"ok": False}
+
+
+Configure (optional):
+INCOMING_WEBHOOK_TOKEN=…
+INCOMING_AREA_MAP={"hcm":"HCM","payroll":"Payroll","security":"Security"}
+
+90-second validation
+
+Workstream Area shows Preview HTML & Export ZIP; open items allow quick owner/status edits; “Next Meeting” selects via auto-suggest
+
+Header Updates shows a count; Mark all seen clears in one click; area dots still work
+
+Slack/Teams: webhook now maps channel→area and attaches profile if actor is an email in users_profile
+
+All new endpoints are dev-safe (empty results / {ok:false} with no crashes)

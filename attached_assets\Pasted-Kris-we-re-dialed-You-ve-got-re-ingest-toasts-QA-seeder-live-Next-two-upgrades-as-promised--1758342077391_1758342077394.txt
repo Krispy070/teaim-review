@@ -1,0 +1,258 @@
+Kris, we’re dialed. You’ve got re-ingest + toasts + QA seeder live. Next two upgrades, as promised:
+
+Live progress for re-ingest (no page refresh, shows when ingest finishes and links to the new artifact).
+
+One-click QA “Smoke Runner” that seeds docs, creates a stage, requests an external sign-off, and previews the digest—so you can validate the whole loop in 30 seconds.
+
+Everything below is paste-ready.
+
+A) Live re-ingest progress + “View in Documents”
+A1) Backend: return artifact_id when available
+
+If your /api/ingest-sync returns JSON, let’s bubble that up.
+
+server/routers/backups.py — update the fallback HTTP call in /reingest-stored:
+
+    # 4) Fallback: call your /api/ingest-sync endpoint
+    new_artifact_id = None
+    if not did_direct:
+        import requests, json
+        base = os.getenv("FASTAPI_URL", "http://127.0.0.1:5000")
+        url = f"{base}/api/ingest-sync?project_id={project_id}"
+
+        headers = {}
+        if os.getenv("DEV_AUTH", "0") == "1":
+            headers["X-Dev-User"] = ctx.user_id or "dev-user"
+            headers["X-Dev-Org"] = ctx.org_id
+            headers["X-Dev-Role"] = ctx.role or "admin"
+        else:
+            token = os.getenv("INTERNAL_API_BEARER")
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+
+        files = {"file": (filename, file_bytes, mime)}
+        try:
+            r = requests.post(url, files=files, headers=headers, timeout=60)
+            if not r.ok:
+                raise HTTPException(r.status_code, f"Ingest sync failed: {r.text[:300]}")
+            try:
+                data = r.json()
+                # Common patterns: {"artifact_id":"..."} or {"artifacts":[{"id":"..."}]}
+                new_artifact_id = data.get("artifact_id") \
+                    or (data.get("artifacts") or [{}])[0].get("id")
+            except Exception:
+                pass
+        except Exception as e:
+            raise HTTPException(500, f"Re-ingest request failed: {e}")
+
+
+Return it (end of the same function):
+
+    return {"ok": True, "filename": filename, "artifact_id": new_artifact_id}
+
+
+And in /store-and-reingest cascade it too:
+
+    r = reingest_stored(stored_key=stored_key, project_id=project_id, ctx=ctx)
+    return {"ok": True, "stored_key": stored_key, "artifact_id": r.get("artifact_id")}
+
+
+If your direct Python ingest helper returns an artifact id, set new_artifact_id likewise.
+
+A2) Frontend: show progress + link to the artifact when known
+
+client/src/pages/AdminBackups.tsx — add a tiny “live status” row and handle the returned artifact_id.
+
+// near top
+const [lastArtifact, setLastArtifact] = useState<{id?:string; name?:string}|null>(null);
+
+// in storeFile() after re-ingest:
+const re = await apiPost("/backups/reingest-stored", undefined, {
+  project_id: projectId!, stored_key: d.stored_key,
+});
+setLastArtifact({ id: re.artifact_id, name });
+
+// in storeAndReingest():
+const d = await apiPost<{ ok:boolean; stored_key:string; artifact_id?:string }>(
+  "/backups/store-and-reingest", undefined,
+  { project_id: projectId!, backup_key: sel.key, artifact_name: name }
+);
+setLastArtifact({ id: d.artifact_id, name });
+
+// render a live notice somewhere under the backup contents panel:
+{lastArtifact && (
+  <div className="mt-3 text-sm">
+    Re-ingest started for <b>{lastArtifact.name}</b>.
+    {" "}
+    {lastArtifact.id ? (
+      <a className="underline" href={`/projects/${projectId}/documents#artifact=${lastArtifact.id}`}>
+        View in Documents
+      </a>
+    ) : (
+      <span className="text-muted-foreground">Link will appear once ID is available.</span>
+    )}
+  </div>
+)}
+
+
+If your Documents page supports a query/hash like #artifact=<id>, this jumps to it. If not, you can open your artifact viewer route instead.
+
+A3) Optional: light “live” polling for 30s (no backend changes)
+
+Add right below the setLastArtifact(...) lines:
+
+// optimistic poll: if id isn’t present yet, poll audit feed (or meetings/artifacts) for ~30s
+if (!re.artifact_id) {
+  const started = Date.now();
+  const timer = setInterval(async () => {
+    if (Date.now() - started > 30000) return clearInterval(timer);
+    try {
+      const rsp = await fetch(`/api/audit/list?project_id=${projectId}`, { credentials: "include" });
+      if (!rsp.ok) return;
+      const data = await rsp.json();
+      // If your ingest writes an audit like {"kind":"ingest.completed","details":{"artifact_id":"..."}}
+      const hit = (data.events || []).find((e:any)=> e.kind === "ingest.completed" && e.details?.artifact_id);
+      if (hit) {
+        setLastArtifact({ id: hit.details.artifact_id, name });
+        clearInterval(timer);
+      }
+    } catch {}
+  }, 1500);
+}
+
+
+If your pipeline doesn’t emit ingest.completed, skip this—your backend return of artifact_id already covers the common case.
+
+B) QA “Smoke Runner” (one click: seed → stage → external sign-off → digest preview)
+B1) Backend: tiny convenience endpoint to create a “Discovery” stage & request external sign-off
+
+server/routers/dev_seed.py — add:
+
+from .signoff_external import request_external  # reuse your existing endpoint
+from .stages import create_stage
+from pydantic import BaseModel
+
+class SmokeBody(BaseModel):
+    email_to: str
+
+@router.post("/smoke-run")
+def smoke_run(project_id: str = Query(...), body: SmokeBody = None, ctx: TenantCtx = Depends(ADMIN_OR_OWNER)):
+    """
+    1) Ensure a 'Discovery' stage exists (create if missing)
+    2) Request external signoff to provided email (or DIGEST_TEST_EMAIL)
+    3) Return token link from signoff request (if guard allowed immediate send)
+    """
+    sb = get_user_supabase(ctx)
+    email = (body.email_to if body else None) or os.getenv("DIGEST_TEST_EMAIL")
+    if not email:
+        raise HTTPException(400, "Provide email_to or set DIGEST_TEST_EMAIL")
+
+    # 1) ensure stage
+    got = sb.table("project_stages").select("id,title").eq("org_id", ctx.org_id)\
+        .eq("project_id", project_id).eq("title","Discovery").limit(1).execute().data
+    if got:
+        stage_id = got[0]["id"]
+    else:
+        out = create_stage(body=type("X",(object,),{"title":"Discovery","start_date":None,"end_date":None})(),
+                           project_id=project_id, ctx=ctx)  # call your own route fn
+        stage_id = out["stage"]["id"]
+
+    # 2) request external sign-off
+    from .signoff_external import RequestExternalBody
+    res = request_external(
+        body=RequestExternalBody(stage_id=stage_id, email_to=email, message="Smoke-run"),
+        project_id=project_id, ctx=ctx
+    )
+    # res may be {"ok":False,"reason":...,"token_link":...} if quiet hours; still return link
+    return {"ok": True, "stage_id": stage_id, **res}
+
+
+(If your routers aren’t callable directly in your module structure, instead call the same Supabase ops these functions do. The above uses your route code for maximum reuse.)
+
+B2) Frontend page: one-click runner
+
+client/src/pages/ProjectSmokeRun.tsx
+
+import { useParams } from "react-router-dom";
+import { useState } from "react";
+import { apiPost, apiGet } from "@/lib/api";
+import { useToast } from "@/components/ui/use-toast";
+
+export default function ProjectSmokeRun(){
+  const { projectId } = useParams();
+  const { toast } = useToast();
+  const [email, setEmail] = useState("");
+  const [link, setLink] = useState<string | null>(null);
+  const [counts, setCounts] = useState<any>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function seed(){
+    setBusy(true);
+    toast({ title: "Seeding sample docs…" });
+    try {
+      const d = await apiPost("/dev/seed-simple", undefined, { project_id: projectId! });
+      toast({ title: `Seeded ${d.count} docs` });
+    } catch(e:any){ toast({ title:"Seed failed", description:String(e?.message||e), variant:"destructive" }); }
+    finally{ setBusy(false); }
+  }
+
+  async function stageAndSign(){
+    setBusy(true);
+    try{
+      const d = await apiPost("/dev/smoke-run", { email_to: email || undefined }, { project_id: projectId! });
+      setLink(d.token_link || null);
+      toast({ title: "Stage ready", description: d.token_link ? "External link created" : "Request prepared (quiet hours?)" });
+    } catch(e:any){ toast({ title:"Stage/signoff failed", description:String(e?.message||e), variant:"destructive" }); }
+    finally{ setBusy(false); }
+  }
+
+  async function previewDigest(){
+    setBusy(true);
+    try{
+      const d = await apiGet("/digest/preview", { project_id: projectId! });
+      setCounts(d.counts);
+      toast({ title: "Digest preview ready" });
+    } catch(e:any){ toast({ title:"Preview failed", description:String(e?.message||e), variant:"destructive" }); }
+    finally{ setBusy(false); }
+  }
+
+  return (
+    <div className="p-6 space-y-4 max-w-xl">
+      <h1 className="text-xl font-semibold">Project Smoke Run</h1>
+      <div className="border rounded p-3 space-y-2">
+        <div className="flex gap-2">
+          <button disabled={busy} className="px-3 py-2 border rounded" onClick={seed}>1) Seed Docs</button>
+          <input className="border rounded p-2 flex-1" placeholder="External signer email (optional)" value={email} onChange={e=>setEmail(e.target.value)} />
+          <button disabled={busy} className="px-3 py-2 border rounded" onClick={stageAndSign}>2) Stage + Sign</button>
+        </div>
+        {link && <div className="text-sm">External link: <a className="underline" href={link} target="_blank" rel="noreferrer">{link}</a></div>}
+        <div className="flex gap-2">
+          <button disabled={busy} className="px-3 py-2 border rounded" onClick={previewDigest}>3) Preview Digest</button>
+          {counts && <div className="text-sm text-muted-foreground">A:{counts.actions} R:{counts.risks} D:{counts.decisions}</div>}
+        </div>
+      </div>
+      <div className="text-xs text-muted-foreground">
+        Tip: If quiet hours are active, the external email won’t send—but we still give you the link here.
+      </div>
+    </div>
+  );
+}
+
+
+Add route & admin link:
+
+{ path: "/projects/:projectId/admin/smoke", element: <ProjectSmokeRun/> }
+
+Quick verification (2 minutes)
+
+Backups page → Open backup → Store→Re-ingest → toast sequence shows storing → re-ingesting; if backend returns artifact_id, a “View in Documents” link appears; Restore Activity widget shows events.
+
+Smoke Run:
+
+Seed docs → “Seeded X docs”
+
+Stage + Sign → external token link (open it to see the sign-off page)
+
+Preview Digest → counts visible (A/R/D)
+
+That’s it. You now have visible, testable, one-click flows for recovery and for full-stack QA. If you want a mini live meter (progress row that polls audit every 1.5s for 30s) always on in Restore Activity, I can wire it too—no backend changes needed.

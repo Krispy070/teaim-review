@@ -1,0 +1,131 @@
+1) Initialize Supabase (schema + RPC)
+
+Open Supabase → SQL Editor and paste/run the bootstrap.sql from the canvas:
+TEAIM – Workday Hub • Drop-in Code Pack (Replit-ready)
+
+If you want a minimal seed instead of the whole file, use:
+
+-- Enable vector
+create extension if not exists vector;
+
+-- Core tables (abridged)
+create table if not exists orgs (id uuid primary key default gen_random_uuid(), name text not null, created_at timestamptz default now());
+create table if not exists projects (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid not null references orgs(id) on delete cascade,
+  code text not null, name text not null, status text default 'active',
+  created_at timestamptz default now(), unique (org_id, code)
+);
+create table if not exists artifacts (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid not null, project_id uuid not null,
+  path text not null, mime_type text, title text, source text, chunk_count int default 0,
+  created_at timestamptz default now()
+);
+create table if not exists artifact_chunks (
+  id bigserial primary key,
+  org_id uuid not null, project_id uuid not null,
+  artifact_id uuid references artifacts(id) on delete cascade,
+  chunk_index int not null, content text not null,
+  embedding vector(3072)
+);
+
+-- Vector search RPC
+create or replace function search_chunks(p_org uuid, p_project uuid, q vector, k int)
+returns table(content text, title text, artifact_id uuid)
+language sql stable as $$
+  select c.content, a.title, a.id
+  from artifact_chunks c
+  join artifacts a on a.id = c.artifact_id
+  where c.org_id = p_org and c.project_id = p_project
+  order by c.embedding <#> q
+  limit k;
+$$;
+
+2) Create a demo org + project (grab the UUIDs)
+
+Run:
+
+insert into orgs (name) values ('TEAIM Demo') returning id;
+-- copy org_id
+
+insert into projects (org_id, code, name)
+values ('<ORG_UUID>', 'WD-STARK-2024', 'ACME Corp Workday Implementation')
+returning id, code, name;
+-- copy project_id
+
+
+Use those UUIDs in the header fields (org_id, project_id) in your app.
+(Using 'test-org'/'test-project' will fail because the DB expects UUIDs.)
+
+3) Storage bucket (if not done)
+
+Supabase → Storage → Buckets → create project-artifacts (Private).
+Replit secrets should already include: BUCKET=project-artifacts.
+
+4) Secrets check (Replit → Secrets)
+
+OPENAI_API_KEY
+
+SUPABASE_URL
+
+SUPABASE_SERVICE_ROLE_KEY
+
+BUCKET=project-artifacts
+
+(optional web) VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY
+
+5) Make both servers run (you’re close)
+
+You already have Express + the proxy. Ensure FastAPI is running (your agent now spawns it—great). If you need manual:
+
+cd server
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+Verify it worked
+A) Upload from the UI
+
+Enter your org_id and project_id (UUIDs) in the header.
+
+Click Upload Document and choose a small PDF/TXT.
+
+Success toast should show an artifact_id.
+
+Quick DB check (Supabase SQL):
+
+select id, title, chunk_count, created_at
+from artifacts
+where project_id = '<PROJECT_UUID>'
+order by created_at desc
+limit 5;
+
+B) Ask Kap in the Chat Dock
+
+Ask: “What does the latest upload say?”
+
+You should get an answer + “Sources: <Title>”.
+If you get a function error, re-check that search_chunks exists:
+
+select proname from pg_proc where proname='search_chunks';
+
+If anything misbehaves — quick checklist
+
+“Function not found” → you didn’t run bootstrap.sql (or missed the RPC).
+
+“Artifacts table not found” → same.
+
+Upload fails → bucket name mismatch or missing secrets.
+
+Chat returns “insufficient context” → embeddings ok, just not enough content yet (normal).
+
+What next (after it’s live)
+
+Add /ingest-email webhook + allowlist and #proj: subject rule.
+
+Wire Supabase Auth for login + roles; keep API using service key.
+
+Add daily/weekly digest endpoints and schedule.
+
+Lock Wellness privacy via API (PM/Exec only aggregate).
+
+If you paste me Replit’s next log/screenshot after running the SQL + creating org/project, I’ll sanity-check the UUIDs and call out any gaps.

@@ -1,0 +1,418 @@
+Love it. Sprint 2’s buttoned up—let’s slam the next four upgrades in one push: Wellness Page, Subscriptions Admin grid, Timeline OCR extraction, and Meeting Summaries filters. Paste-ready below. If any paths differ in Replit, tell me and I’ll refit.
+
+1) Wellness Page (check-ins → dashboard red flags)
+1A) SQL (Supabase)
+create table if not exists public.wellness_checkins (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid not null,
+  project_id uuid not null,
+  user_id uuid not null,
+  score int not null check (score between 1 and 5),
+  note text,
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_wc_proj_time on public.wellness_checkins(project_id, created_at);
+
+alter table public.wellness_checkins enable row level security;
+
+-- Members can insert/read their project’s data (API will anonymize for non-admins)
+create policy "wc_select_member" on public.wellness_checkins
+for select using (org_id = public.current_org() and public.is_member(org_id, project_id));
+
+create policy "wc_insert_member" on public.wellness_checkins
+for insert with check (org_id = public.current_org() and public.is_member(org_id, project_id));
+
+select pg_notify('pgrst','reload schema');
+
+1B) API
+
+server/routers/wellness.py
+
+from fastapi import APIRouter, Depends, Query, HTTPException
+from pydantic import BaseModel
+from datetime import datetime, timedelta, timezone
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/wellness", tags=["wellness"])
+ADMIN_OR_OWNER = require_role({"owner","admin"})
+
+class CheckinBody(BaseModel):
+    score: int
+    note: str | None = None
+
+@router.post("/checkin")
+def checkin(body: CheckinBody, project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    if not (1 <= body.score <= 5):
+        raise HTTPException(400, "score must be 1..5")
+    sb = get_user_supabase(ctx)
+    sb.table("wellness_checkins").insert({
+        "org_id": ctx.org_id, "project_id": project_id, "user_id": ctx.user_id,
+        "score": body.score, "note": body.note
+    }).execute()
+    return {"ok": True}
+
+@router.get("/summary")
+def summary(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    since = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+    rows = sb.table("wellness_checkins").select("user_id,score,note,created_at")\
+            .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+            .gte("created_at", since).order("created_at", desc=False).execute().data or []
+    # bucket by date
+    byday = {}
+    for r in rows:
+        d = r["created_at"][:10]
+        byday.setdefault(d, []).append(r["score"])
+    spark = [{"date": d, "avg": round(sum(v)/len(v), 2), "n": len(v)} for d,v in sorted(byday.items())]
+    last7 = spark[-7:]
+    avg7 = round(sum(x["avg"] for x in last7)/max(1,len(last7)), 2) if last7 else None
+    # simple trend: last 3 points decreasing?
+    trend_down = False
+    if len(last7) >= 3:
+        a,b,c = last7[-3]["avg"], last7[-2]["avg"], last7[-1]["avg"]
+        trend_down = (a > b) and (b > c)
+    # redact notes unless admin/owner
+    show_notes = ctx.role in {"owner","admin"}
+    notes = []
+    if show_notes:
+        notes = [{"note": r["note"], "at": r["created_at"], "user_id": r["user_id"]}
+                 for r in rows if r.get("note")]
+    else:
+        notes = [{"note": r["note"], "at": r["created_at"]} for r in rows if r.get("note")]
+
+    return {"avg7": avg7, "spark": last7, "trend_down": trend_down, "notes": notes}
+
+
+Mount in server/main.py:
+
+from .routers import wellness
+app.include_router(wellness.router)
+
+1C) Frontend (page + quick widget)
+
+client/src/pages/Wellness.tsx
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { apiGet, apiPost } from "@/lib/api";
+
+export default function WellnessPage(){
+  const { projectId } = useParams();
+  const [sum,setSum] = useState<any>(null);
+  const [score,setScore] = useState(3);
+  const [note,setNote] = useState("");
+
+  async function load(){ setSum(await apiGet("/wellness/summary", { project_id: projectId! })); }
+  useEffect(()=>{ load(); }, [projectId]);
+
+  async function submit(){
+    await apiPost("/wellness/checkin", { score, note }, { project_id: projectId! });
+    setNote(""); await load();
+  }
+
+  return (
+    <div className="p-6 space-y-6">
+      <h1 className="text-xl font-semibold">Team Wellness</h1>
+
+      <div className="border rounded p-4 space-y-2">
+        <div className="text-sm font-medium">Submit Check-in</div>
+        <div className="flex items-center gap-3">
+          <input type="range" min={1} max={5} value={score} onChange={e=>setScore(parseInt(e.target.value))}/>
+          <div className="text-sm">Score: {score}</div>
+        </div>
+        <textarea className="border rounded p-2 w-full" placeholder="Optional note (kept private to admins)"
+                  value={note} onChange={e=>setNote(e.target.value)} />
+        <button className="px-3 py-2 rounded border" onClick={submit}>Submit</button>
+      </div>
+
+      {sum && (
+        <div className="border rounded p-4 space-y-3">
+          <div className="text-sm">7-day avg: <b>{sum.avg7 ?? "—"}</b> {sum.trend_down ? "⚠️ trending down" : ""}</div>
+          <div>
+            <div className="text-xs text-muted-foreground mb-1">Trend</div>
+            <div className="h-2 bg-gray-200 rounded relative">
+              {sum.spark.map((p:any, i:number)=>{
+                const w = 100/sum.spark.length;
+                const h = Math.max(10, (p.avg/5)*100);
+                return <div key={i} className="absolute bottom-0 bg-black"
+                            style={{left:`${i*w}%`, width:`${w-2}%`, height:`${h}%`}} title={`${p.date}: ${p.avg}`}></div>
+              })}
+            </div>
+          </div>
+          {!!sum.notes?.length && (
+            <div>
+              <div className="text-xs text-muted-foreground mb-1">Recent notes</div>
+              <ul className="list-disc pl-5 text-sm">
+                {sum.notes.slice(-5).map((n:any, i:number)=>(
+                  <li key={i}>{n.note} <span className="text-xs text-muted-foreground">({new Date(n.at).toLocaleString()})</span></li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+Route:
+
+{ path: "/projects/:projectId/wellness", element: <WellnessPage/> }
+
+
+(Optional) Add a tiny “Wellness” KPI chip on the dashboard by calling /wellness/summary and showing avg7 + ⚠️ if trend_down.
+
+2) Subscriptions Admin grid (weekly/monthly toggles)
+2A) API
+
+server/routers/subscriptions.py
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/subs", tags=["subscriptions"])
+ADMIN_OR_PM = require_role({"owner","admin","pm"})
+
+class SubUpsert(BaseModel):
+    user_id: str
+    digest_weekly: bool
+    digest_monthly: bool
+
+@router.get("/list")
+def list_subs(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    # join members for easy display
+    ms = sb.table("project_members").select("user_id,role").eq("org_id", ctx.org_id).eq("project_id", project_id).execute().data or []
+    subs = sb.table("team_subscriptions").select("user_id,digest_weekly,digest_monthly")\
+           .eq("org_id", ctx.org_id).eq("project_id", project_id).execute().data or []
+    S = {s["user_id"]: s for s in subs}
+    out = []
+    for m in ms:
+        s = S.get(m["user_id"], {"digest_weekly": True, "digest_monthly": False})
+        out.append({"user_id": m["user_id"], "role": m["role"],
+                    "digest_weekly": s["digest_weekly"], "digest_monthly": s["digest_monthly"]})
+    return {"subs": out}
+
+@router.post("/upsert")
+def upsert_sub(body: SubUpsert, project_id: str = Query(...), ctx: TenantCtx = Depends(ADMIN_OR_PM)):
+    sb = get_user_supabase(ctx)
+    sb.table("team_subscriptions").upsert({
+        "org_id": ctx.org_id, "project_id": project_id, "user_id": body.user_id,
+        "digest_weekly": body.digest_weekly, "digest_monthly": body.digest_monthly
+    }, on_conflict="org_id,project_id,user_id").execute()
+    return {"ok": True}
+
+
+Mount:
+
+from .routers import subscriptions
+app.include_router(subscriptions.router)
+
+2B) UI
+
+client/src/pages/AdminSubscriptions.tsx
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { apiGet, apiPost } from "@/lib/api";
+
+type Row = { user_id:string; role:string; digest_weekly:boolean; digest_monthly:boolean };
+
+export default function AdminSubscriptions(){
+  const { projectId } = useParams();
+  const [rows,setRows] = useState<Row[]>([]);
+  async function load(){ const r = await apiGet<{subs:Row[]}>("/subs/list", { project_id: projectId! }); setRows(r.subs); }
+  useEffect(()=>{ load(); }, [projectId]);
+
+  async function setRow(i:number, patch: Partial<Row>){
+    const r = {...rows[i], ...patch};
+    setRows(prev => prev.map((x,ix)=> ix===i? r : x));
+    await apiPost("/subs/upsert", { user_id: r.user_id, digest_weekly: r.digest_weekly, digest_monthly: r.digest_monthly }, { project_id: projectId! });
+  }
+
+  return (
+    <div className="p-6 space-y-4">
+      <h1 className="text-xl font-semibold">Digest Subscriptions</h1>
+      <div className="border rounded">
+        {rows.map((r,i)=>(
+          <div key={r.user_id} className="grid grid-cols-4 gap-2 p-2 border-b last:border-0 items-center">
+            <div className="text-sm">{r.user_id.slice(0,8)}… <span className="text-xs text-muted-foreground">({r.role})</span></div>
+            <label className="text-sm flex items-center gap-2 col-span-1">
+              <input type="checkbox" checked={r.digest_weekly} onChange={e=>setRow(i, {digest_weekly: e.target.checked})}/> Weekly
+            </label>
+            <label className="text-sm flex items-center gap-2 col-span-1">
+              <input type="checkbox" checked={r.digest_monthly} onChange={e=>setRow(i, {digest_monthly: e.target.checked})}/> Monthly
+            </label>
+            <div className="text-xs text-muted-foreground">opt-in per member</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
+Route (admin-only link):
+
+{ path: "/projects/:projectId/admin/subscriptions", element: <AdminSubscriptions/> }
+
+3) Timeline OCR extraction (from scanned images / PDFs)
+3A) Parser helper
+
+server/ingest/timeline_parse.py
+
+import re
+from datetime import datetime
+
+# Match patterns like:
+#  Stage: Discovery | Start: 2025-09-22 | End: 2025-10-10
+#  Phase Build P1 2025/10/13 - 2025/12/05
+PATTERNS = [
+  re.compile(r"(?:Stage|Phase)[:\s]+(?P<label>[^|,\n]+?).*?(?:Start[:\s]+(?P<start>\d{4}[-/]\d{2}[-/]\d{2}).*?End[:\s]+(?P<end>\d{4}[-/]\d{2}[-/]\d{2}))", re.I|re.S),
+  re.compile(r"(?:Stage|Phase)?\s*(?P<label>[A-Za-z0-9 _]+?)\s+(?P<start>\d{4}[-/]\d{2}[-/]\d{2})\s*[-–]\s*(?P<end>\d{4}[-/]\d{2}[-/]\d{2})", re.I)
+]
+
+def extract_timeline_phases(text: str):
+  out = []
+  for pat in PATTERNS:
+    for m in pat.finditer(text):
+      label = m.group("label").strip().strip("|: ")
+      start = m.group("start").replace("/","-")
+      end   = m.group("end").replace("/","-")
+      # sanity
+      try:
+        datetime.fromisoformat(start); datetime.fromisoformat(end)
+      except Exception:
+        continue
+      out.append({"label": label, "start_date": start, "end_date": end})
+  # dedupe by label+start
+  seen=set(); uniq=[]
+  for p in out:
+    k=(p["label"].lower(), p["start_date"])
+    if k in seen: continue
+    seen.add(k); uniq.append(p)
+  return uniq
+
+3B) Ingest hook
+
+Where your OCR code yields ocr_text, add:
+
+from ..ingest.timeline_parse import extract_timeline_phases
+# ...
+phases = extract_timeline_phases(ocr_text or text or "")
+if phases:
+    # write timeline memories into mem_entries (or your timeline store)
+    sb = get_service_supabase()  # server-side write
+    for ph in phases:
+        sb.table("mem_entries").insert({
+          "org_id": org_id, "project_id": project_id,
+          "kind": "timeline_phase",
+          "body": ph  # JSON; your UI already reads label/start_date/end_date
+        }).execute()
+else:
+    # if it looks like a timeline but we couldn't parse: queue review
+    if "phase" in (ocr_text or "").lower() or "stage" in (ocr_text or "").lower():
+        sb.table("review_items").insert({
+          "org_id": org_id, "project_id": project_id,
+          "artifact_id": artifact_id, "kind": "needs_ocr",
+          "severity": "info", "details": {"hint":"timeline_like_but_unparsed"}
+        }).execute()
+
+
+Result: upload a scanned “timeline” JPG/PDF → phases appear on Timeline page automatically (from earlier Timeline UI).
+
+4) Meeting Summaries — filters & search
+4A) API (optional; if you don’t want client-side filtering)
+
+server/routers/meetings_query.py
+
+from fastapi import APIRouter, Depends, Query
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/meetings", tags=["meetings"])
+
+@router.get("/list")
+def list_meetings(project_id: str = Query(...), q: str | None = None,
+                  min_actions: int = 0, min_risks: int = 0, min_decisions: int = 0,
+                  ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    sel = "id,artifact_id,title,summary,actions_count,risks_count,decisions_count,created_at"
+    r = sb.table("meetings").select(sel).eq("org_id", ctx.org_id).eq("project_id", project_id)\
+          .order("created_at", desc=True).limit(500).execute().data or []
+    out=[]
+    for m in r:
+        if q and (q.lower() not in ((m.get("title") or "") + " " + (m.get("summary") or "")).lower()):
+            continue
+        if m["actions_count"] < min_actions: continue
+        if m["risks_count"]   < min_risks: continue
+        if m["decisions_count"] < min_decisions: continue
+        out.append(m)
+    return {"items": out}
+
+
+Mount:
+
+from .routers import meetings_query
+app.include_router(meetings_query.router)
+
+4B) UI filter bar
+
+client/src/pages/MeetingSummaries.tsx (add a small filter row at top)
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+
+export default function MeetingSummaries(){
+  const { projectId } = useParams();
+  const [items,setItems] = useState<any[]>([]);
+  const [q,setQ] = useState(""); const [a,setA] = useState(0); const [r,setR]=useState(0); const [d,setD]=useState(0);
+
+  async function load(){
+    const qs = new URLSearchParams({ project_id: projectId!, q, min_actions: String(a), min_risks: String(r), min_decisions: String(d) }).toString();
+    const res = await fetch(`/api/meetings/list?${qs}`); if (res.ok) setItems((await res.json()).items);
+  }
+  useEffect(()=>{ load(); }, [projectId]);
+
+  return (
+    <div className="p-6 space-y-4">
+      <div className="flex flex-wrap items-end gap-2">
+        <input className="border rounded p-2" placeholder="Search title/summary…" value={q} onChange={e=>setQ(e.target.value)} />
+        <label className="text-sm">Min Actions <input type="number" className="border rounded p-1 w-16 ml-1" value={a} onChange={e=>setA(parseInt(e.target.value||"0"))}/></label>
+        <label className="text-sm">Min Risks <input type="number" className="border rounded p-1 w-16 ml-1" value={r} onChange={e=>setR(parseInt(e.target.value||"0"))}/></label>
+        <label className="text-sm">Min Decisions <input type="number" className="border rounded p-1 w-16 ml-1" value={d} onChange={e=>setD(parseInt(e.target.value||"0"))}/></label>
+        <button className="px-3 py-2 rounded border" onClick={load}>Apply</button>
+        <a className="px-3 py-2 rounded border" href={`/api/meetings/export.csv?project_id=${projectId}`} target="_blank" rel="noreferrer">Export CSV</a>
+      </div>
+
+      <div className="border rounded">
+        {items.map(m=>(
+          <div key={m.id} className="p-3 border-b last:border-0">
+            <div className="text-sm font-medium">{m.title || "(untitled)"} • {new Date(m.created_at).toLocaleString()}</div>
+            <div className="text-xs text-muted-foreground mb-1">A:{m.actions_count} R:{m.risks_count} D:{m.decisions_count}</div>
+            <div className="text-sm">{m.summary}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+5) 5-minute validation pass
+
+Wellness: submit two check-ins (3, then 2) → 7-day avg shows; trend flag turns ⚠️ when last three points decrease; notes appear only when you’re admin/owner.
+
+Subscriptions: flip a PM’s weekly off → run /digest/send-weekly → recipient excludes that PM.
+
+Timeline OCR: upload a scanned image with Phase Discovery 2025/09/22 - 2025/10/10 → Timeline UI shows “Discovery”.
+
+Meeting filters: set min Actions=1 → table shrinks; search “kickoff” filters to kickoff row.
+
+Want me to wire a Wellness chip on the dashboard and a Documents “needs attention” lane for OCR items next? Or move to the Admin Backups viewer (list + restore one artifact) — your call, boss.

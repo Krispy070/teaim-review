@@ -1,0 +1,350 @@
+Next Big Build v2.13.1 — Data & Reporting Phase 2. This drops a robust migration & reporting framework you can feel right away:
+
+Workbooks
+
+CSV Import (dev-safe): add many workbooks at once
+
+Late / At-Risk chips + Upcoming logic
+
+Per-workbook mini timeline (dates + iteration runs)
+
+Runs now carry status pipeline: pulled → validated → loaded → failed; counters per workbook
+
+Reports
+
+CSV Import (dev-safe)
+
+Status pipeline chips (planned → mapped → built → validated → delivered → blocked)
+
+Owner filter & quick chips
+
+Dashboard
+
+Data & Reporting KPI tile (workbooks: total/overdue/at-risk; reports: delivered/custom)
+
+Bonus
+
+“Request Data Migration Sign-Off” button on Workbooks tab (opens your Sign-Off modal with a prefilled doc link)
+
+Everything below is copy-paste ready, Brand v2–aware, and dev-safe (new endpoints no-op gracefully if tables/columns are missing).
+
+1) Backend — Workbooks: CSV Import + Runs pipeline + At-Risk metrics
+1A) Workbooks CSV Import (dev-safe)
+
+server/routers/workbooks.py (append)
+
+from fastapi import UploadFile, File
+import csv, io
+
+@router.post("/import_csv")
+def import_csv(project_id: str = Query(...), file: UploadFile = File(...),
+               ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    try:
+        raw = (file.file.read()).decode("utf-8", errors="ignore")
+        rdr = csv.DictReader(io.StringIO(raw))
+        cols = {"name","area","intro_date","start_date","asof_date","due_date","iterations_planned","status","notes"}
+        n=0
+        for row in rdr:
+            data = {k: row.get(k) for k in cols if k in row}
+            if not (data.get("name") or "").strip():
+                continue
+            # coerce ints
+            try:
+                if data.get("iterations_planned") not in (None, ""):
+                    data["iterations_planned"] = int(data["iterations_planned"])
+            except: data["iterations_planned"] = 0
+            data.update({"org_id": ctx.org_id, "project_id": project_id})
+            try: sb.table("workbooks").insert(data).execute(); n+=1
+            except Exception: ...
+        return {"ok": True, "imported": n}
+    except Exception:
+        return {"ok": False, "imported": 0}
+
+1B) Runs pipeline (counts) + status values
+
+server/routers/workbooks.py (append or adjust existing runs handlers)
+
+@router.get("/runs/summary")
+def runs_summary(workbook_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        rows = sb.table("workbook_runs").select("status")\
+               .eq("org_id", ctx.org_id).eq("workbook_id", workbook_id).execute().data or []
+    except Exception:
+        rows = []
+    out = {"pulled":0,"validated":0,"loaded":0,"failed":0}
+    for r in rows:
+        s = (r.get("status") or "pulled").lower()
+        if s in out: out[s]+=1
+    return {"counts": out}
+
+
+(Optional) ensure your workbook_runs.status accepts: pulled/validated/loaded/failed.
+
+1C) At-Risk / Overdue metrics (14d window)
+
+server/routers/workbooks.py (augment /metrics)
+
+@router.get("/metrics")
+def metrics(project_id: str = Query(...), upcoming_days: int = 14, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        wbs = sb.table("workbooks").select("id,name,area,due_date,asof_date,iterations_planned,iterations_done,status")\
+              .eq("org_id", ctx.org_id).eq("project_id", project_id).execute().data or []
+    except Exception:
+        wbs = []
+    total = len(wbs)
+    done = len([w for w in wbs if (w.get("status") or "")=="done"])
+    inprog = len([w for w in wbs if (w.get("status") or "")=="in_progress"])
+    blocked = len([w for w in wbs if (w.get("status") or "")=="blocked"])
+
+    today = datetime.utcnow().date()
+    overdue = [w for w in wbs if w.get("due_date") and _is_overdue(w.get("due_date"), today)]
+    upcoming = [w for w in wbs if _is_upcoming(w.get("due_date"), today, upcoming_days)]
+    at_risk = [w for w in wbs if _is_at_risk(w, today)]
+
+    return {"summary":{"total":total,"in_progress":inprog,"done":done,"blocked":blocked,
+                       "overdue": len(overdue), "at_risk": len(at_risk)},
+            "upcoming": upcoming[:10]}
+
+def _is_overdue(due: str, today: date):
+    try:
+        d = datetime.fromisoformat(due).date()
+        return d < today
+    except: return False
+
+def _is_upcoming(due: str|None, today: date, window: int):
+    try:
+        if not due: return False
+        d = datetime.fromisoformat(due).date()
+        return 0 <= (d - today).days <= window
+    except: return False
+
+def _is_at_risk(w, today: date):
+    # simplistic: in progress but due within 3d or iteration shortfall
+    try:
+        if (w.get("status") or "") == "in_progress":
+            if w.get("due_date"):
+                d = datetime.fromisoformat(w.get("due_date")).date()
+                if 0 <= (d - today).days <= 3:
+                    return True
+            p = int(w.get("iterations_planned") or 0)
+            d = int(w.get("iterations_done") or 0)
+            return p>0 and d < p and (w.get("asof_date") and datetime.fromisoformat(w.get("asof_date")).date() < today)
+    except: ...
+    return False
+
+2) Backend — Reports CSV Import (dev-safe)
+
+server/routers/reports_registry.py (append)
+
+from fastapi import UploadFile, File
+
+@router.post("/import_csv")
+def import_csv(project_id: str = Query(...), file: UploadFile = File(...),
+               ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    try:
+        raw = (file.file.read()).decode("utf-8", errors="ignore")
+        rdr = csv.DictReader(io.StringIO(raw))
+        cols = {"name","legacy_system","owner","frequency","due_date","status","wd_type","wd_report_name","design_doc_url","sample_url","notes"}
+        n=0
+        for row in rdr:
+            data = {k: row.get(k) for k in cols if k in row}
+            if not (data.get("name") or "").strip():
+                continue
+            data.update({"org_id": ctx.org_id, "project_id": project_id})
+            try: sb.table("reports").insert(data).execute(); n+=1
+            except Exception: ...
+        return {"ok": True, "imported": n}
+    except Exception:
+        return {"ok": False, "imported": 0}
+
+3) Frontend — Workbooks UI: import + chips + mini timeline + run pipeline
+
+A. Import control (WorkbooksCard top toolbar)
+
+client/src/pages/Reporting.tsx — inside WorkbooksCard after Save/Export buttons:
+
+<input type="file" accept=".csv" className="text-xs" onChange={async e=>{
+  const f = e.target.files?.[0]; if (!f) return;
+  const fd = new FormData(); fd.append("file", f);
+  await fetch(`/api/workbooks/import_csv?project_id=${projectId}`, { method:"POST", body: fd, credentials: "include" });
+  load(); loadMetrics();
+}} />
+
+
+B. Chips in list (Overdue / At-Risk)
+
+In the table rows, next to status:
+
+<td className="p-1">
+  {w.status||"—"}{" "}
+  {_chip(w)}
+</td>
+
+
+Add helper above component return:
+
+function _chip(w:WB){
+  const badge = (cls:string, txt:string)=> <span className={`ml-1 text-[11px] px-2 py-[1px] rounded ${cls}`}>{txt}</span>;
+  const today = new Date().toISOString().slice(0,10);
+  if (w.due_date && w.due_date < today) return badge("bg-red-500/15 text-red-500", "Overdue");
+  // at-risk: in_progress & due within 3d or iteration shortfall
+  const d = (w.due_date || ""); const dd = d? new Date(d+"T00:00:00"): null;
+  if ((w.status==="in_progress") && dd){
+    const days = Math.ceil((+dd - +new Date())/86400000);
+    if (days >=0 && days <=3) return badge("bg-amber-500/15 text-amber-600", "At-Risk");
+  }
+  return null;
+}
+
+
+C. Mini timeline
+
+Create a component:
+
+client/src/components/WorkbookTimeline.tsx
+
+export default function WorkbookTimeline({start, end, runs}:{start?:string; end?:string; runs?:{run_no:number;status:string}[]}){
+  if (!start || !end) return <div className="text-xs text-muted-foreground">No dates</div>;
+  const s = new Date(start+"T00:00:00"), e = new Date(end+"T00:00:00");
+  const total = Math.max(1, Math.round((+e - +s)/86400000));
+  // place runs roughly (assumes pulled_on ~ evenly spaced)
+  return (
+    <div className="h-2 bg-white/10 rounded relative">
+      <div className="absolute h-2 rounded bg-[var(--brand-accent)]" style={{ left:'0%', width:'100%' }}/>
+      {(runs||[]).map(r=>{
+        const left = Math.min(98, Math.max(0, (r.run_no/(Math.max(1, (runs||[]).length+1)))*100));
+        const col = r.status==="loaded" ? "var(--brand-good)" : r.status==="validated" ? "#19d492" : r.status==="failed" ? "#ef4444" : "#6b7280";
+        return <div key={r.run_no} className="absolute -top-1 w-[6px] h-[6px] rounded-full" title={`Run ${r.run_no} • ${r.status}`} style={{ left:`${left}%`, background: col }} />;
+      })}
+    </div>
+  );
+}
+
+
+Use it in the Workbooks list:
+
+Fetch runs + summary when opening a row (simple onClick expander) or inline (light version):
+
+Add below the row table (simple list) or replace a column with:
+
+<td className="p-1">
+  <WorkbookTimeline start={w.start_date} end={w.due_date} runs={[]} />
+</td>
+
+
+(To keep it lightweight now, pass empty runs; we can add a row expander that loads /api/workbooks/runs & /summary later.)
+
+D. Runs counters view (optional): call /runs/summary?workbook_id= and render small badges.
+
+4) Frontend — Reports UI: import + status pipeline + owner filter
+
+A. Import control (ReportsCard top toolbar)
+
+client/src/pages/Reporting.tsx — inside ReportsCard next to Save/Export:
+
+<input type="file" accept=".csv" className="text-xs" onChange={async e=>{
+  const f = e.target.files?.[0]; if (!f) return;
+  const fd = new FormData(); fd.append("file", f);
+  await fetch(`/api/reports/import_csv?project_id=${projectId}`, { method:"POST", body: fd, credentials:"include" });
+  load();
+}} />
+
+
+B. Status pipeline chip renderer & owner filter
+
+Above the Reports table, an owner filter:
+
+const [ownerFilter,setOwnerFilter]=useState("");
+// owner input
+<input className="border rounded p-1 text-xs" placeholder="Filter owner…" value={ownerFilter} onChange={e=>setOwnerFilter(e.target.value)} />
+
+
+Filter locally:
+
+const rows = items.filter(r => !ownerFilter || (r.owner||"").toLowerCase().includes(ownerFilter.toLowerCase()));
+
+
+Pipeline chips in table row:
+
+<td className="p-1">
+  <span className={`text-[11px] px-2 py-[1px] rounded ${_pClass(r.status)}`}>{r.status||"planned"}</span>
+</td>
+
+
+Helper:
+
+function _pClass(s?:string){
+  const t=(s||"planned").toLowerCase();
+  if (t==="delivered") return "bg-[var(--brand-good)]/20 text-[var(--brand-good)]";
+  if (t==="validated") return "bg-emerald-500/15 text-emerald-600";
+  if (t==="built") return "bg-sky-500/15 text-sky-600";
+  if (t==="mapped") return "bg-indigo-500/15 text-indigo-600";
+  if (t==="blocked") return "bg-red-500/15 text-red-500";
+  return "bg-amber-500/15 text-amber-600"; // planned
+}
+
+5) Dashboard — Data & Reporting KPI tile
+
+client/src/pages/DashboardV2.tsx (augment metrics block)
+
+const [repKpi,setRepKpi]=useState<{workbooks?:any;reports?:any}>({});
+useEffect(()=>{ (async()=>{
+  try{
+    const wb = await getJSON(`/api/workbooks/metrics?project_id=${projectId}`);
+    const rp = await getJSON(`/api/reports/list?project_id=${projectId}`);
+    const delivered = (rp.items||[]).filter((r:any)=> (r.status||"").toLowerCase()==="delivered").length;
+    const custom = (rp.items||[]).filter((r:any)=> (r.wd_type||"").toLowerCase()==="custom").length;
+    setRepKpi({ workbooks: wb.summary, reports: { delivered, custom, total: (rp.items||[]).length } });
+  }catch{ setRepKpi({}); }
+})(); },[projectId]);
+
+{/* KPI tile */}
+<div className="brand-card p-3">
+  <div className="text-xs text-muted-foreground">Data & Reporting</div>
+  <div className="text-lg font-semibold">
+    WB: {repKpi.workbooks?.total ?? "—"} · Overdue: {repKpi.workbooks?.overdue ?? "—"} · At-Risk: {repKpi.workbooks?.at_risk ?? "—"}
+  </div>
+  <div className="text-xs text-muted-foreground">
+    Reports: {repKpi.reports?.total ?? "—"} (Delivered: {repKpi.reports?.delivered ?? "—"} · Custom: {repKpi.reports?.custom ?? "—"})
+  </div>
+</div>
+
+6) “Request Data Migration Sign-Off” (Workbooks tab)
+
+client/src/pages/Reporting.tsx — in WorkbooksCard header:
+
+import SignoffRequestModal from "@/components/SignoffRequestModal";
+const [reqOpen,setReqOpen]=useState(false);
+const dataDocLink = `/api/workbooks/export.csv?project_id=${projectId}`; // simple reference link; later we can attach a curated doc
+
+<div className="flex items-center gap-2 mt-2">
+  <button className="brand-btn text-xs swoosh" onClick={()=>setReqOpen(true)}>Request Data Migration Sign-Off</button>
+  {reqOpen && (
+    <SignoffRequestModal
+      projectId={projectId}
+      stageId={"data-migration"}  // can map to a dedicated stage if you want
+      stageTitle={"Data Migration Sign-Off"}
+      stageArea={"Integrations"}
+      onClose={()=>setReqOpen(false)}
+    />
+  )}
+</div>
+
+
+(Your modal supports custom message & doc link; if you want to prefill docLink with the CSV link, you can patch the modal props to accept initialDocLink and set that into state.)
+
+7) 90-second validation
+
+Workbooks: CSV import; At-Risk/Overdue chips; mini timeline; runs have pipeline counts
+
+Reports: CSV import; status pipeline chips; owner filter
+
+Dashboard: “Data & Reporting” tile shows workbook/report KPIs
+
+Sign-Off: one-click “Request Data Migration Sign-Off” from Workbooks
+
+Dev-safe: endpoints return empty lists on missing tables, no hard crashes

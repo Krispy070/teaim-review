@@ -1,0 +1,196 @@
+TEAIM Call → App Update (Human-in-the-loop)
+0) Ingest
+
+Source: Zoom/Teams/Meet/Phone → transcript + speaker diarization + timestamps.
+
+Webhook hits POST /ingest/transcript with: { projectId, source, url|text, speakers[], startedAt, endedAt }.
+
+We store raw blob + normalized text. Nothing is overwritten later—everything is additive with an audit trail.
+
+1) Structured extraction (LLM with guardrails)
+
+We call ChatGPT once with a strict JSON schema (function/tool call) so output is machine-safe. Target objects:
+
+participants[] (name, email?, role?, org?)
+
+decisions[] (what, by whom, due, blockers)
+
+actions[] (title, owner?, due, area, priority, tags)
+
+risks[] (desc, impact, likelihood, mitigation, owner)
+
+issues[]
+
+workstream_updates[] (area=HCM/FIN/etc, summary, %complete)
+
+bp_changes[] (BP code, changeType, reason, security impacts, tests)
+
+artifacts[] (title, type, link)
+
+test_suggestions[] (Gherkin/GWT or step list)
+
+The model also emits confidences{…} and dedupe_key per item (e.g., hash of sentence span + nouns) for idempotency.
+
+2) Upsert logic (no surprises)
+
+We run a deterministic mapper:
+
+Participants:
+
+Match by email (or fuzzy by name + company).
+
+If new, create contact in users_light table with status=invited_pending.
+
+Queue invite email via /admin/invite (but don’t send until PM approves batch).
+
+Actions/Risks/Issues:
+
+Upsert by dedupe_key. If found, append an update; if new, stage as pending_review.
+
+Auto-link to area/workstream by label mapping (e.g., “security roles”→HCM Security).
+
+BP changes:
+
+Resolve BP by area+code; if missing, stage a new BP + change.
+
+Test suggestions:
+
+Save as draft test cases in tests_suggested with sourceTranscriptId.
+
+Nothing goes live yet. Everything is staged as a “proposed batch”.
+
+3) PM Review Queue (line-by-line)
+
+A single review page for the transcript shows:
+
+Left: transcript with highlights; clicking a highlight focuses the proposed item.
+
+Right: proposed objects grouped by type with Approve / Edit / Reject on each row.
+
+“Approve all low-risk (<0.7 confidence) disabled by default”—we force eyeballs.
+
+When editing, we show the LLM’s extracted source span + our normalization (so PM can correct quickly).
+
+Batch actions: Approve all invites, Approve all action items, etc.
+
+The confirm button applies a transactional commit to live tables and writes a diff (who/what/when/from transcript span).
+
+4) Apply & notify
+
+On approve:
+
+Items move from staging_* → live tables.
+
+New users: invites sent (or Slack/Teams mention if internal).
+
+Owners of new/changed items get notifications with deep links (and the speaking turn that created it).
+
+On reject:
+
+We keep a “rejected” record with rationale to retrain prompts later.
+
+5) Corrections from the same call (“cross-out”)
+
+In the transcript view, PM (or speaker) can select text → “Mark as correction”:
+
+It opens a quick form: “This earlier item is wrong; correct value is X”.
+
+We store an amendment with amends_item_id, reason, new_value, sourceTranscriptId, and render the original as strikethrough in the item’s history.
+
+Items are never hard-deleted; they’re superseded (status=superseded). The UI shows the latest value and a timeline (⚠️ perfect for audits).
+
+Interfaces (clear + boring = reliable)
+Ingest webhook
+POST /ingest/transcript
+{
+  "projectId": "...",
+  "source": "zoom|teams|meet|phone",
+  "transcriptUrl": "s3://... | https://...",
+  "text": "...",                 // optional if transcriptUrl present
+  "speakers": [{"label":"S1","name":"Jane","email":"j@x.com"}],
+  "language":"en-US",
+  "startedAt":"...",
+  "endedAt":"..."
+}
+→ 201 { transcriptId }
+
+Extraction job
+
+Worker pulls transcriptId, fetches text, calls ChatGPT with our JSON schema, persists to staging_* tables (participants/actions/...).
+
+PM review
+GET /admin/review/transcript/:id
+→ { transcript, proposed: { participants[], actions[], risks[], bp_changes[], tests[], ... } }
+
+POST /admin/review/transcript/:id/commit
+{ approved: {actions:[ids], ...}, edited: {...}, rejected: {...}, sendInvites: true }
+→ 200 { appliedCounts, notificationsQueued }
+
+Corrections
+POST /items/:id/correction
+{ transcriptId, reason, fields: { ...new values... } }
+→ marks prior as superseded, logs amendment with link back to transcript span
+
+Idempotency & safety
+
+Every extracted item has dedupe_key and transcript_span (start/end ms). Re-ingest of the same call doesn’t duplicate.
+
+All LLM calls have max token / retry and we store raw + parsed JSON for audit.
+
+Confidence thresholds:
+
+>=0.85 → “suggest approve”
+
+0.6–0.85 → “needs PM glance”
+
+<0.6 → “draft only” (collapsed by default)
+
+Who gets added/invited
+
+External emails → create contact & stage an email invite (never auto-send without PM toggle).
+
+Internal emails (domain allowlist) → create member with minimal permissions until PM assigns a role.
+
+Routing to areas
+
+Fast, deterministic label map:
+
+dictionary: keyword → area (e.g., ["job catalog","positions","HCM"] → HCM)
+
+fallback to cosine similarity over predefined area descriptions to avoid “misc” noise.
+
+Test script suggestions
+
+Store both freeform steps and normalized Gherkin:
+
+Feature: …
+
+Scenario: …
+
+Given/When/Then …
+
+On approve, they land in Test Library tagged with source transcript + area + risk tie-ins.
+
+Audit & reversibility
+
+Every commit writes a single batchId with diffs for each item.
+
+Any item shows: created by (LLM via transcript X), approved by PM Y at T, corrections list.
+
+Privacy, cost & performance
+
+PII scrub pass before sending text to ChatGPT (mask SSNs, DOBs unless “legal” context).
+
+Chunking: 5–10min segments with speaker turns preserved; overlap 2–3 sentences for context.
+
+Caching: same transcript hash → skip re-extraction unless “force” param given.
+
+What we change today to stabilize it
+
+Add staging_* tables + review UI if not present.
+
+Standardize params: always projectId (camel), optional userId for ownership guess.
+
+Implement correction route (/items/:id/correction) with soft supersede.
+
+Add invite queue flag on review (sendInvites: bool)—default false.

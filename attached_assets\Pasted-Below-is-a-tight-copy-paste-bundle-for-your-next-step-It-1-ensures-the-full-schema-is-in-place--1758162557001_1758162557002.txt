@@ -1,0 +1,206 @@
+Below is a tight, copy-paste bundle for your next step. It (1) ensures the full schema is in place, (2) fixes the search_chunks RPC signature + cache, and (3) gives you a smoke test checklist.
+
+1) Supabase: install the full schema (recommended)
+
+Even though the minimal schema works, your backend code expects more tables (summaries, mem_*). In Supabase → SQL Editor, run this full block:
+
+-- Enable required extensions
+create extension if not exists "uuid-ossp";
+create extension if not exists vector;
+
+-- Core entities
+create table if not exists orgs (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  created_at timestamptz default now()
+);
+
+create table if not exists projects (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid not null references orgs(id) on delete cascade,
+  code text not null,
+  name text not null,
+  status text default 'active',
+  created_at timestamptz default now(),
+  unique (org_id, code)
+);
+
+create table if not exists artifacts (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid not null,
+  project_id uuid not null,
+  path text not null,
+  mime_type text,
+  title text,
+  source text check (source in ('email','transcript','doc','note')) default 'doc',
+  meeting_date date,
+  chunk_count int default 0,
+  created_at timestamptz default now()
+);
+
+create table if not exists artifact_chunks (
+  id bigserial primary key,
+  org_id uuid not null,
+  project_id uuid not null,
+  artifact_id uuid references artifacts(id) on delete cascade,
+  chunk_index int not null,
+  content text not null,
+  embedding vector(3072)
+);
+
+create table if not exists summaries (
+  id bigserial primary key,
+  org_id uuid not null,
+  project_id uuid not null,
+  artifact_id uuid references artifacts(id) on delete cascade,
+  level text check (level in ('artifact','daily','workstream','project')),
+  summary text,
+  key_points jsonb,
+  risks jsonb,
+  decisions jsonb,
+  actions jsonb,
+  created_at timestamptz default now()
+);
+
+-- Memory agent
+create table if not exists mem_entries (
+  id bigserial primary key,
+  org_id uuid not null,
+  project_id uuid not null,
+  type text check (type in ('episodic','semantic','procedural','affect','decision')) not null,
+  title text,
+  body text not null,
+  source_artifact_id uuid references artifacts(id),
+  created_at timestamptz default now()
+);
+
+create table if not exists mem_chunks (
+  id bigserial primary key,
+  mem_id bigint references mem_entries(id) on delete cascade,
+  content text not null,
+  embedding vector(3072)
+);
+
+create table if not exists mem_stats (
+  id bigserial primary key,
+  org_id uuid not null,
+  project_id uuid not null,
+  key text not null,
+  value numeric,
+  period text not null,
+  created_at timestamptz default now()
+);
+
+create table if not exists mem_signals (
+  id bigserial primary key,
+  org_id uuid not null,
+  project_id uuid not null,
+  mem_id bigint references mem_entries(id),
+  signal text not null,
+  weight numeric default 1,
+  observed_at timestamptz default now()
+);
+
+-- Audit (minimal)
+create table if not exists audit_log (
+  id bigserial primary key,
+  org_id uuid,
+  project_id uuid,
+  actor uuid,
+  action text,
+  meta jsonb,
+  created_at timestamptz default now()
+);
+
+-- Vector search RPC (named params & stable)
+drop function if exists search_chunks(integer, uuid, uuid, vector);
+create or replace function search_chunks(
+  k integer,
+  p_org uuid,
+  p_project uuid,
+  q vector
+)
+returns table(content text, title text, artifact_id uuid)
+language sql stable as $$
+  select c.content, a.title, a.id
+  from artifact_chunks c
+  join artifacts a on a.id = c.artifact_id
+  where c.org_id = p_org
+    and c.project_id = p_project
+  order by c.embedding <#> q
+  limit k;
+$$;
+
+-- Nudge PostgREST to reload the schema cache
+NOTIFY pgrst, 'reload schema';
+
+
+If Supabase complains about any “already exists,” it’s fine—this script is idempotent.
+
+2) Confirm your IDs + try a real ingest
+
+You already created:
+
+org_id: d915376c-2bd7-4e79-b9c9-aab9d7fcb5a8
+
+project_id: dced0b98-87b4-46ff-b2a4-2cf8e627e8d2
+
+In the app header, paste those two values.
+
+Now upload a small TXT or PDF via the Upload button. The server will:
+
+Save to project-artifacts bucket
+
+Create artifacts row
+
+Parse → chunk → embed → insert artifact_chunks
+
+Insert a minimal summaries row
+
+Extract memories → mem_entries + mem_chunks
+
+DB sanity (Supabase → SQL):
+
+select id, title, chunk_count
+from artifacts
+where project_id = 'dced0b98-87b4-46ff-b2a4-2cf8e627e8d2'
+order by created_at desc
+limit 3;
+
+select count(*) from artifact_chunks
+where project_id = 'dced0b98-87b4-46ff-b2a4-2cf8e627e8d2';
+
+
+You should see chunk_count > 0 and some rows in artifact_chunks within ~10–20 seconds of upload (embedding happens in the background task).
+
+3) Ask Kap
+
+In the Chat Dock:
+
+Set the same org/project UUIDs.
+
+Ask something like: “Summarize the latest upload.”
+You should get an answer + “Sources: <title>”. If you get “insufficient context,” upload one more doc and try again.
+
+If /ask still errors about search_chunks
+
+You already did this once, but it’s the fix: run
+NOTIFY pgrst, 'reload schema';
+(Sometimes PostgREST caches RPC signatures; reloading clears it.)
+
+Double-check the function exists and params:
+
+select proname as fn, oidvectortypes(proargtypes) as args, pg_get_function_arguments(oid) as named
+from pg_proc
+where proname = 'search_chunks';
+
+
+Should show: (integer, uuid, uuid, vector) and named args k, p_org, p_project, q.
+
+What to feed Replit next (copy to its AI or task list)
+✅ Schema installed; org/project UUIDs set.
+Please:
+1) Run a test upload from the UI and confirm artifacts + chunks are created.
+2) Ask a question in Chat Dock; verify we get an answer + citations.
+3) If RPC errors persist, run `NOTIFY pgrst, 'reload schema';` in Supabase and retry.
+4) Log any backend exceptions to /tmp/fastapi.log and surface a toast if /ask fails, so the PM gets actionable feedback.

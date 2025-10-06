@@ -1,0 +1,240 @@
+1) Backend — Re-ingest a stored file (from artifacts/restores/...)
+
+We’ll add an endpoint that:
+
+Validates tenant + path,
+
+Downloads the stored object from the artifacts bucket,
+
+Pushes it back through your existing ingest pipeline,
+
+Writes an audit event backup.reingest.
+
+It tries a direct Python call into your ingest code if present; otherwise it falls back to calling your own /api/ingest-sync HTTP endpoint. Works in dev (X-Dev headers) and prod (Bearer token) without changing your current auth model.
+
+server/routers/backups.py — add below existing endpoints
+
+@router.post("/reingest-stored")
+def reingest_stored(
+    stored_key: str = Query(...),          # e.g. org/<org>/project/<proj>/restores/<ts>__file.ext
+    project_id: str = Query(...),
+    ctx: TenantCtx = Depends(ADMIN_OR_OWNER),
+):
+    """
+    Re-ingest a file previously restored into artifacts/restores/...
+    """
+    sbs = get_service_supabase()
+
+    # 1) Validate tenant path
+    expected_prefix = f"org/{ctx.org_id}/project/{project_id}/restores/"
+    if not stored_key.startswith(expected_prefix):
+        raise HTTPException(400, "stored_key not under this org/project restores path")
+
+    # 2) Download bytes from artifacts bucket
+    try:
+        file_bytes = sbs.storage().from_("artifacts").download(stored_key)
+    except Exception as e:
+        raise HTTPException(404, f"Cannot download stored file: {e}")
+
+    filename = os.path.basename(stored_key.split("/", 5)[-1])
+    import mimetypes
+    mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+    # 3) Try direct Python ingest (if your code exports such a function)
+    did_direct = False
+    try:
+        # OPTION A: your app may expose a helper we can import
+        #   from ..routers.ingest import ingest_bytes   # (example)
+        #   ingest_bytes(org_id=ctx.org_id, project_id=project_id, filename=filename, data=file_bytes, mime=mime, actor_id=ctx.user_id)
+        # If you have that, uncomment/adapt and set did_direct=True.
+        pass
+    except Exception:
+        did_direct = False
+
+    # 4) Fallback: call your own /api/ingest-sync endpoint with dev/prod auth
+    if not did_direct:
+        import requests
+        base = os.getenv("FASTAPI_URL", "http://127.0.0.1:5000")
+        url = f"{base}/api/ingest-sync?project_id={project_id}"
+
+        headers = {}
+        if os.getenv("DEV_AUTH", "0") == "1":
+            headers["X-Dev-User"] = ctx.user_id or "dev-user"
+            headers["X-Dev-Org"] = ctx.org_id
+            headers["X-Dev-Role"] = ctx.role or "admin"
+        else:
+            # If your /ingest-sync validates JWT, set INTERNAL_API_BEARER with a service token
+            token = os.getenv("INTERNAL_API_BEARER")
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+
+        files = {"file": (filename, file_bytes, mime)}
+        try:
+            r = requests.post(url, files=files, headers=headers, timeout=60)
+            if not r.ok:
+                raise HTTPException(r.status_code, f"Ingest sync failed: {r.text[:300]}")
+        except Exception as e:
+            raise HTTPException(500, f"Re-ingest request failed: {e}")
+
+    # 5) Audit
+    try:
+        sbs.table("audit_events").insert({
+            "org_id": ctx.org_id,
+            "project_id": project_id,
+            "actor_id": ctx.user_id,
+            "kind": "backup.reingest",
+            "details": {"stored_key": stored_key, "filename": filename, "via": "direct_or_http"}
+        }).execute()
+    except Exception:
+        pass
+
+    return {"ok": True, "filename": filename}
+
+
+If you DO have a Python ingest helper (e.g., ingest_bytes(...)), uncomment it and set did_direct=True. Otherwise the HTTP fallback will use your dev headers (in dev) or a service token (INTERNAL_API_BEARER) in prod.
+
+2) Frontend — Add “Re-ingest” button to Admin Backups
+
+client/src/pages/AdminBackups.tsx — add beside Download / Store→Restores:
+
+async function reingestFile(name:string){
+  // derive stored_key if you just clicked from an opened backup after "Store→Restores"
+  // If you want to re-ingest straight from a backup without storing, you can add a separate path,
+  // but here we assume you already used Store→Restores and know the stored_key.
+  const storedKey = prompt(
+    "Enter stored_key under artifacts (org/<org>/project/<proj>/restores/...)",
+    ""
+  );
+  if (!storedKey) return;
+
+  const u = `/api/backups/reingest-stored?project_id=${projectId}&stored_key=${encodeURIComponent(storedKey)}`;
+  const r = await fetch(u, { method:"POST", credentials:"include" });
+  if (r.ok) {
+    const d = await r.json();
+    alert(`Re-ingest started for ${d.filename}. Check Meeting Summaries / Dashboard shortly.`);
+  } else {
+    alert(await r.text());
+  }
+}
+
+
+And in the entry buttons block (next to “Store→Restores”):
+
+<button className="px-2 py-1 border rounded text-sm" onClick={()=>reingestFile(e.name)}>Re-ingest</button>
+
+
+Tip: If you want this completely one-click after “Store→Restores”, have the server return stored_key from /store-file (we already do) and stash it in component state so you don’t need prompt().
+
+3) Dashboard — Restore Log widget (latest restores/re-ingests)
+
+Tiny widget that pulls recent audit_events for kinds backup.restore_file and backup.reingest.
+
+client/src/components/RestoreLog.tsx
+
+import { useEffect, useState } from "react";
+
+export default function RestoreLog({ projectId }:{ projectId: string }) {
+  const [items, setItems] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(()=> {
+    (async ()=>{
+      setLoading(true);
+      try {
+        const kinds = ["backup.restore_file","backup.reingest"];
+        const qs = new URLSearchParams({ project_id: projectId, kind: kinds.join(",") }).toString();
+        // If your /api/audit/list supports only single kind, you can fetch twice; otherwise allow comma means client-side filter.
+        const r = await fetch(`/api/audit/list?project_id=${projectId}`, { credentials:"include" });
+        if (r.ok) {
+          const data = await r.json();
+          const filtered = (data.events || []).filter((e:any)=> kinds.includes(e.kind));
+          setItems(filtered.slice(0, 10));
+        }
+      } finally { setLoading(false); }
+    })();
+  }, [projectId]);
+
+  if (loading) return null;
+  if (!items.length) return null;
+
+  return (
+    <div className="border rounded p-3 space-y-2">
+      <div className="text-sm font-medium">Restore Activity</div>
+      <div className="grid gap-2">
+        {items.map((e:any, i:number)=>(
+          <div key={i} className="text-sm">
+            <span className="font-mono text-xs">{new Date(e.created_at).toLocaleString()}</span>{" "}
+            <b>{e.kind.replace("backup.","")}</b>{" "}
+            <span className="text-xs text-muted-foreground">{e.details?.filename || e.details?.artifact}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
+Drop it on your Project Dashboard (under KPIs or right column):
+
+import RestoreLog from "@/components/RestoreLog";
+// ...
+<div className="grid md:grid-cols-2 gap-4">
+  {/* left column widgets */}
+  <div className="space-y-4">{/* KPIs, Pending, etc. */}</div>
+  {/* right column */}
+  <div className="space-y-4">
+    <RestoreLog projectId={projectId!} />
+  </div>
+</div>
+
+4) (Optional polish) One-click chain: Store → Re-ingest
+
+If you want a single button that stores the file from a selected backup and immediately re-ingests it:
+
+server/routers/backups.py — add a combo endpoint
+
+@router.post("/store-and-reingest")
+def store_and_reingest(
+    backup_key: str = Query(...),
+    artifact_name: str = Query(...),
+    project_id: str = Query(...),
+    ctx: TenantCtx = Depends(ADMIN_OR_OWNER),
+):
+    # 1) Store → Restores
+    s = store_file(backup_key=backup_key, artifact_name=artifact_name, project_id=project_id, ctx=ctx)
+    stored_key = s.get("stored_key")
+    if not stored_key:
+        raise HTTPException(500, "Store failed; no stored_key returned")
+
+    # 2) Re-ingest
+    r = reingest_stored(stored_key=stored_key, project_id=project_id, ctx=ctx)
+    return {"ok": True, "stored_key": stored_key, "reingested": r}
+
+
+UI (AdminBackups page):
+
+async function storeAndReingest(name:string){
+  const u = `/api/backups/store-and-reingest?project_id=${projectId}&backup_key=${encodeURIComponent(sel!.key)}&artifact_name=${encodeURIComponent(name)}`;
+  const r = await fetch(u, { method:"POST", credentials:"include" });
+  if (r.ok) {
+    const d = await r.json();
+    alert(`Stored as ${d.stored_key} and re-ingested.`);
+  } else {
+    alert(await r.text());
+  }
+}
+
+
+Add a third button per entry:
+
+<button className="px-2 py-1 border rounded text-sm" onClick={()=>storeAndReingest(e.name)}>Store + Re-ingest</button>
+
+5) Sanity checks (2 min)
+
+Re-ingest (dev): Ensure DEV_AUTH=1 on backend and frontend so fallback uses X-Dev headers.
+
+Re-ingest (prod): Set INTERNAL_API_BEARER=<service JWT> on the server; /api/ingest-sync should accept it.
+
+Audit: In Audit Viewer, filter kind=backup.reingest → see fresh entries.
+
+Dashboard: Restore Log shows restore_file and reingest events; Meeting Summaries / Dashboard should reflect the ingested file soon after.

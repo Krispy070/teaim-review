@@ -1,0 +1,272 @@
+Two things:
+
+Crash in WorkstreamArea
+
+Add Business Processes (BP) tracking per functional area
+
+I’ll fix the crash first (it’s small), then give you a clean BP model + API + UI slice you can drop in.
+
+1) Crash: org is not defined in WorkstreamArea.tsx:476
+
+What’s happening:
+
+Your effect/query key uses org?.orgId, but there’s no org in scope in that component. React tries to evaluate the dependency array and throws.
+
+Quick, safe patch (works even if you don’t have an org context yet)
+
+At the top of WorkstreamArea.tsx (near other hooks), add a single derived variable and use it everywhere instead of org?.orgId:
+
+// WorkstreamArea.tsx
+// ...
+// Derive orgId defensively from the sources you *do* have:
+const orgId =
+  project?.orgId ??
+  me?.orgId ??
+  searchParams.get("org") ??
+  undefined;
+
+
+Now replace every org?.orgId with orgId:
+
+- ], [areaKey, projectId, org?.orgId, setEditor, setTab, setMsg, toast, queryClient]);
++ ], [areaKey, projectId, orgId, setEditor, setTab, setMsg, toast, queryClient]);
+
+- queryClient.invalidateQueries(["area-summary", projectId, org?.orgId, areaKey]);
++ queryClient.invalidateQueries(["area-summary", projectId, orgId, areaKey]);
+
+- useQuery(["area-summary", projectId, org?.orgId, areaKey], ...)
++ useQuery(["area-summary", projectId, orgId, areaKey], ...)
+
+
+If you do have an org context/hook, you can use it, but still alias it to avoid optional-chaining in deps:
+
+// const { org } = useOrg(); // if exists
+// const orgId = org?.orgId ?? project?.orgId ?? me?.orgId ?? undefined;
+
+
+Why this fixes it: React dependency arrays are evaluated eagerly. A missing identifier (not undefined, but truly not declared) throws immediately. We declare orgId and pass that instead.
+
+Bonus: run a quick grep to catch other landmines
+grep -R "org?.orgId" client/src | sed -n '1,120p'
+
+2) Add “Business Processes (BP)” per functional area
+What we want
+
+Track which Workday Business Processes are in-scope by area (HCM/FIN/etc.)
+
+Record changes to BPs (what was modified, why, security impacts, test cases)
+
+Surface this in the WorkstreamArea as a new BP tab with a simple table + add/edit drawer
+
+Seed minimal BP data so your Runner tests can hit it later, too
+
+Minimal Drizzle schema (3 tables)
+
+Create/extend server/db/schema/bp.ts:
+
+import { pgTable, uuid, varchar, text, jsonb, timestamp } from "drizzle-orm/pg-core";
+
+export const businessProcesses = pgTable("business_processes", {
+  id: uuid("id").primaryKey().notNull(),
+  projectId: uuid("project_id").notNull().index(),
+  areaId: uuid("area_id").notNull().index(),
+  code: varchar("code", { length: 80 }).notNull(),      // e.g., HIRE_EMPLOYEE
+  name: varchar("name", { length: 200 }).notNull(),
+  type: varchar("type", { length: 80 }).notNull(),      // task / approval / sub-process / integration
+  owner: varchar("owner", { length: 120 }),             // person or team
+  status: varchar("status", { length: 24 }).notNull().default("in_scope"), // in_scope / configured / tested / signed_off
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export const businessProcessChanges = pgTable("bp_changes", {
+  id: uuid("id").primaryKey().notNull(),
+  bpId: uuid("bp_id").notNull().index(),
+  changeType: varchar("change_type", { length: 40 }).notNull(), // add|modify|remove
+  description: text("description").notNull(),
+  driver: varchar("driver", { length: 120 }),                    // legal/policy/request/etc
+  configPath: varchar("config_path", { length: 240 }),           // where in WD config
+  impactedSecurity: jsonb("impacted_security").$type<string[]>().default([]),
+  integrationsTouched: jsonb("integrations_touched").$type<string[]>().default([]),
+  testCases: jsonb("test_cases").$type<string[]>().default([]),
+  effectiveDate: timestamp("effective_date"),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export const businessProcessSteps = pgTable("bp_steps", {
+  id: uuid("id").primaryKey().notNull(),
+  bpId: uuid("bp_id").notNull().index(),
+  stepNo: varchar("step_no", { length: 12 }),            // "10.20"
+  stepType: varchar("step_type", { length: 80 }),        // review / approval / task / integration
+  securityGroup: varchar("security_group", { length: 120 }),
+  integration: varchar("integration", { length: 120 }),
+  notes: text("notes"),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+
+If you’re using a bootstrap DDL block for dev, add equivalent CREATE TABLE IF NOT EXISTS for these three.
+
+API endpoints (FastAPI/Flask style—adjust imports to your stack)
+
+List BPs by area: GET /api/areas/:areaKey/bps?projectId=...
+
+Create BP: POST /api/areas/:areaKey/bps
+
+Add BP change: POST /api/bps/:bpId/changes
+
+Example (pseudo-Flask; map to your env):
+
+# server/routers/bp.py
+from flask import Blueprint, request, jsonify
+from db import pg  # your query helper
+
+bp = Blueprint("bp", __name__)
+
+@bp.get("/api/areas/<area_key>/bps")
+def list_bps(area_key):
+    project_id = request.args.get("projectId") or request.args.get("project_id")
+    if not project_id:
+        return jsonify({"ok": False, "error": "projectId required"}), 400
+    area = pg.one("select id from areas where project_id=%s and key=%s limit 1", (project_id, area_key))
+    if not area:
+        return jsonify({"ok": True, "items": []})
+    rows = pg.query("""
+        select id, code, name, type, owner, status, created_at
+        from business_processes
+        where project_id=%s and area_id=%s
+        order by name asc
+    """, (project_id, area["id"]))
+    return jsonify({"ok": True, "items": rows})
+
+@bp.post("/api/areas/<area_key>/bps")
+def create_bp(area_key):
+    data = request.get_json() or {}
+    project_id = data.get("projectId")
+    if not project_id:
+        return jsonify({"ok": False, "error": "projectId required"}), 400
+    area = pg.one("select id from areas where project_id=%s and key=%s limit 1", (project_id, area_key))
+    if not area:
+        return jsonify({"ok": False, "error": "area not found"}), 404
+    pg.exec("""
+      insert into business_processes (id, project_id, area_id, code, name, type, owner, status)
+      values (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s)
+    """, (project_id, area["id"], data["code"], data["name"], data.get("type","task"),
+          data.get("owner"), data.get("status","in_scope")))
+    return jsonify({"ok": True})
+
+@bp.post("/api/bps/<bp_id>/changes")
+def add_bp_change(bp_id):
+    data = request.get_json() or {}
+    pg.exec("""
+      insert into bp_changes (id, bp_id, change_type, description, driver, config_path,
+                              impacted_security, integrations_touched, test_cases, effective_date)
+      values (gen_random_uuid(), %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s)
+    """, (bp_id, data.get("changeType","modify"), data.get("description",""),
+          data.get("driver"), data.get("configPath"),
+          json.dumps(data.get("impactedSecurity",[])),
+          json.dumps(data.get("integrationsTouched",[])),
+          json.dumps(data.get("testCases",[])),
+          data.get("effectiveDate")))
+    return jsonify({"ok": True})
+
+
+Mount the router (e.g., in server/main.py).
+
+UI: add “Business Processes” tab to WorkstreamArea
+
+In WorkstreamArea.tsx, add a new tab and a small table.
+
+const [tab, setTab] = useState<"overview"|"actions"|"bps">("overview");
+
+// Tab buttons
+<TabBar>
+  <Tab active={tab==="overview"} onClick={()=>setTab("overview")}>Overview</Tab>
+  <Tab active={tab==="actions"} onClick={()=>setTab("actions")}>Actions</Tab>
+  <Tab active={tab==="bps"} onClick={()=>setTab("bps")}>Business Processes</Tab>
+</TabBar>
+
+{tab==="bps" && <BusinessProcessesPanel areaKey={areaKey} projectId={projectId} />}
+
+
+New component:
+
+function BusinessProcessesPanel({ areaKey, projectId }: { areaKey: string; projectId: string }) {
+  const { data, isLoading } = useQuery(
+    ["bps", projectId, areaKey],
+    () => fetch(`/api/areas/${areaKey}/bps?projectId=${projectId}`).then(r=>r.json()),
+    { staleTime: 30_000 }
+  );
+
+  if (isLoading) return <div className="card p-4">Loading BPs…</div>;
+  const items = data?.items ?? [];
+
+  return (
+    <div className="card p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="card__title">Business Processes</h3>
+        <button className="k-btn k-btn--primary" onClick={() => openCreateBP()}>Add BP</button>
+      </div>
+      <div className="overflow-auto">
+        <table className="min-w-full text-sm">
+          <thead>
+            <tr className="text-text-muted">
+              <th className="text-left py-2">Code</th>
+              <th className="text-left py-2">Name</th>
+              <th className="text-left py-2">Type</th>
+              <th className="text-left py-2">Owner</th>
+              <th className="text-left py-2">Status</th>
+              <th className="text-left py-2">Changes</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((bp:any)=>(
+              <tr key={bp.id} className="border-t border-border">
+                <td className="py-2">{bp.code}</td>
+                <td className="py-2">{bp.name}</td>
+                <td className="py-2">{bp.type}</td>
+                <td className="py-2">{bp.owner || "—"}</td>
+                <td className="py-2">
+                  <span className="k-pill k-pill--gold">{bp.status}</span>
+                </td>
+                <td className="py-2">
+                  <button className="k-btn" onClick={()=> openBPChanges(bp.id)}>Log change</button>
+                </td>
+              </tr>
+            ))}
+            {items.length===0 && <tr><td colSpan={6} className="py-4 text-text-muted">No BPs yet.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+
+(Hook up openCreateBP() / openBPChanges() to simple drawers or modals that POST to the endpoints above.)
+
+Seeder: create one BP + one change so UI isn’t empty
+
+In your seedMinimal:
+
+const bpHcm = uuid();
+await tx.insert(businessProcesses).values([{
+  id: bpHcm, projectId, areaId: ids.areaHcm, code: "HIRE_EMPLOYEE",
+  name: "Hire Employee", type: "sub-process", owner: "HR Ops", status: "in_scope", createdAt: now
+}]);
+
+await tx.insert(businessProcessChanges).values([{
+  id: uuid(), bpId: bpHcm, changeType: "modify",
+  description: "Added background check approval step for US hires",
+  driver: "Policy update",
+  configPath: "HCM > Staffing > Hire Employee",
+  impactedSecurity: ["HR Partner", "Recruiter"],
+  integrationsTouched: ["Onboarding_ServiceNow"],
+  testCases: ["TC-HIRE-001","TC-HIRE-002"],
+  effectiveDate: now
+}]);
+
+TL;DR
+
+Crash fix: replace all org?.orgId with a defined orgId variable; update hook deps and query keys accordingly. That removes the runtime error immediately.
+
+BP feature: add 3 small tables + 3 endpoints + a simple UI tab. Seed one BP & change so it’s instantly usable.

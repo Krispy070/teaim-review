@@ -1,0 +1,197 @@
+Quick Fix: Do these two checks first
+
+Sign in (top right shows “Sign in” in your screenshot).
+Log in with your staging Admin/PM account, then re-run Seed & Run (at /projects/:projectId/admin/test).
+
+If it turns green: you were blocked by auth. Done. ✅
+
+If it still shows inserted: 0 → your staging DB is missing the minimum tables. Run the one-time bootstrap SQL below in Supabase Studio → SQL editor for your staging project, then re-run Seed & Run.
+
+One-time DB Bootstrap (minimal schema for the Test Runner)
+
+Copy this into Supabase Studio → SQL, run once. It creates just the tables/columns the Test Runner touches. It’s permissive (no RLS). You can harden RLS later.
+
+-- Enable uuid generator
+create extension if not exists pgcrypto;
+
+-- Key-value ops
+create table if not exists ops_kv (
+  key text primary key,
+  val jsonb
+);
+
+-- Comms queue & log (for scheduled nudges, reminders)
+create table if not exists comms_queue (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid,
+  project_id uuid,
+  kind text,
+  to_token text,
+  to_email text,
+  not_before timestamptz,
+  sent_at timestamptz,
+  details jsonb,
+  attempts int default 0,
+  next_try timestamptz,
+  last_error text
+);
+
+create table if not exists comms_send_log (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid,
+  project_id uuid,
+  kind text,
+  to_email text,
+  details jsonb,
+  created_at timestamptz default now()
+);
+
+-- Area prefs & meta & admins & presence
+create table if not exists area_prefs (
+  org_id uuid, project_id uuid, user_id uuid, area text, key text, val text,
+  primary key (org_id, project_id, user_id, area, key)
+);
+
+create table if not exists user_prefs (
+  user_id uuid, project_id uuid, key text, scope text, val text,
+  primary key (user_id, project_id, key, scope)
+);
+
+create table if not exists area_meta (
+  org_id uuid, project_id uuid, area text, next_meeting timestamptz,
+  primary key (org_id, project_id, area)
+);
+
+create table if not exists area_admins (
+  org_id uuid, project_id uuid, area text, user_id text,
+  primary key (org_id, project_id, area, user_id)
+);
+
+create table if not exists area_presence (
+  org_id uuid, project_id uuid, user_id text, area text, last_seen timestamptz default now(),
+  primary key (org_id, project_id, user_id, area)
+);
+
+-- Core PM tables used by tests
+create table if not exists area_comments (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid, project_id uuid, area text, user_id text,
+  message text,
+  parent_id uuid,
+  created_at timestamptz default now()
+);
+
+create table if not exists actions (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid, project_id uuid,
+  title text, owner text, area text, status text,
+  created_at timestamptz default now()
+);
+
+create table if not exists risks (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid, project_id uuid,
+  title text, owner text, area text, status text,
+  created_at timestamptz default now()
+);
+
+create table if not exists decisions (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid, project_id uuid,
+  title text, decided_by text, area text, status text,
+  created_at timestamptz default now()
+);
+
+create table if not exists audit_events (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid, project_id uuid,
+  actor_id text, kind text, details jsonb,
+  created_at timestamptz default now()
+);
+
+-- Data & Reporting
+create table if not exists workbooks (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid, project_id uuid, name text, area text,
+  intro_date date, start_date date, asof_date date, due_date date,
+  iterations_planned int, iterations_done int, status text, notes text
+);
+
+create table if not exists workbook_runs (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid, project_id uuid, workbook_id uuid,
+  run_no int, pulled_on date, rows int, status text,
+  created_at timestamptz default now()
+);
+
+create table if not exists reports (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid, project_id uuid,
+  name text, legacy_system text, owner text, frequency text, due_date date,
+  status text, wd_type text, wd_report_name text, design_doc_url text, sample_url text, notes text
+);
+
+-- Guides (training/how-to)
+create table if not exists guides (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid, project_id uuid, area text, owner text,
+  title text, status text,
+  tags jsonb, steps jsonb, sources jsonb,
+  updated_at timestamptz
+);
+
+-- Changes (CRs)
+create table if not exists changes (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid, project_id uuid,
+  title text, area text, description text,
+  priority text, risk text, status text,
+  assignee text, due_date date,
+  watchers jsonb,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+-- Releases
+create table if not exists releases (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid, project_id uuid,
+  name text, window_start timestamptz, window_end timestamptz,
+  notes text, cr_ids jsonb
+);
+
+-- Signoff (tokens/docs minimal)
+create table if not exists signoff_doc_tokens (
+  token text primary key,
+  org_id uuid, project_id uuid, doc_id uuid,
+  signer_email text,
+  created_at timestamptz default now(),
+  expires_at timestamptz,
+  used_at timestamptz,
+  revoked_at timestamptz
+);
+
+create table if not exists signoff_docs (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid, project_id uuid, stage_id uuid,
+  name text, status text,
+  signed_by text, signed_name text, signed_at timestamptz,
+  created_at timestamptz default now()
+);
+
+-- Optional: org comms settings (timezone for digests/nudges)
+create table if not exists org_comms_settings (
+  org_id uuid primary key,
+  timezone text
+);
+
+
+After this, reload the app and click Seed & Run again. You should see green checks for most or all tests.
+
+If anything still fails, tell me which test is red and the small JSON under the log—we’ll pinpoint it fast.
+
+Why this happened (so you trust the fix)
+
+Your Seed endpoint intentionally “swallows” insert errors and continues (so staging won’t crash). That’s why you saw ok:true but all counts were zero.
+
+Once you sign in (so writes are authorized) and the tables exist, the seed inserts rows and the downstream tests (metrics, exports, ICS, notifications) have data to operate on.

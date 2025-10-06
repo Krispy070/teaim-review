@@ -1,0 +1,229 @@
+Let’s land a shell-level UX fix that you’ll see immediately:
+
+Fixed/sticky shell: header stays put, only the sidebar scrolls and the content has its own scroll (no “nav longer than page” feel)
+
+Navigation ordering cleaned up (sensible IA; still complete)
+
+Logos visible in the header (customer left, implementor/vendor right), plus live previews on the Branding page
+
+“Scroll to top on route change” so content always anchors to the top when you navigate
+
+Below is Next Big Build v2.7 — Shell & Branding Polish (copy/paste). It’s safe, Brand v2–aware, and doesn’t rip out any of your working screens.
+
+1) Global layout fixes (header sticky, sidebar scroll, content scroll)
+1A) Root height + scroll behavior
+
+client/src/index.css (append)
+
+html, body, #root { height: 100%; }
+.app-shell { height: 100%; display: flex; flex-direction: column; }
+.app-shell-header { position: sticky; top: 0; z-index: 50; }
+.app-shell-main { flex: 1; display: flex; min-height: 0; }
+.app-shell-sidebar { width: 240px; border-right: 1px solid rgba(255,255,255,.08); overflow-y: auto; }
+.app-shell-content { flex: 1; overflow-y: auto; padding: 12px; }
+
+
+This guarantees the header is sticky; the left nav has its own scroll; main content has its own scroll.
+
+1B) Small shell component to keep things tidy
+
+client/src/components/AppShell.tsx (new)
+
+import BrandedHeader from "@/components/BrandedHeader";
+import SidebarV2 from "@/components/SidebarV2";
+import { isBrandV2 } from "@/lib/brand";
+
+export default function AppShell({ sidebar, children }:{ sidebar?:React.ReactNode; children:React.ReactNode }){
+  const brand = isBrandV2();
+  return (
+    <div className={brand ? "app-shell brand-v2" : "app-shell"}>
+      <div className="app-shell-header">{brand && <BrandedHeader />}</div>
+      <div className="app-shell-main">
+        <div className="app-shell-sidebar">{brand ? (sidebar || <SidebarV2 />) : (sidebar || null)}</div>
+        <div className="app-shell-content">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+1C) Scroll-to-top on route change
+
+client/src/components/ScrollToTop.tsx (new)
+
+import { useEffect } from "react";
+import { useLocation } from "react-router-dom";
+
+export default function ScrollToTop(){
+  const { pathname } = useLocation();
+  useEffect(()=>{ try{ document.querySelector(".app-shell-content")?.scrollTo({top:0}); }catch{} },[pathname]);
+  return null;
+}
+
+2) Wire the shell once
+
+client/src/App.jsx (minimal patch)
+
+Import the shell and scroller:
+
+import AppShell from "@/components/AppShell";
+import ScrollToTop from "@/components/ScrollToTop";
+
+
+Wrap your routes inside the shell:
+
+function AppContent(){
+  // ... your existing context/role/brand logic ...
+  return (
+    <AppShell>
+      <ScrollToTop />
+      <Routes>
+        {/* your existing Routes (with ProjectGuard wrapping your project-scoped layout as you set up) */}
+      </Routes>
+    </AppShell>
+  );
+}
+
+
+This swaps out the old ad hoc layout so the header is sticky and only the sidebar scrolls. The content area scrolls independently.
+
+3) Logos in header + branding previews (make them obvious)
+3A) Header: show both logos clearly
+
+client/src/components/BrandedHeader.tsx (within the right “TEAIM” block you already have)
+
+Replace the small vendor slot with an obvious pair:
+
+<div className="flex items-center gap-3">
+  {/* Customer (left) */}
+  {b.customer_logo_path
+    ? <img src={`/branding/logo?which=customer${projectId?`&project_id=${projectId}`:""}`} alt="customer" className="h-6" />
+    : (b.customer_name ? <div className="text-sm font-medium">{b.customer_name}</div> : null)}
+  <span className="text-xs text-muted-foreground">•</span>
+  {/* Implementor/Vendor (right) */}
+  {b.vendor_logo_path
+    ? <img src={`/branding/logo?which=vendor${projectId?`&project_id=${projectId}`:""}`} alt="vendor" className="h-6" />
+    : (b.vendor_name ? <div className="text-sm font-medium">{b.vendor_name}</div> : null)}
+  <div className="text-sm font-semibold" style={{color:b.theme_color || "#111111"}}>TEAIM</div>
+</div>
+
+
+Now you’ll always see Customer on the left, Implementor/Vendor on the right, with TEAIM.
+
+3B) Branding page: live preview under each section
+
+client/src/pages/BrandingSettings.tsx (after each upload section; add these lines)
+
+Under Customer card:
+
+<div className="mt-2">
+  <div className="text-xs text-muted-foreground mb-1">Preview</div>
+  {s.customer_logo_path
+    ? <img src={`/branding/logo?which=customer`} alt="customer logo" className="h-8" />
+    : <div className="text-xs text-muted-foreground">No logo uploaded</div>}
+</div>
+
+
+Under Vendor card:
+
+<div className="mt-2">
+  <div className="text-xs text-muted-foreground mb-1">Preview</div>
+  {s.vendor_logo_path
+    ? <img src={`/branding/logo?which=vendor`} alt="vendor logo" className="h-8" />
+    : <div className="text-xs text-muted-foreground">No logo uploaded</div>}
+</div>
+
+
+You’ll see exactly what the header will show, right on the Branding page.
+
+4) Navigation ordering (clearer IA, still complete)
+
+client/src/components/SidebarV2.tsx — reorder groups logically and keep everything. Here’s the refined order (replace file if easiest):
+
+// same imports as before…
+export default function SidebarV2(){
+  const params = useParams();
+  const pid = resolveProjectId(params.projectId, undefined) || getPersistedProjectId();
+  const p = (path:string) => pid ? `/projects/${pid}/${path}` : "/projects/select";
+
+  let canAdmin = true; try { const org = (useOrg && useOrg()) || {} as any; canAdmin = ["owner","admin","pm"].includes(org?.userRole || "admin"); } catch {}
+
+  return (
+    <div className="h-full w-[240px] bg-[var(--brand-bg)] text-white p-3 border-r border-white/10 overflow-auto">
+      <Group title="Overview">
+        <Item to={p("dashboard")} icon={Home} label="Dashboard" />
+        <Item to={p("timeline")} icon={Calendar} label="Timeline" />
+      </Group>
+
+      <Group title="Execution">
+        <Item to={p("documents")} icon={FileText} label="Documents" />
+        <Item to={p("meetings")} icon={Calendar} label="Meeting Summaries" />
+        <Item to={p("actions/kanban")} icon={PenTool} label="Actions Kanban" />
+        <Item to={p("actions/list")} icon={CheckSquare} label="Actions" />
+        <Item to={p("stages")} icon={ShieldCheck} label="Stage Sign-Off" />
+        <Item to={p("signoff/compose")} icon={FileCog} label="Compose Sign-Off Package" />
+        <Item to={p("integrations")} icon={Wrench} label="Integrations & Tech" />
+        <Item to={p("reporting")} icon={Database} label="Data & Reporting" />
+      </Group>
+
+      <Group title="Planning">
+        <Item to={p("stages/manage")} icon={Calendar} label="Stages" />
+        <Item to={p("stages/wizard")} icon={Box} label="Stage Wizard" />
+        <Item to={p("workstreams")} icon={Workflow} label="Workstreams" />
+        <Item to={p("training")} icon={ClipboardList} label="Training" />
+        <Item to={p("testing")} icon={FlaskConical} label="Testing" />
+        <Item to={p("logistics")} icon={Bus} label="Logistics" />
+      </Group>
+
+      <Group title="Governance">
+        <Item to={p("updates/review")} icon={Bell} label="PM Update Monitor" />
+        <Item to={p("signoff/docs")} icon={FileText} label="Sign-Off Docs" />
+        <Item to={p("wellness")} icon={HeartPulse} label="Team Wellness" />
+        <Item to={p("financials")} icon={DollarSign} label="Financials" />
+      </Group>
+
+      <Group title="Insights">
+        <Item to={p("admin/method")} icon={LineChart} label="Method Insights" />
+        <Item to={p("admin/audit-timeline")} icon={Activity} label="Audit Timeline" />
+      </Group>
+
+      {canAdmin && (
+        <Group title="Admin">
+          <Item to={p("admin/projects")} icon={FolderOpen} label="Projects Admin" />
+          <Item to={p("admin/members")} icon={Users} label="Members" />
+          <Item to={p("admin/team-access")} icon={Users} label="Team Management" />
+          <Item to={p("admin/invite")} icon={Users} label="Invite" />
+          <Item to={p("admin/integrations")} icon={Wrench} label="Integrations Tracker" />
+          <Item to={p("admin/backups")} icon={FileText} label="Admin Backups" />
+          <Item to={p("admin/ops")} icon={ServerCog} label="System Health" />
+          <Item to={p("admin/rls-selftest")} icon={ShieldCheck} label="RLS Self-Test" />
+          <Item to={`/admin/schema-doctor`} icon={Cog} label="Schema Doctor" />
+          <Item to={p("admin/qa-tools")} icon={FlaskRound} label="QA Tools" />
+          <Item to={p("admin/smoke-run")} icon={Rocket} label="Smoke Runner" />
+          <Item to={`/projects/new`} icon={FolderOpen} label="New Project" />
+          <Item to={`/admin/branding`} icon={Settings} label="Branding & Logos" />
+          <Item to={p("admin/comms")} icon={Mail} label="Email Center" />
+        </Group>
+      )}
+    </div>
+  );
+}
+
+
+What changed: a cleaner top-down flow: Overview → Execution → Planning → Governance → Insights → Admin. The most used screens are above the fold.
+
+5) (Optional) Cleaner page headings
+
+If any page still “starts mid-scroll”, the ScrollToTop above fixes it. For extra polish, give each page a uniform heading:
+
+// top of each page component
+<div className="text-xl font-semibold heading mb-2">{/* Page Name */}</div>
+
+6) 60-second validation
+
+Header stays put; only the sidebar scrolls; content scrolls independently.
+
+Logos now clearly visible in header; Branding page shows live previews.
+
+Nav order is clear; links work immediately with ProjectGuard.
+
+Navigating to any page starts at top (no “halfway down” surprises).

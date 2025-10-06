@@ -1,0 +1,423 @@
+Here’s a clean FastAPI router for Business Processes (BP) + a drop-in React drawer UI. This matches your current patterns (camelCase projectId, area key routing, user-aware), and won’t collide with existing seed/test infra.
+
+SERVER — FastAPI (copy-paste)
+server/routers/router_bp.py
+# server/routers/router_bp.py
+from fastapi import APIRouter, Query, Path, Body, HTTPException
+from pydantic import BaseModel, Field
+from typing import List, Optional, Any
+from datetime import datetime
+from db import pg  # your query helper that returns dict rows (adjust as needed)
+
+bp_router = APIRouter(prefix="/api", tags=["business_processes"])
+
+# ---------- Schemas ----------
+class BpItem(BaseModel):
+    id: str
+    projectId: str
+    areaId: str
+    code: str
+    name: str
+    type: str
+    owner: Optional[str] = None
+    status: str
+    createdAt: Optional[datetime] = None
+
+class BpCreate(BaseModel):
+    projectId: str = Field(..., description="Project UUID")
+    code: str = Field(..., max_length=80)
+    name: str = Field(..., max_length=200)
+    type: str = Field("task", description="task|approval|sub-process|integration")
+    owner: Optional[str] = None
+    status: str = Field("in_scope")
+
+class BpChange(BaseModel):
+    changeType: str = Field("modify", description="add|modify|remove")
+    description: str
+    driver: Optional[str] = None
+    configPath: Optional[str] = None
+    impactedSecurity: List[str] = []
+    integrationsTouched: List[str] = []
+    testCases: List[str] = []
+    effectiveDate: Optional[datetime] = None
+
+# ---------- Helpers ----------
+def get_area(project_id: str, area_key: str) -> Optional[dict]:
+    return pg.one(
+        "select id from areas where project_id = %s and key = %s limit 1",
+        (project_id, area_key),
+    )
+
+# ---------- Endpoints ----------
+@bp_router.get("/areas/{area_key}/bps")
+def list_bps(
+    area_key: str = Path(..., description="Area key, e.g. HCM"),
+    projectId: str = Query(..., description="Project UUID"),
+):
+    area = get_area(projectId, area_key)
+    if not area:
+        return {"ok": True, "items": []}
+    rows = pg.query(
+        """
+        select id, project_id as "projectId", area_id as "areaId",
+               code, name, type, owner, status, created_at as "createdAt"
+        from business_processes
+        where project_id = %s and area_id = %s
+        order by name asc
+        """,
+        (projectId, area["id"]),
+    )
+    return {"ok": True, "items": rows}
+
+@bp_router.post("/areas/{area_key}/bps")
+def create_bp(
+    area_key: str,
+    payload: BpCreate = Body(...)
+):
+    area = get_area(payload.projectId, area_key)
+    if not area:
+        raise HTTPException(404, detail="area not found")
+
+    pg.exec(
+        """
+        insert into business_processes
+          (id, project_id, area_id, code, name, type, owner, status, created_at)
+        values
+          (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, now())
+        """,
+        (
+            payload.projectId,
+            area["id"],
+            payload.code,
+            payload.name,
+            payload.type,
+            payload.owner,
+            payload.status,
+        ),
+    )
+    return {"ok": True}
+
+@bp_router.get("/bps/{bp_id}/changes")
+def list_bp_changes(bp_id: str):
+    rows = pg.query(
+        """
+        select id, bp_id as "bpId", change_type as "changeType", description, driver,
+               config_path as "configPath",
+               impacted_security as "impactedSecurity",
+               integrations_touched as "integrationsTouched",
+               test_cases as "testCases",
+               effective_date as "effectiveDate",
+               created_at as "createdAt"
+        from bp_changes
+        where bp_id = %s
+        order by created_at desc
+        """,
+        (bp_id,),
+    )
+    return {"ok": True, "items": rows}
+
+@bp_router.post("/bps/{bp_id}/changes")
+def add_bp_change(
+    bp_id: str,
+    payload: BpChange = Body(...)
+):
+    pg.exec(
+        """
+        insert into bp_changes
+          (id, bp_id, change_type, description, driver, config_path,
+           impacted_security, integrations_touched, test_cases, effective_date, created_at)
+        values
+          (gen_random_uuid(), %s, %s, %s, %s, %s,
+           %s::jsonb, %s::jsonb, %s::jsonb, %s, now())
+        """,
+        (
+            bp_id,
+            payload.changeType,
+            payload.description,
+            payload.driver,
+            payload.configPath,
+            pg.json(payload.impactedSecurity),
+            pg.json(payload.integrationsTouched),
+            pg.json(payload.testCases),
+            payload.effectiveDate,
+        ),
+    )
+    return {"ok": True}
+
+Mount it in server/main.py
+# server/main.py
+from fastapi import FastAPI
+# ...
+from routers.router_bp import bp_router
+
+app = FastAPI()
+# ...
+app.include_router(bp_router)
+
+(Optional) Dev bootstrap DDL
+
+Add to your existing bootstrap route or migration (names match our seed plan):
+
+create table if not exists business_processes (
+  id uuid primary key,
+  project_id uuid not null,
+  area_id uuid not null,
+  code varchar(80) not null,
+  name varchar(200) not null,
+  type varchar(80) not null,
+  owner varchar(120),
+  status varchar(24) not null default 'in_scope',
+  created_at timestamp default now()
+);
+create index if not exists idx_bp_proj_area on business_processes(project_id, area_id);
+
+create table if not exists bp_changes (
+  id uuid primary key,
+  bp_id uuid not null,
+  change_type varchar(40) not null,
+  description text not null,
+  driver varchar(120),
+  config_path varchar(240),
+  impacted_security jsonb default '[]'::jsonb,
+  integrations_touched jsonb default '[]'::jsonb,
+  test_cases jsonb default '[]'::jsonb,
+  effective_date timestamp,
+  created_at timestamp default now()
+);
+create index if not exists idx_bp_changes_bpid on bp_changes(bp_id);
+
+create table if not exists bp_steps (
+  id uuid primary key,
+  bp_id uuid not null,
+  step_no varchar(12),
+  step_type varchar(80),
+  security_group varchar(120),
+  integration varchar(120),
+  notes text,
+  created_at timestamp default now()
+);
+
+CLIENT — React drawers (copy-paste)
+Fix the crash first (once)
+
+At the top of WorkstreamArea.tsx:
+
+// derive a safe orgId; remove any org?.orgId uses
+const orgId =
+  project?.orgId ??
+  me?.orgId ??
+  new URLSearchParams(location.search).get("org") ??
+  undefined;
+
+
+Replace every org?.orgId in deps/query keys with orgId.
+
+Add the BP tab and panel
+BusinessProcessesPanel.tsx
+import React, { useState } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+
+export function BusinessProcessesPanel({ areaKey, projectId }: { areaKey: string; projectId: string }) {
+  const qc = useQueryClient();
+  const [showCreate, setShowCreate] = useState(false);
+  const [bpForChange, setBpForChange] = useState<any>(null);
+
+  const { data, isLoading } = useQuery(
+    ["bps", projectId, areaKey],
+    () => fetch(`/api/areas/${areaKey}/bps?projectId=${projectId}`).then(r => r.json()),
+    { staleTime: 30_000 }
+  );
+
+  const items = data?.items ?? [];
+  if (isLoading) return <div className="card p-4">Loading BPs…</div>;
+
+  return (
+    <div className="card p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="card__title">Business Processes</h3>
+        <button className="k-btn k-btn--primary" onClick={() => setShowCreate(true)}>Add BP</button>
+      </div>
+
+      <div className="overflow-auto">
+        <table className="min-w-full text-sm">
+          <thead className="text-text-muted">
+            <tr><th className="text-left py-2">Code</th><th className="text-left py-2">Name</th><th className="text-left py-2">Type</th><th className="text-left py-2">Owner</th><th className="text-left py-2">Status</th><th className="text-left py-2">Actions</th></tr>
+          </thead>
+          <tbody>
+            {items.map((bp:any)=>(
+              <tr key={bp.id} className="border-t border-border">
+                <td className="py-2">{bp.code}</td>
+                <td className="py-2">{bp.name}</td>
+                <td className="py-2">{bp.type}</td>
+                <td className="py-2">{bp.owner || "—"}</td>
+                <td className="py-2"><span className="k-pill k-pill--gold">{bp.status}</span></td>
+                <td className="py-2">
+                  <button className="k-btn" onClick={() => setBpForChange(bp)}>Log change</button>
+                </td>
+              </tr>
+            ))}
+            {items.length===0 && <tr><td colSpan={6} className="py-4 text-text-muted">No BPs yet.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+
+      {showCreate && (
+        <CreateBPDrawer
+          areaKey={areaKey}
+          projectId={projectId}
+          onClose={() => setShowCreate(false)}
+          onSaved={() => { qc.invalidateQueries(["bps", projectId, areaKey]); setShowCreate(false); }}
+        />
+      )}
+
+      {bpForChange && (
+        <LogBPChangeDrawer
+          bp={bpForChange}
+          onClose={() => setBpForChange(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+CreateBPDrawer.tsx
+function Field({label, children}:{label:string;children:any}) {
+  return <label className="flex flex-col gap-1 mb-3"><span className="text-sm text-text-muted">{label}</span>{children}</label>;
+}
+
+export function CreateBPDrawer({ areaKey, projectId, onClose, onSaved }:{
+  areaKey:string; projectId:string; onClose:()=>void; onSaved:()=>void;
+}) {
+  const [form, setForm] = React.useState({ code:"", name:"", type:"task", owner:"", status:"in_scope" });
+  const save = async () => {
+    const res = await fetch(`/api/areas/${areaKey}/bps`, {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ projectId, ...form })
+    });
+    if (!res.ok) return alert("Failed to save BP");
+    onSaved();
+  };
+  return (
+    <div className="fixed inset-0 bg-black/40 grid place-items-center z-50">
+      <div className="card p-4 w-[520px]">
+        <h3 className="card__title mb-2">Add Business Process</h3>
+        <Field label="Code"><input className="k-input" value={form.code} onChange={e=>setForm({...form, code:e.target.value})}/></Field>
+        <Field label="Name"><input className="k-input" value={form.name} onChange={e=>setForm({...form, name:e.target.value})}/></Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Type">
+            <select className="k-input" value={form.type} onChange={e=>setForm({...form, type:e.target.value})}>
+              <option>task</option><option>approval</option><option>sub-process</option><option>integration</option>
+            </select>
+          </Field>
+          <Field label="Owner"><input className="k-input" value={form.owner} onChange={e=>setForm({...form, owner:e.target.value})}/></Field>
+        </div>
+        <Field label="Status">
+          <select className="k-input" value={form.status} onChange={e=>setForm({...form, status:e.target.value})}>
+            <option>in_scope</option><option>configured</option><option>tested</option><option>signed_off</option>
+          </select>
+        </Field>
+        <div className="flex justify-end gap-2">
+          <button className="k-btn" onClick={onClose}>Cancel</button>
+          <button className="k-btn k-btn--primary" onClick={save}>Save</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+LogBPChangeDrawer.tsx
+export function LogBPChangeDrawer({ bp, onClose }:{ bp:any; onClose:()=>void }) {
+  const [form, setForm] = React.useState({
+    changeType:"modify",
+    description:"",
+    driver:"",
+    configPath:"",
+    impactedSecurity:"",
+    integrationsTouched:"",
+    testCases:""
+  });
+  const save = async () => {
+    const payload = {
+      changeType: form.changeType,
+      description: form.description,
+      driver: form.driver || undefined,
+      configPath: form.configPath || undefined,
+      impactedSecurity: form.impactedSecurity ? form.impactedSecurity.split(",").map(s=>s.trim()) : [],
+      integrationsTouched: form.integrationsTouched ? form.integrationsTouched.split(",").map(s=>s.trim()) : [],
+      testCases: form.testCases ? form.testCases.split(",").map(s=>s.trim()) : [],
+    };
+    const res = await fetch(`/api/bps/${bp.id}/changes`, { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(payload) });
+    if (!res.ok) return alert("Failed to save change");
+    onClose();
+  };
+  return (
+    <div className="fixed inset-0 bg-black/40 grid place-items-center z-50">
+      <div className="card p-4 w-[620px]">
+        <h3 className="card__title mb-2">Log Change — {bp.code}</h3>
+        <div className="grid grid-cols-2 gap-3">
+          <label className="flex flex-col gap-1"><span className="text-sm text-text-muted">Change Type</span>
+            <select className="k-input" value={form.changeType} onChange={e=>setForm({...form, changeType:e.target.value})}>
+              <option>add</option><option>modify</option><option>remove</option>
+            </select>
+          </label>
+          <label className="flex flex-col gap-1"><span className="text-sm text-text-muted">Driver</span>
+            <input className="k-input" value={form.driver} onChange={e=>setForm({...form, driver:e.target.value})}/>
+          </label>
+        </div>
+        <label className="flex flex-col gap-1 my-2"><span className="text-sm text-text-muted">Description</span>
+          <textarea className="k-input" rows={4} value={form.description} onChange={e=>setForm({...form, description:e.target.value})}/>
+        </label>
+        <label className="flex flex-col gap-1"><span className="text-sm text-text-muted">Config Path</span>
+          <input className="k-input" value={form.configPath} onChange={e=>setForm({...form, configPath:e.target.value})}/>
+        </label>
+        <div className="grid grid-cols-3 gap-3 my-2">
+          <label className="flex flex-col gap-1"><span className="text-sm text-text-muted">Impacted Security (comma)</span>
+            <input className="k-input" value={form.impactedSecurity} onChange={e=>setForm({...form, impactedSecurity:e.target.value})}/>
+          </label>
+          <label className="flex flex-col gap-1"><span className="text-sm text-text-muted">Integrations (comma)</span>
+            <input className="k-input" value={form.integrationsTouched} onChange={e=>setForm({...form, integrationsTouched:e.target.value})}/>
+          </label>
+          <label className="flex flex-col gap-1"><span className="text-sm text-text-muted">Test Cases (comma)</span>
+            <input className="k-input" value={form.testCases} onChange={e=>setForm({...form, testCases:e.target.value})}/>
+          </label>
+        </div>
+        <div className="flex justify-end gap-2">
+          <button className="k-btn" onClick={onClose}>Cancel</button>
+          <button className="k-btn k-btn--primary" onClick={save}>Save</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+Wire it in WorkstreamArea.tsx
+
+Add a new tab and render:
+
+import { BusinessProcessesPanel } from "@/components/BusinessProcessesPanel";
+
+{/* tabs */}
+<Tab active={tab==="bps"} onClick={()=>setTab("bps")}>Business Processes</Tab>
+
+{/* panel */}
+{tab==="bps" && <BusinessProcessesPanel areaKey={areaKey} projectId={projectId} />}
+
+Seeding (one BP + one change)
+
+In your seedMinimal (Drizzle/SQL—keep your current style), insert:
+
+business_processes row for HCM (HIRE_EMPLOYEE)
+
+bp_changes row (“Added background check approval step”)
+
+That way the BP tab isn’t empty and you can demo immediately.
+
+What this gives you
+
+Crash resolved (org is not defined → safe orgId).
+
+First-class BP tracking per functional area (list/create + log changes).
+
+UI drawers with clean, enterprise styling matching your brand tokens.
+
+Endpoints aligned to camelCase projectId and your area key model.

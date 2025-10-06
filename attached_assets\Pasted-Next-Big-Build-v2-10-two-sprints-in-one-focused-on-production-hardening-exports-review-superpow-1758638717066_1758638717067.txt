@@ -1,0 +1,305 @@
+Next Big Build v2.10 (two sprints in one), focused on production hardening + exports/review superpowers. All snippets are copy-paste ready, Brand v2–aware, dev-safe, and won’t break your current flows.
+
+v2.10.1 — Production auth + Comms controls + Digest polish
+1) Supabase Auth (prod) — login page + context
+1A) Frontend: supabase client + login page
+
+client/src/lib/supabase.ts (new)
+
+import { createClient } from "@supabase/supabase-js";
+export const supa = createClient(
+  import.meta.env.VITE_SUPABASE_URL!,
+  import.meta.env.VITE_SUPABASE_ANON_KEY!,
+  { auth: { persistSession: true, autoRefreshToken: true } }
+);
+
+
+client/src/pages/Login.tsx (new)
+
+import { useState } from "react";
+import { supa } from "@/lib/supabase";
+
+export default function Login(){
+  const [email,setEmail]=useState(""); const [sent,setSent]=useState(false);
+  async function send(){
+    const { error } = await supa.auth.signInWithOtp({ email });
+    if (error) alert(error.message); else setSent(true);
+  }
+  return (
+    <div className="p-6 max-w-md mx-auto space-y-3">
+      <h1 className="text-xl font-semibold">Sign in</h1>
+      {!sent ? (
+        <>
+          <input className="border rounded p-2 w-full" placeholder="you@company.com"
+                 value={email} onChange={e=>setEmail(e.target.value)} />
+          <button className="brand-btn" onClick={send}>Send magic link</button>
+        </>
+      ): <div>Check your email for a sign-in link.</div>}
+    </div>
+  );
+}
+
+
+client/src/App.jsx — add route:
+
+import Login from "@/pages/Login";
+// ...
+<Route path="/login" element={<Login/>} />
+
+
+Frontend will automatically send the Supabase JWT as Authorization: Bearer via your existing authFetch (it already picks JWT when present). Dev mode (X-Dev headers) keeps working.
+
+1B) Header: show sign-in / sign-out
+
+Patch client/src/components/BrandedHeader.tsx
+
+import { supa } from "@/lib/supabase";
+// ...
+<button className="brand-btn text-xs" onClick={async ()=>{
+  const s = await supa.auth.getUser();
+  if (s.data.user) await supa.auth.signOut(), location.href="/login";
+  else location.href="/login";
+}}>
+  { (await supa.auth.getUser()).data.user ? "Sign out" : "Sign in" }
+</button>
+
+
+(If build complains about top-level await, change to local state/useEffect — the intent is clear.)
+
+Env required (Replit secrets):
+VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY, and on the backend SUPABASE_JWT_SECRET (already used by your get_user_supabase).
+
+2) Comms Quiet Hours + Daily Caps (send_guard)
+2A) DB add columns
+
+Run in Supabase SQL:
+
+alter table public.org_comms_settings
+  add column if not exists quiet_hours_start time,
+  add column if not exists quiet_hours_end time,
+  add column if not exists timezone text default 'UTC',
+  add column if not exists daily_cap integer default 500;
+select pg_notify('pgrst','reload schema');
+
+2B) Backend: enforce in send_guard
+
+Patch server/email/util.py (add inside send_guard(sb, org_id, project_id, kind, to_email) before sending)
+
+import pytz, datetime as dt
+# fetch org settings
+s = sb.table("org_comms_settings").select("quiet_hours_start,quiet_hours_end,timezone,daily_cap")\
+     .eq("org_id", org_id).single().execute().data or {}
+tz = pytz.timezone(s.get("timezone") or "UTC")
+now_local = dt.datetime.now(tz)
+qs, qe = s.get("quiet_hours_start"), s.get("quiet_hours_end")
+if qs and qe:
+    t = now_local.time()
+    within = (qs <= t <= qe) if qs <= qe else (t >= qs or t <= qe)  # spans midnight
+    if within:
+        return False, f"Quiet hours ({qs}–{qe} {tz})"
+
+# daily cap by org/kind
+start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+count = sb.table("comms_send_log").select("id", count="exact")\
+         .eq("org_id", org_id).eq("kind", kind)\
+         .gte("created_at", start.isoformat()).execute().count or 0
+cap = int(s.get("daily_cap") or 500)
+if count >= cap:
+    return False, f"Daily cap reached ({cap})"
+
+
+(Your callers already handle the (ok, reason) pattern.)
+
+3) Digest polish — stable columns + deep links
+
+Patch server/routers/digest.py (where HTML is constructed)
+
+Replace plain counts with chips + links:
+
+def chip(label, n, path):
+    base = os.getenv("APP_BASE_URL","").rstrip("/")
+    url = f"{base}/projects/{project_id}/{path}"
+    return f"<a href='{url}' style='text-decoration:none;border:1px solid #ddd;border-radius:6px;padding:6px 10px;margin-right:6px;color:#111'>{label}: <b>{n}</b></a>"
+
+html = export_header_html(org, code)
+html += "<h2>Weekly Digest</h2><div>"
+if "actions" in wanted:   html += chip("Actions", counts.get("actions",0), "actions/list")
+if "risks" in wanted:     html += chip("Risks",   counts.get("risks",0),   "admin/audit-timeline")
+if "decisions" in wanted: html += chip("Decisions", counts.get("decisions",0), "admin/audit-timeline")
+html += "</div>"
+
+v2.10.2 — Exports streaming + Review inline edit + Meetings export
+4) Streaming Data Room + memory toggle
+
+Patch server/routers/export_dataroom.py (replace function)
+
+@router.get("/dataroom.zip")
+def dataroom(project_id: str = Query(...), include_mem: bool = False, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx); sbs = get_service_supabase()
+    proj = sb.table("projects").select("code").eq("id", project_id).single().execute().data or {}
+    code = proj.get("code") or project_id
+    org = sb.table("org_branding").select("*").eq("org_id", ctx.org_id).single().execute().data or {}
+
+    def gen():
+        import json, zipstream  # pip install zipstream-new (if not present, fallback below)
+        z = zipstream.ZipFile(mode='w', compression=zipstream.ZIP_DEFLATED)
+        # metadata
+        arts = sb.table("artifacts").select("id,name,storage_bucket,storage_path,created_at")\
+                .eq("org_id", ctx.org_id).eq("project_id", project_id).limit(5000).execute().data or []
+        links = sb.table("share_links").select("artifact_id,token,expires_at,revoked_at,created_at")\
+                .eq("org_id", ctx.org_id).eq("project_id", project_id).limit(5000).execute().data or []
+        docs = sb.table("signoff_docs").select("id,name,status,signed_by,signed_name,signed_at,created_at")\
+                .eq("org_id", ctx.org_id).eq("project_id", project_id).limit(2000).execute().data or []
+
+        manifest = {
+          "org_id": ctx.org_id, "project_id": project_id, "project_code": code,
+          "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+          "counts": {"artifacts": len(arts), "links": len(links), "signoff_docs": len(docs)}
+        }
+        hdr = export_header_html(org, code)
+        html_manifest = f"<html><body>{hdr}<h2>Data Room Manifest</h2><pre>{json.dumps(manifest, indent=2)}</pre></body></html>"
+
+        z.write_iter("manifest.json", iter([json.dumps(manifest)]))
+        z.write_iter("manifest.html", iter([html_manifest]))
+
+        if include_mem:
+            try:
+                mem = sb.table("mem_signals").select("*").eq("org_id", ctx.org_id).eq("project_id", project_id).limit(5000).execute().data or []
+                z.write_iter("memory.json", iter([json.dumps(mem)]))
+            except Exception: z.write_iter("memory.json", iter(["[]"]))
+
+        # add artifacts best-effort
+        for a in arts[:1000]:
+            try:
+                b = sbs.storage().from_(a["storage_bucket"]).download(a["storage_path"])
+                z.write_iter(f"artifacts/{a.get('name') or a['id']}", iter([b]))
+            except Exception as e:
+                z.write_iter(f"artifacts/_missing_{a['id']}.txt", iter([str(e)]))
+
+        yield from z
+    try:
+        return StreamingResponse(gen(), media_type="application/zip",
+            headers={"Content-Disposition": 'attachment; filename="dataroom.zip"'})
+    except Exception:
+        # fallback to previous non-streaming if zipstream not available
+        return old_dataroom_impl(project_id, ctx)
+
+
+Dev-safe: if zipstream isn’t available, it falls back to the in-memory version.
+Add a UI checkbox “Include memory” → append &include_mem=1.
+
+5) Review Queue — inline edit for core types
+
+Patch client/src/pages/UpdatesReview.tsx
+Add a lightweight inline form for actions|risks|decisions:
+
+function InlineEdit({u}:{u:any}){
+  const [title,setTitle]=useState(u.payload?.title||"");
+  const [owner,setOwner]=useState(u.payload?.owner||"");
+  const [status,setStatus]=useState(u.payload?.status||"");
+  const [area,setArea]=useState(u.payload?.area||"");
+  async function save(){
+    await postJSON(`/api/updates/${u.id}/edit-approve?project_id=${projectId}`, {
+      payload: { ...u.payload, title, owner, status, area }
+    });
+    load();
+  }
+  const t = (u.target_table||u.table||"").toLowerCase();
+  if (!/actions|risks|decisions/.test(t)) return null;
+  return (
+    <div className="brand-card p-2 mt-2">
+      <div className="grid md:grid-cols-4 gap-2">
+        <input className="border rounded p-2" placeholder="Title" value={title} onChange={e=>setTitle(e.target.value)} />
+        <input className="border rounded p-2" placeholder="Owner" value={owner} onChange={e=>setOwner(e.target.value)} />
+        <input className="border rounded p-2" placeholder="Status" value={status} onChange={e=>setStatus(e.target.value)} />
+        <input className="border rounded p-2" placeholder="Area" value={area} onChange={e=>setArea(e.target.value)} />
+      </div>
+      <div className="flex justify-end mt-2 gap-2">
+        <button className="brand-btn text-xs" onClick={save}>Save & Approve</button>
+      </div>
+    </div>
+  );
+}
+
+
+Render under each item row:
+
+{items.map(u=>(
+  <div key={u.id} className="brand-card p-2 mb-2">
+    {/* existing row renderer */}
+    <InlineEdit u={u}/>
+  </div>
+))}
+
+6) Meetings CSV export + filters
+6A) Backend
+
+server/routers/meetings_export_csv.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
+import io, csv
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/meetings", tags=["meetings"])
+
+@router.get("/export.csv")
+def export_csv(project_id: str = Query(...),
+               owner: str | None = None,
+               area: str | None = None,
+               min_conf: float | None = None,
+               ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    cols = ["artifact_id","kind","index","title","owner","area","confidence","created_at"]
+    try:
+        rows = sb.table("summaries_flat").select(",".join(cols))\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id).execute().data or []
+    except Exception:
+        # fallback: if you don't have a flat table, return empty
+        rows = []
+    # filters
+    if owner: rows = [r for r in rows if (r.get("owner") or "").lower()==owner.lower()]
+    if area: rows = [r for r in rows if (r.get("area") or "").lower()==area.lower()]
+    if min_conf is not None:
+        rows = [r for r in rows if (float(r.get("confidence") or 0) >= float(min_conf))]
+    s = io.StringIO(); w = csv.writer(s); w.writerow(cols)
+    for r in rows: w.writerow([r.get(c) for c in cols])
+    s.seek(0)
+    return StreamingResponse(iter([s.read()]), media_type="text/csv",
+      headers={"Content-Disposition": 'attachment; filename="meetings.csv"'})
+
+
+Mount in server/main.py:
+
+from .routers import meetings_export_csv
+app.include_router(meetings_export_csv.router)
+
+6B) UI filter + export button (Meetings page)
+
+Patch client/src/pages/Meetings.tsx:
+
+const [fOwner,setFOwner]=useState(""); const [fArea,setFArea]=useState(""); const [fConf,setFConf]=useState(0.8);
+// ...
+<div className="flex items-center gap-2 mb-2">
+  <input className="border rounded p-1 text-xs" placeholder="Owner (exact)" value={fOwner} onChange={e=>setFOwner(e.target.value)} />
+  <input className="border rounded p-1 text-xs" placeholder="Area (exact)" value={fArea} onChange={e=>setFArea(e.target.value)} />
+  <label className="text-xs">Min conf</label>
+  <input type="number" step={0.01} min={0} max={1} className="border rounded p-1 w-[80px]" value={fConf} onChange={e=>setFConf(parseFloat(e.target.value||"0.8"))}/>
+  <button className="brand-btn text-xs swoosh" onClick={()=>{
+    downloadGET(`/api/meetings/export.csv?project_id=${projectId}${fOwner?`&owner=${encodeURIComponent(fOwner)}`:""}${fArea?`&area=${encodeURIComponent(fArea)}`:""}&min_conf=${fConf}`, "meetings.csv");
+  }}>Export CSV</button>
+</div>
+
+7) 120-second sanity
+
+Sign-off modal shows signer list (area-aware); sends and closes cleanly
+
+Stages Editor: focus, keyboard save (Enter), undo (Esc), unsaved ring clears on save
+
+Digests include “Closed since last week” sections
+
+Data Room can stream + include memory; CSV one-click exports + companions
+
+Route shows top progress bar; Command Palette is keyboard-friendly

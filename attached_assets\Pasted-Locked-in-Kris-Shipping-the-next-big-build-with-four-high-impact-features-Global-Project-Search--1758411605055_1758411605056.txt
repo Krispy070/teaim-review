@@ -1,0 +1,461 @@
+Locked in, Kris. Shipping the next big build with four high-impact features:
+
+Global Project Search (Ctrl/⌘+K) — search artifacts, actions, risks, decisions, and mem entries in one shot
+
+Per-artifact “Re-embed” action in Documents — queues by artifact_id (belt-and-suspenders with your worker)
+
+Admin Health Dashboard — checks envs, buckets, schedulers, queues, mailer, and digest settings
+
+Integrations Tracker — schema + API + UI (status, owner, schedule) to operationalize integrations
+
+Paste-ready patches below. If any file paths differ, toss me the filenames and I’ll refit 1:1.
+
+0) SQL — Integrations & (optional) text index helpers
+
+Run in Supabase SQL:
+
+-- Project integrations (operational tracker)
+create table if not exists public.project_integrations (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid not null,
+  project_id uuid not null,
+  name text not null,
+  transport text,        -- e.g., SFTP, OIDC, API
+  schedule text,         -- freeform 'daily 01:00 UTC'
+  status text not null default 'not_started', -- not_started|in_progress|connected|validated|blocked
+  owner_email text,
+  notes text,
+  last_checked timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists idx_pi_proj on public.project_integrations(project_id);
+alter table public.project_integrations enable row level security;
+
+create policy "pi_select_member" on public.project_integrations for select
+  using (org_id = public.current_org() and public.is_member(org_id, project_id));
+
+create policy "pi_upsert_pmplus" on public.project_integrations for insert
+  with check (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm','lead']));
+create policy "pi_update_pmplus" on public.project_integrations for update
+  using (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm','lead']))
+  with check (org_id = public.current_org());
+
+-- (Optional) light trig for updated_at
+create or replace function public.touch_updated_at() returns trigger as $$
+begin new.updated_at = now(); return new; end;
+$$ language plpgsql;
+
+drop trigger if exists trg_pi_updated on public.project_integrations;
+create trigger trg_pi_updated before update on public.project_integrations
+for each row execute function public.touch_updated_at();
+
+-- Refresh PostgREST
+select pg_notify('pgrst','reload schema');
+
+1) Backend — Global Search, Admin Health, Integrations API
+1A) Global search endpoint
+
+server/routers/search.py
+
+from fastapi import APIRouter, Depends, Query
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/search", tags=["search"])
+
+@router.get("")
+def search(q: str = Query(..., min_length=2, max_length=80),
+           project_id: str = Query(...),
+           limit: int = 12,
+           ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    qlike = f"%{q}%"
+
+    results = []
+
+    # Artifacts (names only to keep it cheap)
+    arts = sb.table("artifacts").select("id,name,created_at")\
+        .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+        .ilike("name", qlike).limit(limit).execute().data or []
+    results += [{"type":"artifact","id":a["id"],"title":a["name"],"snippet":"","ts":a["created_at"]} for a in arts]
+
+    # Actions / Risks / Decisions (generic table names assumed)
+    def pull(table, tname):
+        r = sb.table(table).select("id,title,created_at")\
+            .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+            .or_(f"title.ilike.{qlike},body.ilike.{qlike}")\
+            .limit(limit).execute().data or []
+        return [{"type":tname,"id":x["id"],"title":x.get("title") or tname.capitalize(), "snippet":"", "ts":x["created_at"]} for x in r]
+    try:
+        results += pull("actions","action")
+    except Exception: ...
+    try:
+        results += pull("risks","risk")
+    except Exception: ...
+    try:
+        results += pull("decisions","decision")
+    except Exception: ...
+
+    # Memories (timeline/decision/procedural…)
+    try:
+        mems = sb.table("mem_entries").select("id,kind,created_at,body")\
+            .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+            .limit(limit).execute().data or []
+        for m in mems:
+            body = m.get("body")
+            text = body if isinstance(body, str) else (body and str(body)) or ""
+            if q.lower() in text.lower():
+                results.append({"type":f"mem:{m['kind']}", "id":m["id"], "title":m["kind"], "snippet":"", "ts":m["created_at"]})
+    except Exception: ...
+
+    # simple rank: newest first, trim
+    results = sorted(results, key=lambda x: x["ts"], reverse=True)[:limit]
+    return {"items": results}
+
+
+Mount in server/main.py:
+
+from .routers import search
+app.include_router(search.router)
+
+1B) Admin Health endpoint
+
+server/routers/admin_health.py
+
+from fastapi import APIRouter, Depends
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase, get_service_supabase
+import os, datetime as dt
+
+router = APIRouter(prefix="/api/admin", tags=["admin"])
+ADMIN_ONLY = require_role({"owner","admin"})
+
+@router.get("/health")
+def health(project_id: str, ctx: TenantCtx = Depends(ADMIN_ONLY)):
+    sb = get_user_supabase(ctx)
+    sbs = get_service_supabase()
+
+    checks = []
+
+    # Env
+    env_ok = all([os.getenv(k) for k in ("SUPABASE_URL","SUPABASE_ANON_KEY","SUPABASE_SERVICE_ROLE_KEY","FASTAPI_URL")])
+    checks.append({"name":"env.supabase/fastapi","ok":env_ok})
+
+    # Buckets
+    try:
+        sbs.storage().from_("artifacts").list()
+        sbs.storage().from_("backups").list()
+        checks.append({"name":"storage.buckets","ok":True})
+    except Exception as e:
+        checks.append({"name":"storage.buckets","ok":False,"err":str(e)})
+
+    # Digest settings present
+    try:
+        s = sb.table("org_comms_settings").select("*").eq("org_id", ctx.org_id).single().execute().data or {}
+        checks.append({"name":"comms.settings","ok":bool(s)})
+    except Exception as e:
+        checks.append({"name":"comms.settings","ok":False,"err":str(e)})
+
+    # Queue (reindex)
+    try:
+        pend = sb.table("reindex_queue").select("id", count="exact").eq("org_id", ctx.org_id).eq("project_id", project_id).eq("status","pending").execute()
+        checks.append({"name":"reindex.pending","ok":True,"count":pend.count or 0})
+    except Exception as e:
+        checks.append({"name":"reindex.pending","ok":False,"err":str(e)})
+
+    # Last digest send
+    last = sb.table("comms_send_log").select("created_at", order="created_at.desc")\
+           .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("kind","digest").limit(1).execute().data
+    checks.append({"name":"digest.last_send","ok":True,"value":(last and last[0]["created_at"]) or None})
+
+    return {"ok": all(c.get("ok") for c in checks if "ok" in c), "checks": checks}
+
+
+Mount:
+
+from .routers import admin_health
+app.include_router(admin_health.router)
+
+1C) Integrations API
+
+server/routers/integrations.py
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/integrations", tags=["integrations"])
+PM_PLUS = require_role({"owner","admin","pm","lead"})
+
+class IntegrationUpsert(BaseModel):
+    id: str | None = None
+    name: str
+    transport: str | None = None
+    schedule: str | None = None
+    status: str = "not_started"
+    owner_email: str | None = None
+    notes: str | None = None
+
+@router.get("/list")
+def list_integrations(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    r = sb.table("project_integrations").select("*")\
+        .eq("org_id", ctx.org_id).eq("project_id", project_id).order("created_at", desc=False).execute()
+    return {"items": r.data or []}
+
+@router.post("/upsert")
+def upsert_integration(body: IntegrationUpsert, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    rec = {
+      "org_id": ctx.org_id, "project_id": project_id,
+      "name": body.name, "transport": body.transport, "schedule": body.schedule,
+      "status": body.status, "owner_email": body.owner_email, "notes": body.notes
+    }
+    if body.id:
+        sb.table("project_integrations").update(rec).eq("id", body.id).execute()
+        return {"ok": True, "id": body.id}
+    out = sb.table("project_integrations").insert(rec).execute()
+    return {"ok": True, "id": out.data[0]["id"]}
+
+
+Mount:
+
+from .routers import integrations
+app.include_router(integrations.router)
+
+2) Frontend — Search, Re-embed button, Admin Health, Integrations
+2A) Spotlight search (Ctrl/⌘+K)
+
+client/src/components/SpotlightSearch.tsx
+
+import { useEffect, useState } from "react";
+import { useParams, useNavigate } from "react-router-dom";
+
+export default function SpotlightSearch(){
+  const { projectId } = useParams();
+  const nav = useNavigate();
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState("");
+  const [items, setItems] = useState<any[]>([]);
+
+  useEffect(()=>{
+    function onKey(e: KeyboardEvent){
+      const mac = navigator.platform.toUpperCase().includes("MAC");
+      if ((mac && e.metaKey && e.key.toLowerCase()==="k") || (!mac && e.ctrlKey && e.key.toLowerCase()==="k")){
+        e.preventDefault(); setOpen(true);
+      }
+      if (e.key==="Escape") setOpen(false);
+    }
+    window.addEventListener("keydown", onKey); return ()=>window.removeEventListener("keydown", onKey);
+  },[]);
+
+  async function run(){
+    if (!q.trim() || !projectId) return;
+    const r = await fetch(`/api/search?q=${encodeURIComponent(q)}&project_id=${projectId}`, { credentials:"include" });
+    if (r.ok) setItems((await r.json()).items || []);
+  }
+
+  function go(it:any){
+    if (it.type==="artifact") nav(`/projects/${projectId}/documents#artifact=${it.id}`);
+    else if (it.type==="action")  nav(`/projects/${projectId}/dashboard?tab=actions`);
+    else if (it.type==="risk")    nav(`/projects/${projectId}/dashboard?tab=risks`);
+    else if (it.type==="decision")nav(`/projects/${projectId}/dashboard?tab=decisions`);
+    else if (String(it.type).startsWith("mem:")) nav(`/projects/${projectId}/timeline`);
+    setOpen(false);
+  }
+
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-[70] bg-black/30 flex items-start justify-center pt-24" onClick={()=>setOpen(false)}>
+      <div className="w-[640px] bg-white dark:bg-neutral-900 border rounded-xl shadow-xl" onClick={e=>e.stopPropagation()}>
+        <div className="p-3 border-b">
+          <input className="w-full bg-transparent outline-none" autoFocus placeholder="Search project (⌘/Ctrl+K)…"
+                 value={q} onChange={e=>setQ(e.target.value)} onKeyDown={e=> e.key==='Enter' && run()} />
+        </div>
+        <div className="max-h-[360px] overflow-auto divide-y">
+          {items.map((it,i)=>(
+            <div key={i} className="p-3 hover:bg-neutral-100 cursor-pointer" onClick={()=>go(it)}>
+              <div className="text-sm"><b>{it.type}</b> — {it.title}</div>
+              {it.snippet && <div className="text-xs text-muted-foreground">{it.snippet}</div>}
+            </div>
+          ))}
+          {!items.length && <div className="p-3 text-sm text-muted-foreground">No results yet. Press Enter to search.</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+Add it to your authed layout (e.g., near <ChatDock/>):
+
+import SpotlightSearch from "@/components/SpotlightSearch";
+// ...
+{!hideDock && <SpotlightSearch/>}
+
+2B) Documents — per-artifact “Re-embed” button
+
+Where you render each artifact card (Documents / Library page), show a small admin/pm-only button:
+
+import { apiPost } from "@/lib/api";
+import { useToast } from "@/components/ui/use-toast";
+
+function ArtifactRow({ a, projectId, role }:{ a:any; projectId:string; role:string }){
+  const { toast } = useToast();
+  async function reembed(){
+    try{
+      await apiPost("/reindex/run-now", undefined, { project_id: projectId, artifact_id: a.id });
+      window.dispatchEvent(new CustomEvent("kap:restore-live"));
+      toast({ title:"Re-embed queued", description: a.name });
+    }catch(e:any){
+      toast({ title:"Queue failed", description:String(e?.message||e), variant:"destructive" });
+    }
+  }
+  return (
+    <div id={`artifact-${a.id}`} className="border rounded p-3 flex items-center justify-between">
+      <div className="truncate">{a.name}</div>
+      {["owner","admin","pm","lead"].includes(role) && (
+        <button className="px-2 py-1 border rounded text-xs" onClick={reembed}>Re-embed</button>
+      )}
+    </div>
+  );
+}
+
+2C) Admin Health dashboard
+
+client/src/pages/AdminHealth.tsx
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+
+export default function AdminHealth(){
+  const { projectId } = useParams();
+  const [data,setData] = useState<any>(null);
+
+  useEffect(()=>{ (async ()=>{
+    const r = await fetch(`/api/admin/health?project_id=${projectId}`, { credentials:"include" });
+    if (r.ok) setData(await r.json());
+  })(); },[projectId]);
+
+  if (!data) return <div className="p-6">Loading…</div>;
+  return (
+    <div className="p-6 space-y-4">
+      <h1 className="text-xl font-semibold">Admin Health</h1>
+      <div className={`px-3 py-2 rounded ${data.ok?'bg-green-50':'bg-yellow-50'}`}>
+        Overall: {data.ok ? "OK" : "Needs attention"}
+      </div>
+      <div className="border rounded">
+        {(data.checks||[]).map((c:any,i:number)=>(
+          <div key={i} className="p-3 border-b last:border-0 text-sm flex items-center justify-between">
+            <div>{c.name}</div>
+            <div>{c.ok ? "✅" : "⚠️"} {c.count!==undefined ? `(${c.count})` : ""} {c.value ? `: ${c.value}` : ""}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
+Add route (admin-only):
+
+{ path: "/projects/:projectId/admin/health", element: <AdminHealth/> }
+
+2D) Integrations Tracker UI
+
+client/src/pages/Integrations.tsx
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { apiGet, apiPost } from "@/lib/api";
+
+type Row = { id?:string; name:string; transport?:string; schedule?:string; status:string; owner_email?:string; notes?:string };
+
+export default function IntegrationsPage(){
+  const { projectId } = useParams();
+  const [rows,setRows] = useState<Row[]>([]);
+  const [draft,setDraft] = useState<Row>({ name:"", transport:"", schedule:"", status:"not_started", owner_email:"", notes:"" });
+
+  async function load(){ const d = await apiGet<{items:Row[]}>("/integrations/list", { project_id: projectId! }); setRows(d.items); }
+  useEffect(()=>{ load(); },[projectId]);
+
+  async function save(r:Row){
+    await apiPost("/integrations/upsert", r, { project_id: projectId! }); await load();
+  }
+
+  return (
+    <div className="p-6 space-y-4">
+      <h1 className="text-xl font-semibold">Integrations</h1>
+
+      <div className="border rounded p-3 space-y-2">
+        <div className="text-sm font-medium">Add / Update</div>
+        <div className="grid md:grid-cols-6 gap-2">
+          <input className="border rounded p-2" placeholder="Name" value={draft.name} onChange={e=>setDraft({...draft, name:e.target.value})}/>
+          <input className="border rounded p-2" placeholder="Transport" value={draft.transport||""} onChange={e=>setDraft({...draft, transport:e.target.value})}/>
+          <input className="border rounded p-2" placeholder="Schedule" value={draft.schedule||""} onChange={e=>setDraft({...draft, schedule:e.target.value})}/>
+          <select className="border rounded p-2" value={draft.status} onChange={e=>setDraft({...draft, status:e.target.value})}>
+            {["not_started","in_progress","connected","validated","blocked"].map(s=><option key={s} value={s}>{s}</option>)}
+          </select>
+          <input className="border rounded p-2" placeholder="Owner email" value={draft.owner_email||""} onChange={e=>setDraft({...draft, owner_email:e.target.value})}/>
+          <button className="px-3 py-2 border rounded" onClick={()=>{ if(!draft.name.trim()) return; save(draft); setDraft({ name:"", transport:"", schedule:"", status:"not_started", owner_email:"", notes:"" }); }}>
+            Save
+          </button>
+        </div>
+        <textarea className="border rounded p-2 w-full" rows={3} placeholder="Notes…" value={draft.notes||""} onChange={e=>setDraft({...draft, notes:e.target.value})}/>
+      </div>
+
+      <div className="border rounded">
+        {rows.map((r,i)=>(
+          <div key={r.id||i} className="p-3 border-b last:border-0 grid md:grid-cols-6 gap-2 items-center">
+            <div className="font-medium">{r.name}</div>
+            <div className="text-sm">{r.transport||"—"}</div>
+            <div className="text-sm">{r.schedule||"—"}</div>
+            <div className="text-sm">{r.status}</div>
+            <div className="text-sm">{r.owner_email||"—"}</div>
+            <button className="px-2 py-1 border rounded text-xs" onClick={()=>save(r)}>Update</button>
+            {r.notes && <div className="md:col-span-6 text-xs text-muted-foreground">{r.notes}</div>}
+          </div>
+        ))}
+        {!rows.length && <div className="p-3 text-sm text-muted-foreground">No integrations yet.</div>}
+      </div>
+    </div>
+  );
+}
+
+
+Add route & sidebar link:
+
+{ path: "/projects/:projectId/integrations", element: <IntegrationsPage/> }
+
+3) (Optional tiny) Digest countdown
+
+Patch DigestChip.tsx to show “in Xh Ym”:
+
+const nextDate = st.next_run_local ? new Date(st.next_run_local) : null;
+const [now, setNow] = useState(Date.now());
+useEffect(()=>{ const t = setInterval(()=>setNow(Date.now()), 60000); return ()=>clearInterval(t); },[]);
+function fmtCountdown(){
+  if(!nextDate) return "—";
+  const ms = nextDate.getTime() - now;
+  if (ms <= 0) return "soon";
+  const m = Math.floor(ms/60000), h = Math.floor(m/60), mm = m%60;
+  return `${h}h ${mm}m`;
+}
+...
+<span className="text-xs text-muted-foreground">In:</span><span>{fmtCountdown()}</span>
+
+4) Quick test plan
+
+Spotlight: press ⌘/Ctrl+K → search → click result routes correctly.
+
+Re-embed per artifact: button queues job → Restore Activity shows queued/completed.
+
+Admin Health: page loads; green if env/buckets ok; shows reindex pending count.
+
+Integrations: add entries; update status/owner; persists; RLS respected.

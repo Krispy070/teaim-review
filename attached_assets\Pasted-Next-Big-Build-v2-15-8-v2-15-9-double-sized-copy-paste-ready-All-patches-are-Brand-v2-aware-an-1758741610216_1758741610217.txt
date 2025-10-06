@@ -1,0 +1,334 @@
+Next Big Build v2.15.8 + v2.15.9 (double-sized, copy-paste ready)
+
+All patches are Brand v2–aware and dev-safe (new endpoints return safe empties if tables/columns aren’t present).
+
+v2.15.8 — CRs at scale + Area owners as first-class operators
+1) CRs — Bulk SLA Nudge + project resend templates + list quick-edit (assignee/due)
+1A) Backend — bulk nudge assignees (throttled) + project templates
+
+server/routers/changes_nudge.py (append)
+
+from pydantic import BaseModel
+from typing import List, Optional
+from ..email.util import mailgun_send_html, send_guard
+from .changes_sla import _sla_state
+
+class NudgeBulkBody(BaseModel):
+    ids: List[str]
+    subject: Optional[str] = None
+    html: Optional[str] = None
+    min_hours_between: int = 12
+
+@router.post("/nudge_assignee_bulk")
+def nudge_assignee_bulk(body: NudgeBulkBody, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    sent = 0
+    try:
+        rows = sb.table("changes").select("id,title,priority,due_date,assignee")\
+                 .eq("org_id", ctx.org_id).eq("project_id", project_id).in_("id", body.ids).execute().data or []
+        now = datetime.now(timezone.utc)
+        for r in rows:
+            to = r.get("assignee")
+            if not to: continue
+            # throttle
+            try:
+                last = sb.table("comms_send_log").select("created_at")\
+                         .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+                         .eq("kind","cr_nudge").eq("to_email", to)\
+                         .order("created_at", desc=True).limit(1).execute().data
+                ok_throttle = True
+                if last:
+                    dt_last = datetime.fromisoformat(last[0]["created_at"].replace("Z","+00:00"))
+                    ok_throttle = (now - dt_last) >= timedelta(hours=body.min_hours_between)
+            except Exception:
+                ok_throttle = True
+            if not ok_throttle: continue
+
+            s = _sla_state(r.get("due_date"), r.get("priority"))
+            subj = body.subject or f"[Nudge] CR '{r.get('title')}' — {s['state']} ({s['days_left']})"
+            html = (body.html or "<p>CR: <b>{{TITLE}}</b><br/>Due: {{DUE}}<br/>Priority: {{PRIO}}</p>")\
+                    .replace("{{TITLE}}", r.get("title") or "")\
+                    .replace("{{DUE}}", r.get("due_date") or "n/a")\
+                    .replace("{{PRIO}}", r.get("priority") or "n/a")
+            try:
+                ok,_ = send_guard(sb, ctx.org_id, project_id, "cr_nudge", to)
+                if ok:
+                    mailgun_send_html([to], subj, html)
+                    sent += 1
+                    try:
+                        sb.table("comms_send_log").insert({
+                          "org_id": ctx.org_id, "project_id": project_id,
+                          "kind":"cr_nudge","to_email":to,"details":{"id":r["id"]}
+                        }).execute()
+                    except Exception: ...
+            except Exception: ...
+        return {"ok": True, "sent": sent}
+    except Exception:
+        return {"ok": False, "sent": sent}
+
+
+Project-level “resend templates” (dev-safe in ops_kv):
+
+server/routers/changes_templates.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from ..tenant import TenantCtx
+from ..guards import require_role, member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/changes", tags=["changes"])
+
+class TplBody(BaseModel):
+    subject: str
+    html: str
+
+@router.get("/resend_template")
+def get_tpl(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        r = sb.table("ops_kv").select("val").eq("key", f"cr_resend_tpl:{ctx.org_id}:{project_id}").single().execute().data or {}
+        return r.get("val") or {"subject":"[Nudge] CR status","html":"<p>{{TITLE}} — due {{DUE}}</p>"}
+    except Exception:
+        return {"subject":"[Nudge] CR status","html":"<p>{{TITLE}} — due {{DUE}}</p>"}
+
+@router.post("/resend_template")
+def set_tpl(body: TplBody, project_id: str = Query(...), ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    sb = get_user_supabase(ctx)
+    try:
+        sb.table("ops_kv").upsert({"key":f"cr_resend_tpl:{ctx.org_id}:{project_id}","val":{"subject":body.subject,"html":body.html}}).execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+
+Mount in server/main.py:
+
+from .routers import changes_templates
+app.include_router(changes_templates.router)
+
+1B) Backend — extend small update to accept assignee and due_date
+
+server/routers/changes_nudge.py (or create changes_small.py)
+
+@router.post("/update_small")
+def update_small(id: str = Query(...), project_id: str = Query(...),
+                 assignee: str | None = None, due_date: str | None = None,
+                 ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    patch={}
+    if assignee is not None: patch["assignee"]=assignee
+    if due_date is not None: patch["due_date"]=due_date
+    try:
+        if patch:
+            sb.table("changes").update(patch).eq("org_id",ctx.org_id).eq("project_id",project_id).eq("id",id).execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+1C) Frontend — ChangeList: inline edit assignee/due; bulk nudge; load/save template
+
+Patch client/src/pages/ChangeList.tsx:
+
+Add template fetch/save:
+
+const [tpl,setTpl]=useState<{subject:string,html:string}>({subject:"",html:""});
+useEffect(()=>{ (async()=>{ try{ const t=await getJSON(`/api/changes/resend_template?project_id=${projectId}`); setTpl(t||{});}catch{} })(); },[projectId]);
+async function saveTpl(){ await postJSON(`/api/changes/resend_template?project_id=${projectId}`, tpl); alert("Template saved"); }
+
+
+Inline edit cells:
+
+<td className="p-1">
+  <input className="border rounded p-1 w-[140px]" defaultValue={r.assignee||""}
+         onBlur={e=> fetch(`/api/changes/update_small?id=${r.id}&project_id=${projectId}&assignee=${encodeURIComponent(e.target.value)}`, {method:"POST",credentials:"include"}) }/>
+</td>
+<td className="p-1">
+  <input type="date" className="border rounded p-1" defaultValue={r.due_date||""}
+         onBlur={e=> fetch(`/api/changes/update_small?id=${r.id}&project_id=${projectId}&due_date=${encodeURIComponent(e.target.value)}`, {method:"POST",credentials:"include"}) }/>
+</td>
+
+
+Bulk nudge + template editor UI:
+
+<div className="brand-card p-3">
+  <div className="text-xs font-medium mb-1">Bulk Nudge (assignees)</div>
+  <div className="grid md:grid-cols-2 gap-2">
+    <input className="border rounded p-2 text-sm" placeholder="Subject" value={tpl.subject||""} onChange={e=>setTpl({...tpl,subject:e.target.value})}/>
+    <button className="brand-btn text-xs" onClick={saveTpl}>Save template</button>
+  </div>
+  <textarea className="border rounded p-2 w-full text-sm mt-1" rows={2} placeholder="HTML ({{TITLE}}, {{DUE}}, {{PRIO}})" value={tpl.html||""} onChange={e=>setTpl({...tpl,html:e.target.value})}/>
+  <div className="mt-2 flex gap-2">
+    <button className="brand-btn text-xs" disabled={!anySel} onClick={async()=>{
+      const ids = Object.keys(sel).filter(k=>sel[k]); 
+      await fetch(`/api/changes/nudge_assignee_bulk?project_id=${projectId}`, {
+        method:"POST", credentials:"include", headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ ids, subject: tpl.subject, html: tpl.html, min_hours_between: 12 })
+      }); alert("Nudges sent (throttled)");
+    }}>Nudge selected</button>
+  </div>
+</div>
+
+2) Area Owners — Owner dashboard page (what I own, at a glance)
+
+client/src/pages/OwnerDashboard.tsx (new)
+
+import { useEffect, useState } from "react";
+import { useParams, useNavigate } from "react-router-dom";
+import { getJSON } from "@/lib/authFetch";
+import PageHeading from "@/components/PageHeading";
+
+export default function OwnerDashboard(){
+  const { projectId } = useParams(); const nav=useNavigate();
+  const [areas,setAreas]=useState<string[]>([]); const [mine,setMine]=useState<string[]>([]);
+  const [crs,setCrs]=useState<any[]>([]);
+
+  useEffect(()=>{ (async()=>{
+    try{
+      const al = await getJSON(`/api/areas/list?project_id=${projectId}`); setAreas(al.items||[]);
+      const ad = await getJSON(`/api/areas/admins?project_id=${projectId}`);
+      const map:Record<string,string[]> = {}; (ad.items||[]).forEach((r:any)=>{ map[r.area]=[...(map[r.area]||[]), r.user_id] });
+      const me = (await getJSON(`/api/me`)).user_id || ""; // if you have /api/me; otherwise use dev header
+      setMine(Object.keys(map).filter(a=> (map[a]||[]).includes(me)));
+      const s = await getJSON(`/api/changes/list_advanced?project_id=${projectId}&sort=sla`);
+      setCrs((s.items||[]).filter((x:any)=> mine.includes(x.area||"")));
+    }catch{}
+  })(); },[projectId]);
+
+  return (
+    <div>
+      <PageHeading title="My Areas" crumbs={[{label:"Team"},{label:"Owner Dashboard"}]} />
+      <div className="grid md:grid-cols-3 gap-3">
+        {mine.map(a=>(
+          <button key={a} className="brand-card p-3 text-left bg-white/5" onClick={()=>nav(`/projects/${projectId}/workstreams/${encodeURIComponent(a)}`)}>
+            <div className="text-sm font-medium">{a}</div>
+            <div className="text-xs text-muted-foreground">Click to manage</div>
+          </button>
+        ))}
+        {!mine.length && <div className="brand-card p-3 text-xs text-muted-foreground">No owned areas.</div>}
+      </div>
+      <div className="brand-card p-3 mt-3">
+        <div className="text-sm font-medium mb-1">CRs in my areas (SLA order)</div>
+        <div className="overflow-auto">
+          <table className="w-full text-xs">
+            <thead><tr><th className="text-left p-1">Title</th><th className="text-left p-1">Area</th><th className="text-left p-1">Assignee</th><th className="text-left p-1">Due</th></tr></thead>
+            <tbody>
+              {crs.map((r:any)=> <tr key={r.id}><td className="p-1">{r.title}</td><td className="p-1">{r.area}</td><td className="p-1">{r.assignee||"—"}</td><td className="p-1">{r.due_date||"—"}</td></tr>)}
+              {!crs.length && <tr><td colSpan={4} className="p-2 text-muted-foreground">Nothing pending.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+Route in client/src/App.jsx:
+
+import OwnerDashboard from "@/pages/OwnerDashboard";
+// …
+<Route path="/projects/:projectId/team/owner" element={<OwnerDashboard/>} />
+
+v2.15.9 — Releases polish + Area audit filters + server-side “seen” end-to-end
+3) Releases — ICS export of all releases (month)
+
+server/routers/releases_ics.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import PlainTextResponse
+from datetime import datetime
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/releases", tags=["releases"])
+
+@router.get("/month.ics", response_class=PlainTextResponse)
+def month_ics(project_id: str = Query(...), year:int = Query(...), month:int = Query(...),
+              ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        rows = sb.table("releases").select("id,name,window_start,window_end")\
+            .eq("org_id",ctx.org_id).eq("project_id",project_id).execute().data or []
+    except Exception:
+        rows=[]
+    ics = ["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//TEAIM//Releases//EN"]
+    def fmt(dtstr): 
+        try:
+            return datetime.fromisoformat(dtstr.replace("Z","+00:00")).strftime("%Y%m%dT%H%M%SZ")
+        except Exception: return None
+    for r in rows:
+        s=fmt(r.get("window_start")); e=fmt(r.get("window_end") or r.get("window_start"))
+        if not s or not e: continue
+        ics += ["BEGIN:VEVENT", f"UID:{r['id']}@teaim", f"DTSTART:{s}", f"DTEND:{e}", f"SUMMARY:{r.get('name')}", "END:VEVENT"]
+    ics += ["END:VCALENDAR"]
+    return PlainTextResponse("\r\n".join(ics), media_type="text/calendar")
+
+
+Mount in server/main.py:
+
+from .routers import releases_ics
+app.include_router(releases_ics.router)
+
+
+Add a Download ICS button in Releases.tsx header:
+
+<button className="brand-btn text-xs" onClick={()=>downloadGET(`/api/releases/month.ics?project_id=${projectId}&year=${ym.y}&month=${ym.m}`, `releases_${ym.y}-${String(ym.m).padStart(2,'0')}.ics`)}>
+  Download ICS
+</button>
+
+4) Area audit widget — filters + CSV
+
+Backend (extend area_audit.py):
+
+@router.get("/audit7d_filtered")
+def audit7d_filtered(project_id: str = Query(...), area: str = Query(...),
+                     kinds: str = Query("actions,risks,decisions,workbook_runs,audit_events"),
+                     ctx: TenantCtx = Depends(member_ctx)):
+    base = set([k.strip() for k in kinds.split(",") if k.strip()])
+    d = audit7d(project_id, area, ctx).get("items", [])
+    return {"items": [x for x in d if x.get("table") in base]}
+
+
+Frontend WorkstreamArea.tsx:
+
+const [kinds,setKinds]=useState<string[]>(["actions","risks","decisions","workbook_runs","audit_events"]);
+useEffect(()=>{ (async()=>{ try{
+  const qs = new URLSearchParams({project_id: projectId!, area: area, kinds: kinds.join(",")});
+  const d = await getJSON(`/api/areas/audit7d_filtered?${qs.toString()}`); setAudit(d.items||[]);
+}catch{ setAudit([]);} })(); },[projectId, area, kinds]);
+
+<div className="flex items-center gap-2 text-xs mb-1">
+  {["actions","risks","decisions","workbook_runs","audit_events"].map(k=>(
+    <label key={k} className="flex items-center gap-1"><input type="checkbox" checked={kinds.includes(k)} onChange={e=>{
+      setKinds(s=> e.target.checked? [...s,k] : s.filter(x=>x!==k));
+    }} />{k}</label>
+  ))}
+  <button className="brand-btn text-xs ml-auto" onClick={()=>{
+    const qs=new URLSearchParams({project_id:projectId!, area:area, kinds:kinds.join(",")});
+    downloadGET(`/api/areas/audit7d.csv?${qs.toString()}`, `audit_${area}_7d.csv`);
+  }}>Export CSV</button>
+</div>
+
+5) Header Updates — mark-seen server-side (call on “Updates” click)
+
+client/src/components/BrandedHeader.tsx (augment our previous handler)
+
+async function markAll(){
+  markAllSeen(); await markAllSeenSrv(); // local + server
+}
+<button className="brand-btn text-xs relative" onClick={markAll} title="Mark all seen">
+  Updates {count>0 ? `(${count})` : ""}
+  {count>0 && <span className="absolute -top-1 -right-1 w-[8px] h-[8px] rounded-full bg-red-500"></span>}
+</button>
+
+90-second validation
+
+CRs: bulk nudge using a project template; inline due/assignee edits on list; SLA filters & sort good
+
+Area owners: auto-notified on new comments; Owner Dashboard page shows owned areas + their CRs
+
+Releases: ICS download for calendar import; month grid shows CR tags
+
+Area audit: filter by kinds (actions/risks/decisions/runs/events) + CSV; header updates count persists server-side

@@ -1,0 +1,177 @@
+🔧 Replit Kickstart Prompt — TEAIM – Workday Hub
+
+Build me a multi-tenant SaaS web app called TEAIM – Workday Hub for Workday implementations. It ingests emails/files, auto-summarizes, tracks actions/risks/decisions, shows exec dashboards, includes a private team-wellness trend, and exposes a bottom “Chat with Kap (GPT)” dock for RAG over project artifacts + memories. Use the following spec:
+
+✅ Feature Summary (bake these in)
+
+Multi-tenant: orgs, org_members, projects (WD-<CLIENT> codes), strict RLS everywhere.
+
+Auth: Supabase Auth (email magic link); roles = owner/admin/pm/lead/member/guest. (MFA later.)
+
+Ingestion: file upload endpoint + (stub) inbound-email endpoint. Allowlist sender domains & require #proj:WD-XXX in subject (validations stubbed).
+
+Parsing: pdf/docx/eml/txt/vtt extraction → chunking → embeddings (OpenAI text-embedding-3-large) → pgvector.
+
+Auto summaries: store artifact-level summaries + risks/decisions/actions (JSON) + provenance.
+
+Actions engine: NLP extracts “owner/verb/date” → creates action rows; follow-up email draft endpoint (no send yet).
+
+Mem Agent: episodic/semantic/procedural/decision/affect memories; weekly wellness pulses aggregated anonymously.
+
+Dashboards: Program timeline with daily progress line, KPIs, Pending Items, Workstream tiles, Integrations as collapsible mini-workflows (Discover→Design→Config→Test→Deploy) with Data/Pending/Q&A panes, Logistics (incl. weekly meetings), Data & Reporting (incl. Legacy paper/Excel), Training calendar, Testing, OCM, Financials, and Wellness Matrix (visible only to PM & Exec).
+
+Chat dock: bottom sticky chat to “Kap” (GPT) with RAG over artifact_chunks + mem_chunks, strict citations, “insufficient context” fallback.
+
+Digests: daily & weekly digest endpoints (return JSON + HTML template); scheduling stub.
+
+Privacy: Wellness is anonymous aggregate only; hide Wellness from non-PM/Exec.
+
+Observability: simple audit log of key actions; basic rate limiting on public endpoints.
+
+🧱 Tech & Structure
+
+Monorepo:
+
+/server  (FastAPI, Python 3.11)
+/web     (Vite + React + Tailwind + Lucide + Recharts)
+
+
+Database: Supabase Postgres with pgvector.
+
+Storage: Supabase bucket project-artifacts.
+
+OpenAI for embeddings + chat.
+
+📁 File Tree (create stubs and TODOs where needed)
+/server
+  main.py                  # FastAPI app + CORS + routes
+  mem_agent.py             # memory extraction helpers
+  parsing.py               # pdf/docx/eml/vtt → text
+  chunking.py              # chunk/overlap helpers
+  rag.py                   # retrieval (pgvector RPC), answer composer
+  models.py                # Pydantic schemas
+  supabase_client.py       # helper to connect Supabase
+  requirements.txt
+  README.md
+/web
+  index.html
+  package.json
+  src/main.tsx
+  src/App.tsx              # use my current mock wireframe structure but add bottom chat dock
+  src/components/*
+  src/lib/supabase.ts
+  tailwind.css + config
+.env.sample                # show needed keys
+bootstrap.sql              # full schema incl. mem tables + RLS + RPC
+deploy.md                  # how to run locally and in Replit
+
+🗄️ Database / SQL (put in bootstrap.sql)
+
+Enable vector.
+
+Tables (with org_id, project_id where applicable): orgs, org_members, profiles, projects, artifacts, artifact_chunks(embedding vector(3072)), summaries, actions, mem_entries, mem_chunks, mem_stats, mem_signals, audit_log.
+
+RPC: search_chunks(p_org uuid, p_project uuid, q vector, k int) returning (content, title, artifact_id).
+
+RLS: membership-scoped read; write restricted to admin/pm (seed basic policies).
+
+Provide a helper seed_admin.sql to create an org and add current auth.user as owner.
+
+🔌 Environment Variables (.env.sample)
+# server
+OPENAI_API_KEY=
+SUPABASE_URL=
+SUPABASE_SERVICE_ROLE_KEY=
+EMBEDDING_MODEL=text-embedding-3-large
+CHAT_MODEL=gpt-4.1-mini
+BUCKET=project-artifacts
+
+# web
+VITE_SUPABASE_URL=
+VITE_SUPABASE_ANON_KEY=
+
+🐍 Server (create these endpoints)
+
+GET / → health
+
+POST /ingest (multipart): org_id, project_id, file → upload to bucket, create artifacts row, background task: parse→chunk→embed→insert chunks, auto-summary, mem_agent.extract() → upsert memories.
+
+POST /ask (JSON): {org_id, project_id, question, k=8} → embed question, use search_chunks, build prompt w/ semantic+procedural memories first → answer with citations [Artifact: title].
+
+POST /wellness/pulse (JSON): {org_id, project_id, week_label, buckets:{very_negative, negative, neutral, positive, very_positive}} → store mem_stats (score + n) and create mem_signals if drop threshold exceeded.
+
+POST /actions/nudge-draft (JSON): {org_id, project_id, action_id} → returns suggested reminder email text.
+
+GET /digest/daily|weekly?org_id&project_id → returns JSON + HTML template (no mail send).
+
+Implement modular helpers:
+
+parsing.py for PDF/DOCX/EML/VTT.
+
+chunking.py for windowed chunks with overlap.
+
+mem_agent.py for extracting {semantic, episodic, procedural, decision} JSON with OpenAI.
+
+rag.py for composing context and strict-cite answers.
+
+🖥️ Web (wire the UI)
+
+Start from a clean Vite+React scaffold with Tailwind.
+
+Use the existing mock layout (tabs + timeline + workstreams + pending items + wellness matrix). Adjust header spacing so status badge doesn’t collide with nav.
+
+Add a bottom sticky chat dock:
+
+Collapsible, opens a panel with:
+
+textarea + “Ask Kap” button
+
+streaming answer area that shows citations (list of artifact titles)
+
+On send → POST /ask; render answer + clickable citations; if “insufficient context,” show suggested queries.
+
+Add Upload button to call POST /ingest (org_id/project_id fields at top of page for now).
+
+In Logistics, show weekly meetings list.
+
+In Data & Reporting, include Legacy (paper/excel).
+
+In Integrations & Tech, use collapsible cards with stage badges + Data/Pending/Q&A columns.
+
+In Training, a simple calendar grid (who/when).
+
+Wellness Matrix shown on Dashboard ONLY for PM/Exec; hide tab for others.
+
+📦 Dependencies
+
+Server: fastapi uvicorn python-multipart pydantic openai supabase psycopg[binary] pypdf python-docx mailparser
+
+Web: react react-dom vite lucide-react recharts + Tailwind.
+
+🧪 Acceptance (MVP works when…)
+
+I can set .env secrets in Replit, run API + web, create an org/project manually in SQL, and:
+
+Upload a PDF → see a new Artifact in DB with chunk_count > 0.
+
+Ask a question → get a formatted answer with at least one citation.
+
+Post a wellness pulse → Dashboard wellness strip updates (read from API; mock data acceptable if time).
+
+Integrations panel expands and shows Data/Pending/Q&A sample.
+
+Chat dock opens from bottom, submits to /ask, renders streamed answer (no need for SSE; can poll for now).
+
+Add TODOs where stubs are acceptable, but keep the interfaces stable so I can fill them in.
+
+🚀 After Replit scaffolds
+
+Paste my Supabase bootstrap.sql and run it in Supabase SQL editor.
+
+Add secrets in Replit.
+
+Run server: uvicorn server.main:app --host 0.0.0.0 --port 8000
+
+Run web: npm --prefix web run dev
+
+Upload a small PDF and try the chat dock.

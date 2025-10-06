@@ -1,0 +1,367 @@
+Next Big Build v2.12.8 (two sprints in one). Everything below is copy-paste ready, Brand v2–aware, and dev-safe (new endpoints degrade gracefully if a table/column is missing).
+
+Landing now:
+
+Request Sign-Off v3.7 — stage-specific default doc link, pending requests table (email, created, expires, revoke / revoke-all / resend), global member search, multi-area chips, PM/Lead presets remembered
+
+Stages Editor batch tools — Shift Start (preserve durations), Set Duration (N days) per area; works with existing Save/Undo Group & Undo All
+
+Digests compact “Changes by Area” grid + deep links that open the correct tab with owner/area pre-filters, then scroll+glow to rows
+
+Wellness per-user printable HTML (brand header) + existing date-range CSV; admin trend overlay stays intact
+
+1) Request Sign-Off v3.7 — stage doc defaults + pending table (revoke/resend)
+1A) Backend — stage default doc link (dev-safe sidecar table)
+
+server/routers/stage_doc_default.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/stages", tags=["stages"])
+PM_PLUS = require_role({"owner","admin","pm"})
+
+class DocBody(BaseModel):
+    url: str
+
+@router.get("/doc_default")
+def get_doc_default(project_id: str = Query(...), stage_id: str = Query(...),
+                    ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        r = sb.table("stage_doc_defaults").select("url").eq("org_id", ctx.org_id)\
+              .eq("project_id", project_id).eq("stage_id", stage_id).single().execute().data
+        return {"url": (r or {}).get("url")}
+    except Exception:
+        return {"url": None}
+
+@router.post("/doc_default")
+def set_doc_default(body: DocBody, project_id: str = Query(...), stage_id: str = Query(...),
+                    ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    try:
+        sb.table("stage_doc_defaults").upsert({
+            "org_id": ctx.org_id, "project_id": project_id, "stage_id": stage_id, "url": body.url
+        }, on_conflict="org_id,project_id,stage_id").execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+
+If the stage_doc_defaults table doesn’t exist yet, calls return {url: None} and {ok: False} without crashing.
+
+Mount in server/main.py:
+
+from .routers import stage_doc_default
+app.include_router(stage_doc_default.router)
+
+1B) Backend — pending list with expiry + resend + revoke all
+
+server/routers/signoff_pending.py (extend)
+
+from fastapi import APIRouter, Depends, Query
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase, get_service_supabase
+from datetime import datetime, timedelta, timezone
+import os
+
+router = APIRouter(prefix="/api/signoff", tags=["signoff"])
+
+@router.get("/pending_list")
+def pending_list(project_id: str = Query(...), stage_id: str | None = None,
+                 ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        doc_ids = []
+        if stage_id:
+            d = sb.table("signoff_docs").select("id").eq("org_id", ctx.org_id)\
+                 .eq("project_id", project_id).eq("stage_id", stage_id).limit(1).execute().data or []
+            if not d: return {"items": []}
+            doc_ids = [d[0]["id"]]
+        q = sb.table("signoff_doc_tokens").select("token,signer_email,created_at,expires_at")\
+             .eq("org_id", ctx.org_id).eq("project_id", project_id).is_("used_at","null")
+        if doc_ids: q = q.in_("doc_id", doc_ids)
+        rows = q.order("created_at", desc=True).limit(200).execute().data or []
+        return {"items": rows}
+    except Exception:
+        return {"items": []}
+
+@router.post("/revoke_token")
+def revoke_token(token: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        sb.table("signoff_doc_tokens").update({"revoked_at": "now()"}).eq("org_id", ctx.org_id).eq("token", token).execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+@router.post("/revoke_all")
+def revoke_all(project_id: str = Query(...), stage_id: str = Query(...),
+               ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    sb = get_user_supabase(ctx)
+    try:
+        d = sb.table("signoff_docs").select("id").eq("org_id", ctx.org_id)\
+             .eq("project_id", project_id).eq("stage_id", stage_id).limit(1).execute().data or []
+        if not d: return {"ok": True}
+        sb.table("signoff_doc_tokens").update({"revoked_at":"now()"})\
+          .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("doc_id", d[0]["id"]).is_("used_at","null").execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+@router.post("/resend_token")
+def resend_token(token: str = Query(...), ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    sb = get_user_supabase(ctx); sbs = get_service_supabase()
+    try:
+        row = sb.table("signoff_doc_tokens").select("doc_id,signer_email").eq("org_id", ctx.org_id).eq("token", token).single().execute().data
+        if not row: return {"ok": False}
+        # create a new token; old one will remain but the receiver gets a fresh link
+        new = sbs.table("signoff_doc_tokens").insert({
+            "org_id": ctx.org_id, "project_id": None, # db default or set correctly if column exists
+            "doc_id": row["doc_id"], "signer_email": row["signer_email"]
+        }).execute().data
+        # best-effort email (dev-safe)
+        try:
+            base = os.getenv("APP_BASE_URL","").rstrip("/")
+            link = f"{base}/signoff/doc/{new[0]['token']}" if new and new[0].get("token") else base
+            from ..email.util import mailgun_send_html, send_guard
+            ok,_ = send_guard(sb, ctx.org_id, None, "signoff_resend", row["signer_email"])
+            if ok: mailgun_send_html([row["signer_email"]], "[Resend] Sign-off request", f"<p>Your sign-off link: <a href='{link}'>Open</a></p>")
+        except Exception: ...
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+
+(If project_id column is required in tokens, add a quick select join to signoff_docs to get it; dev-safe if missing.)
+
+Mount already exists; no changes.
+
+1C) Frontend — Sign-Off modal v3.7 (stage default doc, pending table, revoke / revoke-all / resend)
+
+client/src/components/SignoffRequestModal.tsx (drop-in; only differences from v3.5 shown)
+
+Add stage doc default get/set + pending actions:
+
+const [useStageDefault,setUseStageDefault]=useState(true);
+
+useEffect(()=>{ (async()=>{
+  try{
+    if (useStageDefault){
+      const d = await getJSON(`/api/stages/doc_default?project_id=${projectId}&stage_id=${stageId}`);
+      if (d?.url && !docLink) setDocLink(d.url);
+    }
+  }catch{}
+})(); },[projectId, stageId, useStageDefault]);
+
+async function saveStageDefault(){
+  if (!docLink.trim()) return alert("Provide a URL first");
+  try{
+    await fetch(`/api/stages/doc_default?project_id=${projectId}&stage_id=${stageId}`, {
+      method:"POST", credentials:"include",
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({url:docLink.trim()})
+    });
+    alert("Stage default saved");
+  }catch{}
+}
+
+
+Render Pending table controls (under previous pending section):
+
+{pending.length>0 && (
+  <div className="border rounded p-2">
+    <div className="flex items-center justify-between">
+      <div className="text-xs font-medium">Pending requests ({pending.length})</div>
+      <div className="flex items-center gap-2">
+        <button className="brand-btn text-[11px]" onClick={async()=>{
+          await fetch(`/api/signoff/revoke_all?project_id=${projectId}&stage_id=${stageId}`, {method:"POST",credentials:"include"});
+          setPending([]); alert("All pending tokens revoked");
+        }}>Revoke all</button>
+      </div>
+    </div>
+    <div className="space-y-1 mt-1">
+      {pending.map(p=>(
+        <div key={p.token} className="flex items-center justify-between text-xs">
+          <span>{p.signer_email} • {new Date(p.created_at).toLocaleString()} {p.expires_at?`• exp ${new Date(p.expires_at).toLocaleString()}`:""}</span>
+          <span className="flex items-center gap-1">
+            <button className="brand-btn text-[11px]" onClick={async()=>{
+              await fetch(`/api/signoff/resend_token?token=${encodeURIComponent(p.token)}`, {method:"POST",credentials:"include"});
+              alert("Resent");
+            }}>Resend</button>
+            <button className="brand-btn text-[11px]" onClick={async()=>{
+              await fetch(`/api/signoff/revoke_token?token=${encodeURIComponent(p.token)}`, {method:"POST",credentials:"include"});
+              setPending(prev=>prev.filter(x=>x.token!==p.token));
+            }}>Revoke</button>
+          </span>
+        </div>
+      ))}
+    </div>
+  </div>
+)}
+
+
+Stage default doc toggles (near the docLink input):
+
+<div className="flex items-center gap-2 text-xs">
+  <label className="flex items-center gap-1">
+    <input type="checkbox" checked={useStageDefault} onChange={e=>setUseStageDefault(e.target.checked)} /> Use stage default
+  </label>
+  <label className="flex items-center gap-1">
+    <input type="checkbox" checked={autoAttachStage} onChange={e=>setAutoAttachStage(e.target.checked)} /> Auto-attach last stage doc
+  </label>
+  <button className="brand-btn text-[11px]" onClick={saveStageDefault}>Save stage default</button>
+</div>
+
+
+Everything else stays the same as v3.5.
+
+2) Stages — Batch “Shift Start (preserve durations)” + “Set Duration”
+
+client/src/pages/Stages.tsx (augment your per-area toolbar further)
+
+const [shiftStart,setShiftStart]=useState<number>(0);
+const [setDur,setSetDur]=useState<number>(14);
+
+async function shiftAreaStartPreserve(area:string, days:number){
+  if (!days) return;
+  for (const s of groups[area]||[]){
+    const sd = s.start_date; const ed = s.end_date;
+    if (!sd) continue;
+    const newStart = shiftDate(sd, days);
+    let patch:any = { start_date: newStart };
+    if (ed){
+      const span = diffDays(sd, ed) || 0;
+      const newEnd = shiftDate(newStart, span);
+      patch.end_date = newEnd;
+    }
+    await saveField(s.id, patch);
+  }
+  toast({ title:"Shifted", description:`${area}: start dates ${days>0? '+'+days: days} day(s) (preserved durations)` });
+}
+
+async function setAreaDuration(area:string, days:number){
+  if (!days || days<0) return;
+  for (const s of groups[area]||[]){
+    const sd = s.start_date; if (!sd) continue;
+    const newEnd = shiftDate(sd, days);
+    await saveField(s.id, { end_date: newEnd });
+  }
+  toast({ title:"Applied", description:`${area}: durations set to ${days} day(s)` });
+}
+
+
+Add UI controls next to “Shift End / Save Group / Undo Group”:
+
+{/* START */}
+<div className="flex items-center gap-2">
+  <label className="text-[11px]">ΔStart</label>
+  <input className="border rounded p-1 text-xs w-[60px]" type="number" value={shiftStart}
+         onChange={e=>setShiftStart(parseInt(e.target.value||'0',10))}/>
+  <button className="brand-btn text-xs" onClick={()=>shiftAreaStartPreserve(area, shiftStart)}>Shift Start (preserve)</button>
+</div>
+{/* DURATION */}
+<div className="flex items-center gap-2">
+  <label className="text-[11px]">Duration (d)</label>
+  <input className="border rounded p-1 text-xs w-[60px]" type="number" value={setDur}
+         onChange={e=>setSetDur(parseInt(e.target.value||'14',10))}/>
+  <button className="brand-btn text-xs" onClick={()=>setAreaDuration(area, setDur)}>Set Duration</button>
+</div>
+
+3) Digests — “Changes by Area” grid + pre-filters + tab open
+
+server/routers/digest.py (append after computing change sets)
+
+def by_area(rows):
+    from collections import Counter
+    cnt = Counter([(r.get("area") or "Unassigned") for r in (rows or [])])
+    return sorted(cnt.items(), key=lambda x:(-x[1], x[0]))
+
+def area_chip(label, area, table="actions"):
+    base = os.getenv("APP_BASE_URL","").rstrip("/")
+    if table=="actions":
+        url = f"{base}/projects/{project_id}/actions/list#openFilters=1&area={area}"
+    else:
+        tab = "risks" if table=="risks" else "decisions"
+        url = f"{base}/projects/{project_id}/admin/audit-timeline#openFilters=1&tab={tab}&area={area}"
+    return f"<a href='{url}' style='text-decoration:none;border:1px solid #ddd;border-radius:6px;padding:4px 8px;margin:4px;color:#111;font-size:12px'>{label}: {area}</a>"
+
+areas_actions = by_area(chg_actions)
+areas_risks   = by_area(chg_risks)
+areas_decis   = by_area(chg_decis)
+
+if areas_actions or areas_risks or areas_decis:
+    html += "<h3>Changes by Area</h3><div>"
+    for (a,c) in areas_actions[:8]: html += area_chip(f"Actions {c}", a, "actions")
+    for (a,c) in areas_risks[:8]:   html += area_chip(f"Risks {c}", a, "risks")
+    for (a,c) in areas_decis[:8]:   html += area_chip(f"Decisions {c}", a, "decisions")
+    html += "</div>"
+
+
+Compact, scannable “changes by area”, with deep links that pre-open the correct tabs & filters.
+
+4) Wellness per-user printable HTML (brand header)
+
+server/routers/wellness_user_export_html.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import HTMLResponse
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+from ..brand.export_header import export_header_html
+
+router = APIRouter(prefix="/api/wellness", tags=["wellness"])
+
+@router.get("/user_export.html", response_class=HTMLResponse)
+def user_html(project_id: str = Query(...), user_id: str = Query(...),
+              start: str | None = None, end: str | None = None,
+              ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    org = sb.table("org_branding").select("*").eq("org_id", ctx.org_id).single().execute().data or {}
+    proj = sb.table("projects").select("code").eq("id", project_id).single().execute().data or {}
+    header = export_header_html(org, proj.get("code") or project_id)
+
+    q = sb.table("team_wellness_comments").select("created_at,score,comment")\
+         .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("user_id", user_id)
+    if start: q = q.gte("created_at", start)
+    if end: q = q.lte("created_at", end)
+    try: rows = q.order("created_at", desc=True).limit(500).execute().data or []
+    except Exception: rows = []
+
+    items = "".join([f"<li>{r.get('created_at')} • score {r.get('score')} — {(r.get('comment') or '')}</li>" for r in rows])
+    html = f"""
+    <html><head><meta name="viewport" content="width=device-width, initial-scale=1" /></head>
+    <body style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:880px;margin:auto">
+      {header}
+      <h2>Wellness — {user_id}</h2>
+      <ul>{items or "<li>No history</li>"}</ul>
+    </body></html>"""
+    return HTMLResponse(html)
+
+
+Mount in server/main.py:
+
+from .routers import wellness_user_export_html
+app.include_router(wellness_user_export_html.router)
+
+
+UI — add a “Print HTML” button in the per-user modal:
+
+<a className="brand-btn text-xs" target="_blank" rel="noreferrer"
+   href={`/api/wellness/user_export.html?project_id=${projectId}&user_id=${encodeURIComponent(userId)}${start?`&start=${start}`:""}${end?`&end=${end}`:""}`}>
+  Print HTML
+</a>
+
+5) 120-second validation
+
+Sign-Off v3.7: modal shows pending tokens with Revoke / Revoke All / Resend; auto-attaches stage default doc or last stage doc; presets remembered
+
+Stages: per-area toolbar can Shift Start (preserve durations) and Set Duration; Save/Undo Group & global Save/Undo All work; date inputs still support keyboard arrows
+
+Digests: compact “Changes by Area” chips; deep links open correct tab & pre-filters then scroll/glow
+
+Wellness: per-user Print HTML with brand header; admin compare overlay & CSV already present

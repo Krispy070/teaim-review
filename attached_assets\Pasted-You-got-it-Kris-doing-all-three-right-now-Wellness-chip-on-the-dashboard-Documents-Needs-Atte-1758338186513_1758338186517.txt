@@ -1,0 +1,404 @@
+You got it, Kris — doing all three right now:
+
+Wellness chip on the dashboard
+
+Documents “Needs Attention” lane for OCR items (list + resolve)
+
+Admin Backups viewer (list backups, see contents, download a file from a backup, store a file back into artifacts/restores/)
+
+Everything below is paste-ready. If a file path differs in your repo, tell me and I’ll refit it 1:1.
+
+0) Minimal assumptions (no extra SQL required)
+
+We already created wellness_checkins, review_items, and the backups bucket.
+
+Backups are written as zips at: backups/org/{org_id}/project/{project_id}/{YYYYMMDD}.zip.
+
+We’ll use service-key storage access server-side (membership enforced before doing anything).
+
+1) Wellness chip on the Dashboard
+1A) Tiny component
+
+client/src/components/WellnessChip.tsx
+
+import { useEffect, useState } from "react";
+
+export default function WellnessChip({ projectId }:{ projectId: string }) {
+  const [avg, setAvg] = useState<number | null>(null);
+  const [down, setDown] = useState<boolean>(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await fetch(`/api/wellness/summary?project_id=${projectId}`, { credentials: "include" });
+        if (!r.ok) return;
+        const d = await r.json();
+        setAvg(d.avg7 ?? null);
+        setDown(!!d.trend_down);
+      } catch {}
+    })();
+  }, [projectId]);
+
+  if (avg === null) return null;
+
+  return (
+    <div className="inline-flex items-center gap-2 px-2 py-1 rounded-full border text-sm">
+      <span className="font-medium">Wellness</span>
+      <span className={`px-1.5 rounded ${down ? "bg-yellow-500 text-white" : "bg-green-600 text-white"}`}>
+        {avg.toFixed(2)}
+      </span>
+      {down && <span className="text-xs">⚠️ trend↓</span>}
+    </div>
+  );
+}
+
+1B) Drop it onto your Dashboard header
+
+client/src/pages/ProjectDashboard.tsx (or equivalent)
+
+import WellnessChip from "@/components/WellnessChip";
+// ...
+<h1 className="text-2xl font-semibold flex items-center gap-3">
+  Project Dashboard
+  <WellnessChip projectId={projectId!} />
+</h1>
+
+2) Documents “Needs Attention (OCR)” lane
+2A) API: list + resolve
+
+Extend the review router we added earlier.
+
+server/routers/review.py
+
+from fastapi import APIRouter, Depends, Query, HTTPException
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/review", tags=["review"])
+ADMIN_OR_PM = require_role({"owner","admin","pm"})
+
+@router.get("/pending-count")
+def pending_count(kind: str = Query(...), project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    r = sb.table("review_items").select("id", count="exact")\
+        .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+        .eq("kind", kind).eq("status","pending").execute()
+    return {"count": r.count or 0}
+
+@router.get("/list")
+def list_items(kind: str = Query(...), project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    r = sb.table("review_items").select("id,artifact_id,kind,severity,details,created_at")\
+        .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+        .eq("kind", kind).eq("status","pending").order("created_at", desc=True).limit(100).execute()
+    return {"items": r.data or []}
+
+@router.post("/resolve")
+def resolve_item(item_id: str = Query(...), project_id: str = Query(...), ctx: TenantCtx = Depends(ADMIN_OR_PM)):
+    sb = get_user_supabase(ctx)
+    # ensure belongs to org/project
+    exists = sb.table("review_items").select("id").eq("org_id", ctx.org_id)\
+             .eq("project_id", project_id).eq("id", item_id).limit(1).execute().data
+    if not exists: raise HTTPException(404, "Review item not found")
+    sb.table("review_items").update({"status":"resolved"}).eq("id", item_id).execute()
+    return {"ok": True}
+
+
+(Ensure it’s mounted: app.include_router(review.router).)
+
+2B) UI lane on Documents page
+
+client/src/components/NeedsAttentionLane.tsx
+
+import { useEffect, useState } from "react";
+
+export default function NeedsAttentionLane({ projectId }:{ projectId:string }) {
+  const [items,setItems] = useState<any[]>([]);
+  const [loading,setLoading] = useState(false);
+  const [isAdminPm,setIsAdminPm] = useState<boolean>(false); // derive from your session/role store if available
+
+  async function load(){
+    setLoading(true);
+    try {
+      const r = await fetch(`/api/review/list?project_id=${projectId}&kind=needs_ocr`, { credentials: "include" });
+      if (r.ok) setItems((await r.json()).items || []);
+    } finally { setLoading(false); }
+  }
+  useEffect(()=>{ load(); }, [projectId]);
+
+  async function resolve(id:string){
+    if (!confirm("Mark as resolved?")) return;
+    const r = await fetch(`/api/review/resolve?project_id=${projectId}&item_id=${id}`, { method:"POST", credentials: "include" });
+    if (r.ok) load();
+  }
+
+  if (loading) return <div className="p-3 border rounded">Loading…</div>;
+  if (!items.length) return null;
+
+  return (
+    <div className="border rounded p-3 space-y-2">
+      <div className="text-sm font-medium">Needs Attention (OCR)</div>
+      <div className="grid gap-2">
+        {items.map((x:any)=>(
+          <div key={x.id} className="flex items-center justify-between border rounded p-2">
+            <div className="text-sm">
+              <div className="font-medium">{x.details?.filename || x.artifact_id}</div>
+                <div className="text-xs text-muted-foreground">Reason: {x.details?.reason || "low_text"}</div>
+            </div>
+            <div className="flex items-center gap-2">
+              {/* Link to your artifact view if available */}
+              {/* <Link className="text-sm underline" to={`/projects/${projectId}/documents/${x.artifact_id}`}>Open</Link> */}
+              {isAdminPm && (
+                <button className="px-2 py-1 text-sm border rounded" onClick={()=>resolve(x.id)}>Resolve</button>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
+Add lane at the top of your Documents page:
+
+import NeedsAttentionLane from "@/components/NeedsAttentionLane";
+// ...
+<div className="space-y-4">
+  <NeedsAttentionLane projectId={projectId!} />
+  {/* existing documents grid/list below */}
+</div>
+
+
+You already added a badge next to the Documents nav earlier; this lane gives the detail list + resolve.
+
+3) Admin Backups Viewer (list → contents → download/store a file)
+3A) Router: list, contents, download one file, store one file
+
+server/routers/backups.py
+
+from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi.responses import StreamingResponse, FileResponse
+from io import BytesIO
+import zipfile, tempfile, os, datetime as dt
+
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase, get_service_supabase
+
+router = APIRouter(prefix="/api/backups", tags=["backups"])
+ADMIN_OR_OWNER = require_role({"owner","admin"})
+
+def _list_backups(sb_service, org_id: str, project_id: str):
+    prefix = f"org/{org_id}/project/{project_id}/"
+    items = sb_service.storage().from_("backups").list(prefix) or []
+    # Supabase returns array of objects with 'name','updated_at','id','metadata' etc.
+    out = []
+    for it in items:
+        out.append({
+            "key": prefix + it.get("name"),
+            "name": it.get("name"),
+            "updated_at": it.get("updated_at"),
+            "size": (it.get("metadata") or {}).get("size")
+        })
+    return out
+
+@router.get("/list")
+def list_backups(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sbs = get_service_supabase()
+    return {"backups": _list_backups(sbs, ctx.org_id, project_id)}
+
+@router.get("/contents")
+def backup_contents(backup_key: str = Query(...), project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sbs = get_service_supabase()
+    # download zip head (limit to ~250MB)
+    b = sbs.storage().from_("backups").download(backup_key)
+    if not b: raise HTTPException(404, "Backup not found")
+    if len(b) > 250*1024*1024: raise HTTPException(413, "Backup too large to inspect")
+    zf = zipfile.ZipFile(BytesIO(b), "r")
+    entries = []
+    for zi in zf.infolist():
+        entries.append({"name": zi.filename, "size": zi.file_size})
+    return {"entries": entries}
+
+@router.get("/get-file")
+def get_file(backup_key: str = Query(...), artifact_name: str = Query(...),
+             project_id: str = Query(...), ctx: TenantCtx = Depends(ADMIN_OR_OWNER)):
+    sbs = get_service_supabase()
+    b = sbs.storage().from_("backups").download(backup_key)
+    if not b: raise HTTPException(404, "Backup not found")
+    zf = zipfile.ZipFile(BytesIO(b), "r")
+    path = artifact_name if artifact_name.startswith("artifacts/") else f"artifacts/{artifact_name}"
+    try:
+        data = zf.read(path)
+    except KeyError:
+        raise HTTPException(404, "Artifact not found in backup")
+    # stream as download
+    return StreamingResponse(iter([data]), media_type="application/octet-stream",
+                             headers={"Content-Disposition": f'attachment; filename="{os.path.basename(path)}"'})
+
+@router.post("/store-file")
+def store_file(backup_key: str = Query(...), artifact_name: str = Query(...),
+               project_id: str = Query(...), ctx: TenantCtx = Depends(ADMIN_OR_OWNER)):
+    sbs = get_service_supabase()
+    b = sbs.storage().from_("backups").download(backup_key)
+    if not b: raise HTTPException(404, "Backup not found")
+    zf = zipfile.ZipFile(BytesIO(b), "r")
+    path = artifact_name if artifact_name.startswith("artifacts/") else f"artifacts/{artifact_name}"
+    try:
+        data = zf.read(path)
+    except KeyError:
+        raise HTTPException(404, "Artifact not found in backup")
+
+    # store under artifacts/restores/
+    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    fname = os.path.basename(path)
+    key = f"org/{ctx.org_id}/project/{project_id}/restores/{ts}__{fname}"
+    try:
+        sbs.storage().from_("artifacts").upload(key, data, {
+            "content-type": "application/octet-stream",
+            "upsert": True
+        })
+    except Exception as e:
+        raise HTTPException(500, f"Upload failed: {e}")
+
+    # Optional: write an audit event
+    try:
+        sbs.table("audit_events").insert({
+            "org_id": ctx.org_id, "project_id": project_id,
+            "actor_id": ctx.user_id, "kind": "backup.restore_file",
+            "details": {"backup_key": backup_key, "artifact": artifact_name, "stored_as": key}
+        }).execute()
+    except Exception:
+        pass
+
+    return {"ok": True, "stored_key": key}
+
+
+Mount in server/main.py:
+
+from .routers import backups
+app.include_router(backups.router)
+
+3B) Admin Backups UI
+
+client/src/pages/AdminBackups.tsx
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+
+type Backup = { key:string; name:string; updated_at?:string; size?:number };
+type Entry = { name:string; size:number };
+
+export default function AdminBackups(){
+  const { projectId } = useParams();
+  const [items,setItems] = useState<Backup[]>([]);
+  const [sel,setSel] = useState<Backup|null>(null);
+  const [entries,setEntries] = useState<Entry[]>([]);
+  const [loading,setLoading] = useState(false);
+
+  async function load(){
+    const r = await fetch(`/api/backups/list?project_id=${projectId}`, { credentials:"include" });
+    if (r.ok) setItems((await r.json()).backups || []);
+  }
+  useEffect(()=>{ load(); }, [projectId]);
+
+  async function openBackup(b:Backup){
+    setSel(b); setEntries([]); setLoading(true);
+    const r = await fetch(`/api/backups/contents?project_id=${projectId}&backup_key=${encodeURIComponent(b.key)}`, { credentials:"include" });
+    setLoading(false);
+    if (r.ok) setEntries((await r.json()).entries || []);
+  }
+
+  async function downloadFile(name:string){
+    const u = `/api/backups/get-file?project_id=${projectId}&backup_key=${encodeURIComponent(sel!.key)}&artifact_name=${encodeURIComponent(name)}`;
+    const res = await fetch(u, { credentials:"include" });
+    if (!res.ok) { alert(await res.text()); return; }
+    const blob = await res.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name.split("/").pop() || "file";
+    document.body.appendChild(a); a.click(); URL.revokeObjectURL(a.href); a.remove();
+  }
+
+  async function storeFile(name:string){
+    const u = `/api/backups/store-file?project_id=${projectId}&backup_key=${encodeURIComponent(sel!.key)}&artifact_name=${encodeURIComponent(name)}`;
+    const r = await fetch(u, { method:"POST", credentials:"include" });
+    if (r.ok) {
+      const d = await r.json();
+      alert(`Stored to artifacts: ${d.stored_key}`);
+    } else {
+      alert(await r.text());
+    }
+  }
+
+  return (
+    <div className="p-6 space-y-4">
+      <h1 className="text-xl font-semibold">Backups</h1>
+
+      <div className="border rounded">
+        {items.map(b=>(
+          <div key={b.key} className="p-2 border-b last:border-0 flex items-center justify-between">
+            <div className="text-sm">
+              <div className="font-medium">{b.name}</div>
+              <div className="text-xs text-muted-foreground">{b.updated_at}</div>
+            </div>
+            <button className="px-3 py-1 border rounded" onClick={()=>openBackup(b)}>Open</button>
+          </div>
+        ))}
+        {!items.length && <div className="p-3 text-sm text-muted-foreground">No backups yet.</div>}
+      </div>
+
+      {sel && (
+        <div className="border rounded p-3">
+          <div className="text-sm font-medium mb-2">Backup contents: {sel.name}</div>
+          {loading && <div>Loading…</div>}
+          {!loading && (
+            <div className="grid gap-2">
+              {entries.filter(e=>e.name.startsWith("artifacts/")).map(e=>(
+                <div key={e.name} className="flex items-center justify-between border rounded px-2 py-1">
+                  <div className="text-sm">{e.name} <span className="text-xs text-muted-foreground">({e.size} bytes)</span></div>
+                  <div className="flex items-center gap-2">
+                    <button className="px-2 py-1 border rounded text-sm" onClick={()=>downloadFile(e.name)}>Download</button>
+                    <button className="px-2 py-1 border rounded text-sm" onClick={()=>storeFile(e.name)}>Store→Restores</button>
+                  </div>
+                </div>
+              ))}
+              {!entries.filter(e=>e.name.startsWith("artifacts/")).length && (
+                <div className="text-sm text-muted-foreground">No artifact files found in this backup.</div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+Add route & admin link:
+
+{ path: "/projects/:projectId/admin/backups", element: <AdminBackups/> }
+
+4) Quick verification checklist (5 min)
+
+Wellness chip
+
+Add two check-ins (3, then 2). Chip shows average; if last three move down, shows ⚠️.
+
+Needs Attention lane
+
+Upload a low-text scanned PDF → review_items created with kind='needs_ocr'.
+
+Documents page shows lane with entry; click Resolve → it disappears; badge count drops.
+
+Backups viewer
+
+Scheduler creates backup at 02:00 local (or manually place one in the bucket for testing).
+
+Admin → Backups lists zip(s); open a backup → entries appear.
+
+Download a single file; Store→Restores writes to artifacts/org/.../restores/<ts>__file.
+
+Audit event backup.restore_file appears in Audit Viewer.

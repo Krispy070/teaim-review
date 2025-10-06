@@ -1,0 +1,357 @@
+Kris — love the momentum. I reviewed the Replit log: routing’s standardized, webhooks, invite, classifier ingest, and visibility guards are in; RLS Self-Test is admin-gated and secure; Composer has a smart Stage-Area select. You’ve got one dev-auth hiccup (impersonation sometimes loses projectId), but that’s environmental. Let’s ship the next big push to make this airtight and demo-ready:
+
+Composer “Generate Kap Draft” (prompt → auto-draft sign-off HTML)
+
+Slack/Teams message formatting (rich, readable)
+
+“Apply All Safe” polish (threshold slider + selection-only option)
+
+Stage-area enforcement in sign-off decisions (clean errors, logs)
+
+Invite via email token (link + accept endpoint)
+
+Dev impersonation stabilizer (always carry projectId in client)
+
+All patches are drop-in.
+
+1) Composer — Generate Kap Draft (PM prompt → HTML)
+1A) Backend generator (simple template; LLM-ready hook)
+
+server/routers/signoff_docs_gen.py
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase, get_service_supabase
+from datetime import datetime, timezone
+
+router = APIRouter(prefix="/api/signoff/docs", tags=["signoff-docs"])
+PM_PLUS = require_role({"owner","admin","pm"})
+
+class DraftReq(BaseModel):
+    stage_id: str | None = None
+    area: str | None = None
+    title: str = "Customer Acknowledgement"
+    summary: str
+    bullets: list[str] = []
+    acceptance: str = "I acknowledge and approve the above."
+    footer: str = "Signed electronically via TEAIM"
+
+def _html(name: str, body: DraftReq, proj_code: str):
+    items = "".join([f"<li>{b}</li>" for b in (body.bullets or [])])
+    area = f"<div style='color:#888'>Area: {body.area}</div>" if body.area else ""
+    return f"""
+    <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:880px;margin:auto">
+      <h2>{name}</h2>
+      <div style="color:#555;">Project: {proj_code}</div>
+      {area}
+      <p>{body.summary}</p>
+      {'<ul>'+items+'</ul>' if items else ''}
+      <p style="margin-top:16px">{body.acceptance}</p>
+      <hr/>
+      <div style="color:#888;font-size:12px">{body.footer}</div>
+    </div>
+    """
+
+@router.post("/generate_from_prompt")
+def generate_from_prompt(body: DraftReq, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx); sbs = get_service_supabase()
+    proj = sb.table("projects").select("code").eq("id", project_id).single().execute().data
+    code = (proj or {}).get("code") or project_id
+
+    # TODO: plug LLM here; for now, template based on prompt fields
+    html = _html(body.title, body, code)
+    rec = sbs.table("signoff_docs").insert({
+        "org_id": ctx.org_id, "project_id": project_id,
+        "stage_id": body.stage_id, "name": body.title,
+        "html": html, "status": "draft", "created_by": ctx.user_id, "kind": "customer_ack"
+    }).execute().data[0]
+    return {"ok": True, "doc": rec}
+
+
+Mount in server/main.py:
+
+from .routers import signoff_docs_gen
+app.include_router(signoff_docs_gen.router)
+
+1B) Composer UI — “Kap Draft” modal
+
+Patch client/src/pages/SignoffComposer.tsx:
+
+const [kapOpen,setKapOpen]=useState(false);
+const [kapSummary,setKapSummary]=useState("");
+const [kapBullets,setKapBullets]=useState("Scope finalized|Cutover window confirmed");
+async function generateKap(){
+  const body = {
+    stage_id: "", area: stageArea || undefined,
+    title: stageTitle || "Customer Acknowledgement",
+    summary: kapSummary,
+    bullets: kapBullets.split("|").map(s=>s.trim()).filter(Boolean),
+    acceptance: "I acknowledge and approve the above.",
+    footer: "Signed electronically via TEAIM"
+  };
+  await postJSON(`/api/signoff/docs/generate_from_prompt?project_id=${projectId}`, body);
+  setKapOpen(false); alert("Draft created in Sign-Off Docs");
+}
+
+{/* next to stage area controls */}
+<button className="px-2 py-1 border rounded text-xs" onClick={()=>setKapOpen(true)}>Generate Kap Draft</button>
+
+{kapOpen && (
+  <div className="fixed inset-0 bg-black/30 z-[80] flex items-center justify-center" onClick={()=>setKapOpen(false)}>
+    <div className="w-[580px] bg-white border rounded shadow-xl p-3" onClick={e=>e.stopPropagation()}>
+      <div className="text-sm font-medium mb-2">Generate Kap Draft</div>
+      <textarea className="w-full h-[120px] border rounded p-2 text-sm" placeholder="PM summary for this sign-off…" value={kapSummary} onChange={e=>setKapSummary(e.target.value)} />
+      <input className="border rounded p-2 w-full mt-2" placeholder="Bullets (separate with |)" value={kapBullets} onChange={e=>setKapBullets(e.target.value)} />
+      <div className="mt-2 flex gap-2">
+        <button className="px-3 py-2 border rounded" onClick={generateKap}>Generate</button>
+        <button className="px-3 py-2 border rounded" onClick={()=>setKapOpen(false)}>Cancel</button>
+      </div>
+    </div>
+  </div>
+)}
+
+2) Slack/Teams message formatting (clean)
+
+Patch server/utils/events.py:
+
+def emit_event(org_id: str, project_id: str | None, kind: str, details: dict):
+    sbs = get_service_supabase()
+    try:
+        r = sbs.table("org_webhooks").select("*").eq("org_id", org_id).single().execute()
+        cfg = r.data
+    except Exception:
+        cfg = None
+    if not cfg or not cfg.get("enabled"): return
+
+    # Pretty payload
+    pretty = json.dumps(details, indent=2, ensure_ascii=False)
+    proj = f" • project: {project_id}" if project_id else ""
+    title = f"TEAIM: {kind}{proj}"
+    payload = {"org_id": org_id, "project_id": project_id, "kind": kind, "details": details}
+
+    # Slack blocks
+    if cfg.get("slack_url"):
+        slack = {
+          "blocks": [
+            {"type":"header","text":{"type":"plain_text","text":title,"emoji":True}},
+            {"type":"section","text":{"type":"mrkdwn","text":f"```{pretty}```"}}
+          ]
+        }
+        _post(cfg["slack_url"], slack)
+    # Teams
+    if cfg.get("teams_url"):
+        teams = {
+          "@type": "MessageCard", "@context": "https://schema.org/extensions",
+          "summary": title, "themeColor": "0078D4",
+          "sections": [{"activityTitle": title, "text": f"<pre>{pretty}</pre>"}]
+        }
+        _post(cfg["teams_url"], teams)
+    if cfg.get("generic_url"):
+        _post(cfg["generic_url"], payload)
+
+3) Apply-All-Safe polish (threshold slider + “selection only”)
+
+Patch client/src/pages/UpdatesReview.tsx:
+
+const [thresh,setThresh] = useState<number>(0.85);
+const [selOnly,setSelOnly] = useState(false);
+const [selected,setSelected] = useState<Record<string,boolean>>({});
+
+function toggleSel(id:string){ setSelected(prev=>({...prev, [id]: !prev[id]})); }
+
+async function applyAllSafe(){
+  try{
+    const idsAll = items
+      .filter(i => i.status==="pending" && Number(i.confidence??0) >= thresh)
+      .map(i=>i.id);
+    const ids = selOnly ? idsAll.filter(id=>selected[id]) : idsAll;
+    if (!ids.length) { alert(`No pending items ≥ ${thresh}`); return; }
+    await postJSON(`/api/updates/batch_approve?project_id=${projectId}`, { ids });
+    load();
+  }catch(e:any){ alert(`Apply all safe failed: ${String(e?.message||e)}`); }
+}
+
+// Controls in toolbar:
+<div className="flex items-center gap-2 ml-auto">
+  <label className="text-xs">Min conf</label>
+  <input type="number" step="0.01" min={0} max={1} className="border rounded p-1 w-[80px]" value={thresh} onChange={e=>setThresh(parseFloat(e.target.value||"0.85"))}/>
+  <label className="text-xs flex items-center gap-1">
+    <input type="checkbox" checked={selOnly} onChange={e=>setSelOnly(e.target.checked)}/> selection only
+  </label>
+  <button className="px-3 py-2 border rounded" onClick={applyAllSafe}>Apply All Safe</button>
+</div>
+
+// In list items, add a checkbox:
+{items.map(u=>(
+  <div key={u.id} className="py-2 hover:bg-neutral-50 grid grid-cols-[18px_auto] gap-2 items-start" onClick={()=>open(u)}>
+    <input type="checkbox" checked={!!selected[u.id]} onChange={e=>{ e.stopPropagation(); toggleSel(u.id);} }/>
+    <div>
+      <div className="text-sm"><b>{u.change_type}</b> • {u.operation} • {u.target_table} {u.target_id ? `(${u.target_id.slice(0,8)}…)` : "(new)"} </div>
+      <div className="text-xs text-muted-foreground">conf={u.confidence ?? "—"} • {u.created_at}</div>
+    </div>
+  </div>
+))}
+
+4) Stage-area enforcement on sign-off decision
+
+Patch your decision route (PM or external token). After membership check and before status change:
+
+# Enforce area authority when non-admin
+if ctx.role not in {"owner","admin"}:
+    st = sb.table("project_stages").select("area").eq("org_id", ctx.org_id).eq("project_id", project_id)\
+         .eq("id", body.stage_id).single().execute().data
+    area = st and st.get("area")
+    acc = sb.table("project_member_access").select("can_sign_all,sign_areas")\
+          .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("user_id", ctx.user_id).limit(1).execute().data
+    allowed = False
+    if acc:
+        a = acc[0]
+        allowed = bool(a.get("can_sign_all")) or (area and area in (a.get("sign_areas") or []))
+    if not allowed:
+        # generic error to avoid info leak
+        raise HTTPException(403, "Not authorized to sign this stage")
+
+
+(External token path usually bypasses user roles; keep that behavior or require a sign-area mapping for external email if you want.)
+
+5) Invite via email token (accept flow)
+5A) DB table for pending invites
+create table if not exists public.pending_invites (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid not null,
+  project_id uuid not null,
+  email text not null,
+  role text not null,
+  can_view_all boolean not null default true,
+  visibility_areas text[] default '{}',
+  can_sign_all boolean not null default false,
+  sign_areas text[] default '{}',
+  token text not null unique,
+  expires_at timestamptz not null,
+  used_at timestamptz,
+  created_at timestamptz not null default now()
+);
+alter table public.pending_invites enable row level security;
+create policy "pi_read_admin" on public.pending_invites
+for select using (org_id = public.current_org() and public.has_role(org_id, null, array['owner','admin']));
+create policy "pi_insert_admin" on public.pending_invites
+for insert with check (org_id = public.current_org() and public.has_role(org_id, null, array['owner','admin']));
+create policy "pi_update_admin" on public.pending_invites
+for update using (org_id = public.current_org() and public.has_role(org_id, null, array['owner','admin']))
+with check (org_id = public.current_org());
+select pg_notify('pgrst','reload schema');
+
+5B) Router
+
+server/routers/invite_token.py
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+from datetime import datetime, timedelta, timezone
+import secrets, os
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase, get_service_supabase
+
+router = APIRouter(prefix="/api/invite", tags=["invite"])
+ADMIN = require_role({"owner","admin"})
+
+class InviteTokenBody(BaseModel):
+  email: str
+  role: str
+  can_view_all: bool = True
+  visibility_areas: list[str] = []
+  can_sign_all: bool = False
+  sign_areas: list[str] = []
+  expires_hours: int = 72
+
+@router.post("/create_token")
+def create_token(body: InviteTokenBody, project_id: str = Query(...), ctx: TenantCtx = Depends(ADMIN)):
+  sbs = get_service_supabase()
+  token = secrets.token_urlsafe(32)
+  exp = datetime.now(timezone.utc) + timedelta(hours=int(body.expires_hours))
+  sbs.table("pending_invites").insert({
+    "org_id": ctx.org_id, "project_id": project_id, "email": body.email, "role": body.role,
+    "can_view_all": body.can_view_all, "visibility_areas": body.visibility_areas,
+    "can_sign_all": body.can_sign_all, "sign_areas": body.sign_areas,
+    "token": token, "expires_at": exp.isoformat()
+  }).execute()
+  link = f"{os.getenv('APP_BASE_URL','').rstrip('/')}/invite/accept/{token}"
+  return {"ok": True, "link": link}
+
+@router.get("/accept/{token}")
+def accept_token(token: str):
+  sbs = get_service_supabase()
+  row = sbs.table("pending_invites").select("*").eq("token", token).limit(1).execute().data
+  if not row: raise HTTPException(404, "Invalid token")
+  r = row[0]
+  if r.get("used_at"): raise HTTPException(400, "Token used")
+  if datetime.now(timezone.utc) > datetime.fromisoformat(r["expires_at"]):
+    raise HTTPException(400, "Token expired")
+  # seed membership
+  sbs.table("project_members").upsert({
+    "org_id": r["org_id"], "project_id": r["project_id"], "user_id": r["email"], "role": r["role"]
+  }, on_conflict="org_id,project_id,user_id").execute()
+  sbs.table("project_member_access").upsert({
+    "org_id": r["org_id"], "project_id": r["project_id"], "user_id": r["email"],
+    "can_view_all": r["can_view_all"], "visibility_areas": r["visibility_areas"],
+    "can_sign_all": r["can_sign_all"], "sign_areas": r["sign_areas"]
+  }, on_conflict="org_id,project_id,user_id").execute()
+  sbs.table("pending_invites").update({"used_at": datetime.now(timezone.utc).isoformat()}).eq("id", r["id"]).execute()
+  return {"ok": True}
+
+
+Mount:
+
+from .routers import invite_token
+app.include_router(invite_token.router)
+
+
+(You can add a tiny UI to generate the token link inside AdminInvite later.)
+
+6) Dev impersonation stabilizer (always carry projectId)
+
+client/src/lib/projectCtx.ts
+
+import { useEffect } from "react";
+export function usePersistProjectId(projectId?: string){
+  useEffect(()=>{ if (projectId) sessionStorage.setItem("kap.projectId", projectId); },[projectId]);
+}
+export function getPersistedProjectId(): string | null {
+  return sessionStorage.getItem("kap.projectId");
+}
+
+
+Use in top-level project pages (Dashboard, Composer, Stages, UpdatesReview, etc.):
+
+import { usePersistProjectId } from "@/lib/projectCtx";
+const { projectId } = useParams();
+usePersistProjectId(projectId);
+
+
+And in components that sometimes lose params, fallback:
+
+import { getPersistedProjectId } from "@/lib/projectCtx";
+// ...
+const pid = projectId || getPersistedProjectId() || "";
+
+
+This fixes the intermittent project_id=undefined in dev.
+
+7) Final quick tests
+
+Kap Draft: open Composer → Generate; new doc appears in Sign-Off Docs.
+
+Slack/Teams: set webhook; click Test; approve a review; sign a doc → messages appear.
+
+Apply-All-Safe: change threshold + “selection only”; only those updates apply.
+
+Sign-off decision: signer without area → 403; admin → OK.
+
+Invite via token: create token; GET accept URL → member/access rows created.
+
+RLS Self-Test: PASS or INCONCLUSIVE (admin-gated).
+
+Dev impersonation: no more missing projectId.

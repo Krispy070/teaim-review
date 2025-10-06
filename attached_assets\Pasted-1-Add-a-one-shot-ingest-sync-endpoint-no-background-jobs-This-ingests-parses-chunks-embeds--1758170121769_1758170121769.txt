@@ -1,0 +1,124 @@
+1) Add a one-shot /ingest-sync endpoint (no background jobs)
+
+This ingests, parses, chunks, embeds, and writes rows inline so you can see chunks immediately (great for debugging).
+
+# /server/main.py — add alongside /ingest
+from fastapi import HTTPException
+from .rag import embed_texts  # already in your project
+# parsing.extract_text and chunking.chunk_text already imported
+
+@app.post("/ingest-sync")
+async def ingest_sync(org_id: str = Form(...),
+                      project_id: str = Form(...),
+                      source: str = Form("doc"),
+                      file: UploadFile = File(...)):
+    try:
+        data = await file.read()
+        key = f"{project_id}/{file.filename}"
+        # 1) store file
+        sb.storage.from_(BUCKET).upload(key, data, {
+            "contentType": file.content_type or "application/octet-stream",
+            "upsert": True
+        })
+        # 2) artifact row
+        art = sb.table("artifacts").insert({
+            "org_id": org_id,
+            "project_id": project_id,
+            "path": key,
+            "mime_type": file.content_type,
+            "title": file.filename,
+            "source": source
+        }).execute().data[0]
+        # 3) parse -> chunk -> embed -> insert
+        text = extract_text(file.filename, data, file.content_type)
+        chunks = chunk_text(text, 1200, 200)
+        embs = embed_texts(chunks) if chunks else []
+        rows = [{
+            "org_id": org_id,
+            "project_id": project_id,
+            "artifact_id": art["id"],
+            "chunk_index": i,
+            "content": c,
+            "embedding": e
+        } for i, (c, e) in enumerate(zip(chunks, embs))]
+        if rows:
+            for i in range(0, len(rows), 200):
+                sb.table("artifact_chunks").insert(rows[i:i+200]).execute()
+        sb.table("artifacts").update({"chunk_count": len(rows)}).eq("id", art["id"]).execute()
+        # 4) tiny summary
+        sb.table("summaries").insert({
+            "org_id": org_id, "project_id": project_id,
+            "artifact_id": art["id"], "level": "artifact",
+            "summary": text[:2000]
+        }).execute()
+        return {"ok": True, "artifact_id": art["id"], "chunks": len(rows)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+Proxy is already set, so you’ll call it as /api/ingest-sync.
+
+2) Make index stats avoid PostgREST flakiness
+
+Your /api/diag/index-stats currently uses Supabase selects (PostgREST). Let’s keep those, but fallback to psycopg so you always get real counts.
+
+# /server/main.py — replace index_stats with this version
+from .db import get_conn
+
+@app.get("/diag/index-stats")
+def index_stats(org_id: str, project_id: str):
+    try:
+        a = sb.table("artifacts").select("id", count="exact").eq("org_id", org_id).eq("project_id", project_id).execute()
+        c = sb.table("artifact_chunks").select("id", count="exact").eq("org_id", org_id).eq("project_id", project_id).execute()
+        return {"artifacts": a.count or 0, "chunks": c.count or 0, "via": "postgrest"}
+    except Exception:
+        # psycopg fallback
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("select count(*) from artifacts where org_id=%s and project_id=%s", (org_id, project_id))
+            art = cur.fetchone()[0]
+            cur.execute("select count(*) from artifact_chunks where org_id=%s and project_id=%s", (org_id, project_id))
+            chk = cur.fetchone()[0]
+            return {"artifacts": art, "chunks": chk, "via": "psycopg"}
+
+3) Quick test sequence (copy/paste)
+
+A) Ingest inline
+
+echo "Workday test doc about payroll retro rules and SIT exit criteria." > /tmp/teaim.txt
+curl -s -X POST http://localhost:5000/api/ingest-sync \
+  -F "org_id=d915376c-2bd7-4e79-b9c9-aab9d7fcb5a8" \
+  -F "project_id=dced0b98-87b4-46ff-b2a4-2cf8e627e8d2" \
+  -F "file=@/tmp/teaim.txt"
+
+
+You should see {"ok":true, "artifact_id":"…", "chunks": N }.
+
+B) Verify index
+
+curl -s "http://localhost:5000/api/diag/index-stats?org_id=d915376c-2bd7-4e79-b9c9-aab9d7fcb5a8&project_id=dced0b98-87b4-46ff-b2a4-2cf8e627e8d2"
+# expect chunks > 0
+
+
+C) Ask Kap
+In the UI (Chat Dock), ask:
+“Summarize the latest document and list any decisions or exit criteria mentioned.”
+
+You should get an answer + “Sources: teaim.txt”.
+
+4) Wire the UI to use /api/ingest-sync temporarily
+
+Until the background job path is perfect, point your upload to the sync endpoint:
+
+- const res = await fetch('/api/ingest', { method:'POST', body: fd });
++ const res = await fetch('/api/ingest-sync', { method:'POST', body: fd });
+
+
+Once you’re happy, flip it back to /api/ingest to use background processing.
+
+5) If anything still blocks
+
+/api/diag/openai returns {ok:true} → your key/egress are fine.
+
+/api/diag/index-stats returns chunks 0 after sync ingest → check /tmp/fastapi.log for parsing/embedding errors.
+
+Ask still returns “need more context” → ensure you used the same org/project UUIDs in header and ingest.

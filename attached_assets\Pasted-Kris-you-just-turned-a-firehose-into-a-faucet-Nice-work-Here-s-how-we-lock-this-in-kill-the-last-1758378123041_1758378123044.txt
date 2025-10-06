@@ -1,0 +1,156 @@
+Kris, you just turned a firehose into a faucet. Nice work. Here’s how we lock this in, kill the last surprise 500s, and roll a crisp validation pass before we move to the next sprint.
+
+Status snapshot (where you are)
+
+Re-ingest + toasts + “View in Documents” — wired.
+
+Backups viewer (list/contents/download/store+re-ingest) — wired.
+
+QA seeder + Smoke Runner (seed → stage → external sign-off link → digest preview) — wired.
+
+Dev ⇄ Prod auth — fixed; dev headers on apiPost, prod uses Bearer.
+
+RBAC / tenant isolation — enforced throughout.
+
+Fast hardening (kills remaining 500s)
+
+Supabase envs (server)
+Set all three (even if you mostly use service role):
+
+SUPABASE_URL=<from Supabase>
+SUPABASE_ANON_KEY=<anon key>
+SUPABASE_SERVICE_ROLE_KEY=<service role key>
+
+
+User-scoped calls (RLS on): uses ANON + user JWT.
+
+Service ops (seed/backups/restore): uses SERVICE_ROLE_KEY.
+
+Internal calls
+
+Set FASTAPI_URL=http://127.0.0.1:5000 (or your actual backend URL).
+
+(Prod) Set INTERNAL_API_BEARER=<service JWT or internal token> so /reingest-stored → /ingest-sync succeeds without dev headers.
+
+Dev toggles (keep in sync)
+
+Backend: DEV_AUTH=1
+
+Frontend: VITE_DEV_AUTH=1, VITE_DEV_USER=<UUID>, VITE_DEV_ORG=<UUID>, VITE_DEV_ROLE=owner
+Flip both to 0 for prod.
+
+Schema cache (fix sporadic “table not found”)
+After any SQL change:
+
+select pg_notify('pgrst', 'reload schema');
+
+
+Buckets exist
+
+artifacts (project files / restores)
+
+backups (nightly ZIPs)
+
+Mailgun (for digest/sign-off emails)
+
+MAILGUN_DOMAIN=...
+MAILGUN_API_KEY=...
+DIGEST_TEST_EMAIL=you@...
+
+One-minute self-test pack (copy/paste)
+
+Use dev headers if in dev; otherwise add your Bearer token.
+
+A) QA seed
+
+curl -s -X POST "$APP/api/dev/seed-simple?project_id=<PROJ>" \
+  -H "X-Dev-User:<USER>" -H "X-Dev-Org:<ORG>" -H "X-Dev-Role:owner"
+
+
+B) Smoke run (creates Discovery stage + external sign link + digest preview ready)
+
+curl -s -X POST "$APP/api/dev/smoke-run?project_id=<PROJ>" \
+  -H "Content-Type: application/json" \
+  -H "X-Dev-User:<USER>" -H "X-Dev-Org:<ORG>" -H "X-Dev-Role:owner" \
+  -d '{"email_to":"test@example.com"}'
+
+
+C) Store + re-ingest (from an opened backup entry)
+
+curl -s -X POST "$APP/api/backups/store-and-reingest?project_id=<PROJ>&backup_key=<KEY>&artifact_name=artifacts/<FILE>" \
+  -H "X-Dev-User:<USER>" -H "X-Dev-Org:<ORG>" -H "X-Dev-Role:owner"
+
+
+Check Dashboard → Restore Activity and Documents for the new artifact.
+
+D) Digest preview
+
+curl -s "$APP/api/digest/preview?project_id=<PROJ>" \
+  -H "X-Dev-User:<USER>" -H "X-Dev-Org:<ORG>" -H "X-Dev-Role:pm"
+
+
+E) Tenant sentinel (should be isolated)
+
+curl -s "$APP/api/sentinel/tenant-leak?project_id=<PROJ_A>&target_project_id=<PROJ_B>" \
+  -H "X-Dev-User:<USER_A>" -H "X-Dev-Org:<ORG>" -H "X-Dev-Role:member"
+# -> {"leak": false}
+
+Go-live checklist (bite-size)
+
+Auth & RBAC
+
+Real login path working; no DEV_AUTH in prod.
+
+Seed project_members for real users (owner/admin/pm/lead/member).
+
+Comms
+
+Comms settings set (TZ, quiet hours, caps).
+
+Weekly digest recipients via Subscriptions UI confirmed.
+
+Backups
+
+Nightly job writes to backups/…/YYYYMMDD.zip; retention trims >14d.
+
+Restore + re-ingest tested on one file; backup.reingest audit emitted.
+
+OCR
+
+“Needs OCR” lane shows items; resolve works.
+
+RAG scope
+
+Ask Kap: project-scoped answers only, no cross-project bleed.
+
+Limits
+
+Rate-limit envs tuned: RATE_LIMIT_WINDOW_SEC, RATE_LIMIT_MAX.
+
+Observability
+
+telemetry_events populated on 429/5xx; Admin → Audit Viewer usable.
+
+If the smoke-runner 500 pops again
+
+It’s almost always one of:
+
+service vs user client mismatch → use get_service_supabase() for admin ops.
+
+missing envs → the three Supabase vars, FASTAPI_URL, or INTERNAL_API_BEARER.
+
+schema cache → run the pg_notify('pgrst','reload schema').
+
+The route now degrades gracefully (structured JSON with ok:false); the UI shows the orange banner when the DB isn’t ready.
+
+What I’ll queue next (unless you want me elsewhere)
+
+Documents artifact deep-link (/documents#artifact=<id>) scroll & highlight.
+
+Restore → auto-reindex (kick a lightweight “recently restored” re-embed task).
+
+Scheduler dashboard chip (shows last digest send + next run window).
+
+CI smoke (headless run of seed → stage → signoff token → digest preview) for every deploy.
+
+If you want me to prioritize differently, say the word and I’ll reshuffle. Otherwise, I’ll start with artifact deep-linking and auto-reindex so your restores light up the UI instantly.

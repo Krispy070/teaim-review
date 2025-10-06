@@ -1,0 +1,474 @@
+Below are paste-ready patches to bring the stack to production-grade isolation. No waiting, no “later.” Drop these in order.
+
+1) Frontend → always send the user’s JWT (no more client org_id)
+1a) Supabase singleton
+
+client/src/lib/supabase.ts
+
+import { createClient } from '@supabase/supabase-js';
+
+export const supabase = createClient(
+  import.meta.env.VITE_SUPABASE_URL!,
+  import.meta.env.VITE_SUPABASE_ANON_KEY!,
+  {
+    auth: { persistSession: true, autoRefreshToken: true },
+  }
+);
+
+1b) API helpers: attach Authorization: Bearer <token> automatically
+
+client/src/lib/api.ts (replace your helpers)
+
+import { supabase } from './supabase';
+
+async function authHeaders() {
+  const { data } = await supabase.auth.getSession();
+  const token = data.session?.access_token;
+  if (!token) throw new Error('Not authenticated');
+  return { Authorization: `Bearer ${token}` };
+}
+
+export async function apiGet<T>(path: string, params?: Record<string, string>) {
+  const qs = params ? '?' + new URLSearchParams(params).toString() : '';
+  const headers = await authHeaders();
+  const res = await fetch(`/api${path}${qs}`, { headers });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json() as Promise<T>;
+}
+
+export async function apiPost<T>(
+  path: string,
+  body?: any,
+  query?: Record<string, string>
+) {
+  const qs = query ? '?' + new URLSearchParams(query).toString() : '';
+  const headers = { ...(await authHeaders()), 'Content-Type': 'application/json' };
+  const res = await fetch(`/api${path}${qs}`, {
+    method: 'POST',
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json() as Promise<T>;
+}
+
+1c) StageTracker: remove orgId, pass only project_id as query param
+
+client/src/components/StageTracker.tsx (key lines)
+
+// create
+await apiPost('/stages/create', { title, start_date, end_date }, { project_id: projectId });
+
+// list
+const data = await apiGet<{stages: Stage[]}>('/stages/list', { project_id: projectId });
+
+// request signoff
+await apiPost('/stages/request-signoff',
+  { stage_id: s.id, email_to, message },
+  { project_id: projectId }
+);
+
+// decision
+await apiPost('/stages/decision',
+  { stage_id: s.id, decision, notes },
+  { project_id: projectId }
+);
+
+1d) ProjectStages page: no orgId prop anywhere
+
+client/src/pages/ProjectStages.tsx
+
+import { useParams } from 'react-router-dom';
+import { StageTracker } from '@/components/StageTracker';
+import { useSession } from '@/stores/session'; // your role store
+
+export default function ProjectStages() {
+  const { projectId } = useParams();
+  const { role } = useSession();
+  return (
+    <div className="p-6">
+      <StageTracker
+        projectId={projectId!}
+        canPM={['pm','admin'].includes(role)}
+        canSign={role === 'customer_signer'}
+      />
+    </div>
+  );
+}
+
+
+Sweep any remaining org_id on the client:
+
+quick find: ripgrep -n "org_id|orgId" client/src
+
+2) Express proxy → forward Authorization and query params
+
+proxy/index.js (or wherever you mount the proxy)
+
+const { createProxyMiddleware } = require('http-proxy-middleware');
+const API_BASE = process.env.FASTAPI_URL || 'http://127.0.0.1:8090';
+
+module.exports = function mount(app) {
+  app.use('/api', createProxyMiddleware({
+    target: API_BASE,
+    changeOrigin: true,
+    xfwd: true,
+    onProxyReq(proxyReq, req) {
+      if (req.headers['authorization']) {
+        proxyReq.setHeader('authorization', req.headers['authorization']);
+      }
+    },
+    // keep querystring as-is; no pathRewrite if FastAPI already expects '/api/*'
+  }));
+};
+
+3) Supabase DB → project membership + strict RLS
+3a) Table + policies
+
+Run in Supabase SQL:
+
+create table if not exists public.project_members (
+  org_id uuid not null,
+  project_id uuid not null,
+  user_id uuid not null,
+  role text not null check (role in ('admin','pm','member','customer_signer','viewer')),
+  created_at timestamptz not null default now(),
+  primary key (org_id, project_id, user_id)
+);
+
+create index if not exists idx_pm_user on public.project_members(user_id);
+create index if not exists idx_pm_proj on public.project_members(project_id);
+
+alter table public.project_members enable row level security;
+
+create or replace function public.current_role() returns text
+language sql stable as $$
+  select coalesce(nullif(current_setting('request.jwt.claims', true)::jsonb->>'role',''), 'member');
+$$;
+
+create or replace function public.current_org() returns uuid
+language sql stable as $$
+  select nullif(current_setting('request.jwt.claims', true)::jsonb->>'org_id','')::uuid;
+$$;
+
+create or replace function public.is_member(_org uuid, _project uuid) returns boolean
+language sql stable as $$
+  select exists(
+    select 1 from public.project_members pm
+    where pm.org_id = _org and pm.project_id = _project and pm.user_id = auth.uid()
+  );
+$$;
+
+-- Policies
+create policy "pm_read_self" on public.project_members
+for select using (org_id = public.current_org() and user_id = auth.uid());
+
+create policy "pm_insert_admin_pm" on public.project_members
+for insert with check (org_id = public.current_org() and public.current_role() in ('admin','pm'));
+
+create policy "pm_update_admin_pm" on public.project_members
+for update using (org_id = public.current_org() and public.current_role() in ('admin','pm'))
+with check (org_id = public.current_org());
+
+-- Apply the same pattern to other tables (already created in earlier work):
+--   project_stages, artifacts, artifact_chunks, mem_entries, audit_events, actions, risks, decisions
+-- Example for stages (if not already done):
+alter table public.project_stages enable row level security;
+
+create policy "stages_select" on public.project_stages
+for select using (org_id = public.current_org() and public.is_member(org_id, project_id));
+
+create policy "stages_insert" on public.project_stages
+for insert with check (
+  org_id = public.current_org() and public.is_member(org_id, project_id) and public.current_role() in ('admin','pm')
+);
+
+create policy "stages_update" on public.project_stages
+for update using (org_id = public.current_org() and public.is_member(org_id, project_id))
+with check (org_id = public.current_org() and public.is_member(org_id, project_id));
+
+3b) PostgREST schema refresh (so no more “cache” drama)
+select pg_notify('pgrst', 'reload schema');
+
+
+(Keep using Drizzle for schema changes going forward; the notify above is your immediate fix.)
+
+4) Backend auth → verify JWT, kill dev bypass, derive org from token
+4a) Strict tenant context
+
+server/app/tenant.py
+
+from fastapi import Depends, HTTPException, Header
+from pydantic import BaseModel
+from typing import Optional
+import os, jwt, time
+
+JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")  # Settings > API > JWT secret
+JWT_ALG = "HS256"
+
+class TenantCtx(BaseModel):
+  user_id: str
+  org_id: str
+  role: str
+  jwt: str
+
+def tenant_ctx(authorization: Optional[str] = Header(None)) -> TenantCtx:
+  if not authorization or not authorization.lower().startswith("bearer "):
+    raise HTTPException(401, "Missing Bearer token")
+  token = authorization.split(" ", 1)[1]
+  try:
+    claims = jwt.decode(
+      token,
+      JWT_SECRET,
+      algorithms=[JWT_ALG],
+      options={"verify_aud": False},  # Supabase default
+    )
+  except Exception:
+    raise HTTPException(401, "Invalid token")
+
+  if claims.get("exp") and claims["exp"] < int(time.time()):
+    raise HTTPException(401, "Token expired")
+
+  org_id = claims.get("org_id")
+  sub = claims.get("sub")
+  role = claims.get("role", "member")
+  if not org_id or not sub:
+    raise HTTPException(403, "Missing org/user claims")
+
+  return TenantCtx(user_id=sub, org_id=org_id, role=role, jwt=token)
+
+4b) Per-request Supabase client that uses the user’s JWT (RLS on)
+
+server/app/deps.py (add alongside your existing get_supabase)
+
+import os
+from supabase import create_client, Client
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+def get_service_supabase() -> Client:
+  # For back-office jobs only — never exposed to user flows
+  return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+def get_user_supabase(ctx) -> Client:
+  client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+  client.postgrest.auth(ctx.jwt)  # critical: run with user JWT so RLS applies
+  return client
+
+4c) Membership gate (no direct SQL; let RLS + user JWT do the heavy lifting)
+
+server/app/guards.py
+
+from fastapi import Depends, HTTPException, Query
+from .tenant import tenant_ctx, TenantCtx
+from .deps import get_user_supabase
+
+def member_ctx(
+  project_id: str = Query(...),
+  ctx: TenantCtx = Depends(tenant_ctx)
+) -> TenantCtx:
+  # Use user's JWT so RLS only returns their rows
+  sb = get_user_supabase(ctx)
+  res = sb.table("project_members").select("user_id").eq("project_id", project_id).limit(1).execute()
+  if not res.data:
+    raise HTTPException(403, "Not a member of this project")
+  return ctx
+
+5) Stages API → consistent query params + guard + user-JWT client
+
+server/app/routers/stages.py (key parts)
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+from datetime import datetime, date
+from typing import Optional
+import os, json
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/stages", tags=["stages"])
+
+class StageCreateBody(BaseModel):
+  title: str
+  start_date: Optional[date] = None
+  end_date: Optional[date] = None
+
+@router.get("/list")
+def list_stages(
+  project_id: str = Query(...),
+  ctx: TenantCtx = Depends(member_ctx)
+):
+  sb = get_user_supabase(ctx)
+  res = (sb.table("project_stages")
+           .select("*")
+           .eq("project_id", project_id)
+           .eq("org_id", ctx.org_id)
+           .order("sort_index", desc=False)
+           .order("created_at", desc=False)
+           .execute())
+  return {"stages": res.data}
+
+@router.post("/create")
+def create_stage(
+  body: StageCreateBody,
+  project_id: str = Query(...),
+  ctx: TenantCtx = Depends(member_ctx)
+):
+  sb = get_user_supabase(ctx)
+  out = (sb.table("project_stages").insert({
+      "org_id": ctx.org_id,
+      "project_id": project_id,
+      "title": body.title,
+      "start_date": body.start_date,
+      "end_date": body.end_date,
+      "status": "pending",
+  }).execute())
+  return {"ok": True, "stage": out.data[0]}
+
+class StageRequestBody(BaseModel):
+  stage_id: str
+  email_to: str
+  message: Optional[str] = None
+
+def _mailgun_send(to_email: str, subject: str, html: str):
+  import requests
+  MG_DOMAIN = os.getenv("MAILGUN_DOMAIN")
+  MG_KEY = os.getenv("MAILGUN_API_KEY")
+  if not (MG_DOMAIN and MG_KEY): return
+  return requests.post(
+    f"https://api.mailgun.net/v3/{MG_DOMAIN}/messages",
+    auth=("api", MG_KEY),
+    data={"from": f"TEAIM <no-reply@{MG_DOMAIN}>",
+          "to": [to_email],
+          "subject": subject,
+          "html": html},
+    timeout=15
+  )
+
+@router.post("/request-signoff")
+def request_signoff(
+  body: StageRequestBody,
+  project_id: str = Query(...),
+  ctx: TenantCtx = Depends(member_ctx)
+):
+  sb = get_user_supabase(ctx)
+  sb.table("project_stages").update({
+    "status": "in_review",
+    "requested_by": ctx.user_id,
+    "requested_at": datetime.utcnow(),
+  }).eq("id", body.stage_id).eq("project_id", project_id).eq("org_id", ctx.org_id).execute()
+
+  approve_url = f"{os.getenv('APP_BASE_URL')}/signoff?stage_id={body.stage_id}"
+  html = f"""<p>Please review the stage.</p><p><a href="{approve_url}">Open Sign-Off Page</a></p><p>{body.message or ''}</p>"""
+  _mailgun_send(body.email_to, "TEAIM: Stage sign-off requested", html)
+
+  sb.table("audit_events").insert({
+    "org_id": ctx.org_id,
+    "project_id": project_id,
+    "actor_id": ctx.user_id,
+    "kind": "stage.requested",
+    "details": json.dumps({"stage_id": body.stage_id, "email_to": body.email_to})
+  }).execute()
+
+  return {"ok": True}
+
+class StageDecisionBody(BaseModel):
+  stage_id: str
+  decision: str  # approved | rejected
+  notes: Optional[str] = None
+
+@router.post("/decision")
+def stage_decision(
+  body: StageDecisionBody,
+  project_id: str = Query(...),
+  ctx: TenantCtx = Depends(member_ctx)
+):
+  if body.decision not in ("approved", "rejected"):
+    raise HTTPException(400, "Invalid decision")
+  status = "signed_off" if body.decision == "approved" else "rejected"
+
+  sb = get_user_supabase(ctx)
+  sb.table("project_stages").update({
+    "status": status,
+    "signoff_by": ctx.user_id,
+    "signoff_date": datetime.utcnow(),
+    "signoff_decision": body.decision,
+    "signoff_notes": body.notes
+  }).eq("id", body.stage_id).eq("project_id", project_id).eq("org_id", ctx.org_id).execute()
+
+  sb.table("audit_events").insert({
+    "org_id": ctx.org_id,
+    "project_id": project_id,
+    "actor_id": ctx.user_id,
+    "kind": f"stage.{body.decision}",
+    "details": json.dumps({"stage_id": body.stage_id, "notes": body.notes})
+  }).execute()
+
+  return {"ok": True, "status": status}
+
+
+(Make sure app.include_router(stages.router) is present in main.py.)
+
+6) RAG safety (recap): query by (org_id, project_id) before any LLM call
+
+If you have rag.ask, ensure retrieval is always filtered:
+
+hits = (sb.table("artifact_chunks")
+          .select("id,text,artifact_id")
+          .eq("org_id", ctx.org_id)
+          .eq("project_id", project_id)
+          # add pgvector similarity here if you use RPC
+          .limit(8)
+          .execute()).data
+
+
+Then build the prompt only with hits from that filter.
+
+7) Quick verifications (do these now)
+
+A. Reload PostgREST cache
+
+select pg_notify('pgrst', 'reload schema');
+
+
+B. Happy-path
+
+# With a real user token (from supabase.auth.getSession())
+curl -s -H "Authorization: Bearer $USER_JWT" \
+  "http://localhost:5000/api/stages/list?project_id=<PROJ_UUID>"
+# -> 200 {"stages":[]}
+
+
+C. Leak test (expect 403)
+
+curl -s -i -H "Authorization: Bearer $USER_JWT_A" \
+  "http://localhost:5000/api/stages/list?project_id=<PROJ_B_UUID>"
+# -> 403 Not a member of this project
+
+
+D. Client grep (no org_id)
+
+rg -n "org_id|orgId" client/src | rg -v "types|comments"
+
+Why this fully closes the gaps
+
+JWT verification ON (tenant_ctx validates signature + exp).
+
+No dev bypass (hard fail without token).
+
+Frontend never sends org_id (server derives from token).
+
+RLS always active (per-request Supabase client uses user JWT).
+
+Membership enforced (member_ctx checks project_members with RLS).
+
+Proxy preserves Authorization (no more “who am I?” problems).
+
+Consistency (all /stages/* use project_id as query param).
+
+No direct SQL that sidesteps RLS in request path.
+
+If any file paths differ in Replit, drop me the exact files you want patched and I’ll refit them. Want me to add a Project Switcher in the navbar + a “Tenant Leak Sentinel” test page that intentionally probes cross-project reads and shows green/red status?

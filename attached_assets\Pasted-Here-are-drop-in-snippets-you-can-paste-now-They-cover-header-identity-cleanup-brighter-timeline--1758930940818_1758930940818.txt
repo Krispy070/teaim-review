@@ -1,0 +1,165 @@
+Here are drop-in snippets you can paste now. They cover: header identity cleanup, brighter timeline bars, translucent “Overdue” pills, and nav icon hover/active.
+
+1) Header identity cleanup
+
+Goal: Center the customer identity (logo + name) with a small project pill, keep TEAIM left, implementor/env/bell/avatar right. No busy chips.
+
+HeaderBar.tsx (replace component body)
+import React from "react";
+
+type Logo = { src?: string; alt: string; href?: string };
+type Env = "DEV" | "STAGE" | "PROD";
+
+export default function HeaderBar({
+  teaim,
+  customer,
+  implementor,
+  projectName,
+  env = "DEV",
+  onProjectClick,
+  onBellClick,
+  onAvatarClick,
+}: {
+  teaim: Logo;
+  customer: Logo;
+  implementor?: Logo;
+  projectName?: string;
+  env?: Env;
+  onProjectClick?: () => void;
+  onBellClick?: () => void;
+  onAvatarClick?: () => void;
+}) {
+  return (
+    <header className="header sticky top-0 z-50 w-full">
+      <div className="mx-auto flex h-16 max-w-[1320px] items-center justify-between gap-4 px-4">
+        {/* Left: TEAIM */}
+        <a href={teaim.href || "/"} className="flex items-center gap-2 shrink-0">
+          {teaim.src ? <img src={teaim.src} alt={teaim.alt} className="h-7 w-auto" /> : <span className="text-lg font-semibold text-[var(--text-strong)]">TEAIM</span>}
+        </a>
+
+        {/* Center: Customer identity */}
+        <div className="min-w-0 text-center flex flex-col items-center mx-auto">
+          {customer?.src ? (
+            <img src={customer.src} alt={customer.alt} className="h-8 max-w-[260px] object-contain" />
+          ) : (
+            <span className="truncate text-sm text-[var(--text-soft)]">{customer.alt}</span>
+          )}
+          <div className="mt-1 flex items-center gap-6">
+            <span className="text-[11px] text-[var(--text-muted)] truncate">Workday Implementation Hub</span>
+            {projectName && (
+              <button onClick={onProjectClick} className="k-pill k-pill--gold" title="Switch project">
+                {projectName}
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Right: Implementor + ENV + bell + avatar */}
+        <div className="flex items-center gap-3">
+          {implementor?.src && <img src={implementor.src} alt={implementor.alt} className="h-6 w-auto opacity-90" />}
+          <span className="k-pill k-pill--gold">{env}</span>
+          <button onClick={onBellClick} className="grid h-8 w-8 place-items-center rounded-full border" style={{ borderColor: "var(--ui-border)", color: "var(--text)" }} title="Notifications">🔔</button>
+          <button onClick={onAvatarClick} className="h-8 w-8 rounded-full" style={{ background: "#2E3340" }} title="Account" />
+        </div>
+      </div>
+    </header>
+  );
+}
+
+Header CSS (add/keep)
+.header{
+  background: color-mix(in oklab, var(--ui-bg), black 5%);
+  border-bottom: 1px solid var(--ui-border);
+  backdrop-filter: saturate(140%) blur(6px);
+}
+
+2) Timeline visibility boost
+
+Goal: rails a shade lighter, bars brighter, crisp contrast.
+
+.timeline{
+  --rail: #2A2F40;          /* lighter than before */
+  --tick: #364056;
+  --fill: color-mix(in oklab, var(--brand-orange), white 6%); /* subtle brightness bump */
+}
+.timeline .bar-bg{ background: var(--rail); height: 8px; border-radius: 8px; }
+.timeline .bar-fill{ background: var(--fill); height: 8px; border-radius: 8px; }
+.timeline .tick{ background: var(--tick); width: 1px; opacity: .6; }
+
+
+If you render the bars in React, ensure the fill has at least 60–70% width to be visually noticeable at a glance.
+
+3) Translucent “Overdue” pills (and friends)
+
+Goal: readable, branded, not screaming. (Use on your list tags and tiny status labels.)
+
+.k-pill{
+  display:inline-flex; align-items:center; gap:.4ch;
+  padding:.25rem .55rem; border-radius:10px; font-size:12px; line-height:1;
+  border:1px solid transparent;
+}
+.k-pill--overdue{ background: rgba(231,76,60,.18); color: var(--brand-error); border-color: rgba(231,76,60,.35); }
+.k-pill--warn   { background: rgba(255,193,7,.18);  color: var(--brand-warn);  border-color: rgba(255,193,7,.35); }
+.k-pill--ok     { background: rgba(46,204,113,.18); color: var(--brand-success); border-color: rgba(46,204,113,.35); }
+.k-pill--gold   { background: var(--pill-gold); color: var(--brand-gold); border-color: rgba(255,201,51,.35); }
+
+
+Usage example
+
+<li className="flex items-center justify-between gap-3 py-2 px-3 rounded-xl hover:bg-[#1B1E28]">
+  <span>Finalize security roles</span>
+  <span className="k-pill k-pill--overdue">Overdue</span>
+</li>
+
+4) Sidebar icon hover/active states
+
+Goal: soft by default, orange on hover/active. Applies to all nav items.
+
+.sidebar .item { color: var(--text-soft); font:500 14px/1.2 Inter,system-ui; padding:8px 14px; border-radius:10px; display:flex; align-items:center; gap:10px; }
+.sidebar .item .icon { color: var(--text-soft); transition: color .12s ease; }
+.sidebar .item:hover { background: rgba(255,255,255,.03); color: var(--text); }
+.sidebar .item:hover .icon { color: var(--brand-orange); }
+.sidebar .item.active { background: rgba(242,107,29,.12); color: var(--text-strong); }
+.sidebar .item.active .icon { color: var(--brand-orange); }
+
+
+NavItem example
+
+function NavItem({ icon: Icon, label, active }: any){
+  return (
+    <a className={`sidebar item ${active ? "active" : ""}`}>
+      <Icon className="icon h-4 w-4" />
+      <span className="truncate">{label}</span>
+    </a>
+  );
+}
+
+5) Button group (period switcher) — keep orange to the active one
+.k-btn{
+  display:inline-flex; align-items:center; gap:.6ch;
+  padding:.55rem .9rem; border-radius:12px;
+  border:1px solid var(--ui-border); background: var(--ui-panel-2); color: var(--text-strong);
+  transition: background .12s ease, border-color .12s ease, transform .06s ease;
+}
+.k-btn:hover{ background:#1B1E28; border-color:#3A3E4E; }
+.k-btn--primary{ background: var(--brand-orange); border-color:#C65115; color:#0B0B0D; font-weight:700; }
+.k-btn--ghost{ background: transparent; color: var(--text); }
+
+
+Usage
+
+<div className="flex gap-2">
+  <button className="k-btn k-btn--primary">Week</button>
+  <button className="k-btn k-btn--ghost">Month</button>
+  <button className="k-btn k-btn--ghost">Quarter</button>
+  <button className="k-btn k-btn--ghost">Export</button>
+  <button className="k-btn k-btn--ghost">Share</button>
+</div>
+
+6) Density nudge (optional, nice)
+
+KPI tiles: set padding: 16px 18px;
+
+Card header/body: 12px / 16px
+
+Global max width: keep center column constrained at max-w-[1320px] for the dashboard pages.

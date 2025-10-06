@@ -1,0 +1,248 @@
+I read the log—v2.3 is in, passing review, and running clean. Let’s push Next Big Build v2.4 to lock the demo and give your PMs even more lift. Paste these into Replit as-is.
+
+This pack delivers:
+
+Per-event Slack/Teams deep links (click back into TEAIM)
+
+Per-user digest sections (final wire-up: hide sections they opted out of)
+
+Meeting cards: inline Propose w/ area picker (no extra clicks)
+
+Stage templates: Time & Integrations presets (durations you can edit)
+
+Invite: bulk send from CSV (admin tool)
+
+Toaster: project-aware links (open target directly)
+
+I also included tiny guards so dev headers/JWT continue behaving.
+
+1) Slack/Teams deep links per event
+
+Patch server/utils/events.py — add deep links where we know targets:
+
+def _project_link(project_id: str | None, path: str) -> str | None:
+    base = os.getenv("APP_BASE_URL","").rstrip("/")
+    return f"{base}{path}" if project_id and base else None
+
+def emit_event(org_id: str, project_id: str | None, kind: str, details: dict):
+    # ... cfg & early return ...
+    link = None
+    title = f"TEAIM: {kind}{(' • '+project_id) if project_id else ''}"
+    fields: list[tuple[str,str]] = []
+
+    if kind == "review.applied":
+        table = details.get("table") or details.get("target_table")
+        tid = details.get("target_id") or details.get("update_id") or "—"
+        title = f"TEAIM: Review Applied • {table} {tid}"
+        link = _project_link(project_id, f"/projects/{project_id}/updates/review")
+        # table-aware fields (keep as you already added)
+        # ...
+    elif kind == "signoff.doc.signed":
+        title = f"TEAIM: Document Signed • {details.get('doc_id')}"
+        link = _project_link(project_id, f"/projects/{project_id}/signoff/docs")
+        # fields ...
+    elif kind == "reminder.sent":
+        aid = details.get("action_id")
+        title = f"TEAIM: Reminder Sent • action {aid}"
+        link = _project_link(project_id, f"/projects/{project_id}/actions/kanban")
+
+    # Slack blocks with a link button if available
+    if cfg.get("slack_url"):
+        blocks = _slack_blocks(title, fields, details)
+        if link:
+            blocks.append({
+              "type":"actions",
+              "elements":[{"type":"button","text":{"type":"plain_text","text":"Open in TEAIM"}, "url": link}]
+            })
+        _post(cfg["slack_url"], {"blocks": blocks})
+    # Teams
+    if cfg.get("teams_url"):
+        facts = fields
+        card = _teams_card(title, facts, details)
+        if link:
+            card.setdefault("potentialAction",[]).append({"@type":"OpenUri","name":"Open in TEAIM","targets":[{"os":"default","uri":link}]})
+        _post(cfg["teams_url"], card)
+    # Generic
+    if cfg.get("generic_url"):
+        payload = {"org_id": org_id, "project_id": project_id, "kind": kind, "details": details, "url": link}
+        _post(cfg["generic_url"], payload)
+
+2) Per-user digest sections (final wire-up)
+
+You already personalized recipients; now suppress sections each user has opted out of.
+
+Patch in the /send-weekly loop (in server/routers/digest.py):
+
+# after resolving subs for uid:
+wanted = {"actions","risks","decisions"}
+if subs:
+    if not subs.get("notify_actions", True):   wanted.discard("actions")
+    if not subs.get("notify_risks", True):     wanted.discard("risks")
+    if not subs.get("notify_decisions", True): wanted.discard("decisions")
+# Skip empty emails entirely
+if not wanted: continue
+# Build counts only for wanted
+counts = {}
+if "actions"   in wanted: counts["actions"]   = _compose_count(sb, ctx.org_id, project_id, "actions")
+if "risks"     in wanted: counts["risks"]     = _compose_count(sb, ctx.org_id, project_id, "risks")
+if "decisions" in wanted: counts["decisions"] = _compose_count(sb, ctx.org_id, project_id, "decisions")
+html = _digest_html_filtered(code, counts, wanted)
+# send_guard + mail + log as you have
+
+
+Result: recipients only receive sections they want.
+
+3) Meeting cards: inline Propose with area picker
+
+Patch client/src/pages/Meetings.tsx — next to each extracted item:
+
+function ExtractedItem({ artifactId, kind, idx, item }:{
+  artifactId:string; kind:"action"|"risk"|"decision"; idx:number; item:any
+}){
+  const [conf,setConf]=useState(0.82);
+  const [area,setArea]=useState(item.area || "");
+  const [busy,setBusy]=useState(false);
+
+  async function proposeOne(){
+    setBusy(true);
+    try{
+      await postJSON(`/api/summaries/propose?project_id=${projectId}`, {
+        items: [{ artifact_id: artifactId, kind, index: idx, confidence: conf, area: area || undefined }]
+      });
+      alert("Proposed to Updates Monitor");
+    } finally { setBusy(false); }
+  }
+
+  return (
+    <div className="flex items-center justify-between border rounded p-2 text-sm">
+      <div className="truncate">{item.title || item.text}</div>
+      <div className="flex items-center gap-2">
+        <input className="border rounded p-1 w-[90px]" placeholder="Area" value={area} onChange={e=>setArea(e.target.value)} />
+        <label className="text-xs">conf</label>
+        <input type="number" min={0} max={1} step={0.01} className="border rounded p-1 w-[70px]" value={conf} onChange={e=>setConf(parseFloat(e.target.value||"0.82"))}/>
+        <button className="px-2 py-1 border rounded text-xs" onClick={proposeOne} disabled={busy}>{busy?"…":"Propose"}</button>
+      </div>
+    </div>
+  );
+}
+
+
+Render for each array (actions, risks, decisions) with item and idx.
+
+4) Stage templates: add Time & Integrations presets
+
+Patch server/routers/stages_templates.py:
+
+TEMPLATES.update({
+  "workday_time": [
+    {"title":"Discovery","area":"Time","days":10},
+    {"title":"Time Configuration","area":"Time","days":35},
+    {"title":"Time Testing","area":"Time","days":20},
+    {"title":"Cutover","area":"Time","days":5},
+  ],
+  "integrations_suite": [
+    {"title":"Discovery","area":"Integrations","days":10},
+    {"title":"Interfaces Build","area":"Integrations","days":40},
+    {"title":"Interfaces Test","area":"Integrations","days":25},
+    {"title":"Cutover","area":"Integrations","days":5},
+  ]
+})
+
+
+(Your Stage Wizard already applies durations and baseline dates.)
+
+5) Invite bulk send from CSV (admin tool)
+5A) Router (CSV: email,role,areas,can_view_all,can_sign_all)
+
+server/routers/invite_bulk.py
+
+from fastapi import APIRouter, Depends, Query, UploadFile, File, HTTPException
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+from .invite_token import create_token, send_token, InviteTokenBody
+import csv, io
+
+router = APIRouter(prefix="/api/invite", tags=["invite"])
+ADMIN = require_role({"owner","admin"})
+
+@router.post("/bulk_send")
+def bulk_send(project_id: str = Query(...), file: UploadFile = File(...), ctx: TenantCtx = Depends(ADMIN)):
+    content = file.file.read().decode("utf-8", errors="ignore")
+    reader = csv.DictReader(io.StringIO(content))
+    results = []
+    for row in reader:
+        email = (row.get("email") or "").strip()
+        role = (row.get("role") or "member").strip()
+        areas = [a.strip() for a in (row.get("areas") or "").split(",") if a.strip()]
+        can_view_all = (row.get("can_view_all") or "true").lower() in ("true","1","yes")
+        can_sign_all = (row.get("can_sign_all") or "false").lower() in ("true","1","yes")
+        body = InviteTokenBody(
+            email=email, role=role, can_view_all=can_view_all,
+            visibility_areas=areas if not can_view_all else [],
+            can_sign_all=can_sign_all, sign_areas=areas if can_sign_all else []
+        )
+        try:
+            resp = send_token(body, project_id, ctx)
+            results.append({"email": email, "ok": True, "link": resp.get("link")})
+        except Exception as e:
+            results.append({"email": email, "ok": False, "error": str(e)})
+    return {"results": results}
+
+
+Mount:
+
+from .routers import invite_bulk
+app.include_router(invite_bulk.router)
+
+5B) Small Admin UI (optional)
+
+Add a small uploader on AdminInvite:
+
+async function bulkSend(e:any){
+  const f = e.target.files?.[0]; if(!f) return;
+  const fd = new FormData(); fd.append("file", f);
+  const r = await fetch(`/api/invite/bulk_send?project_id=${projectId}`, { method:"POST", credentials:"include", body: fd as any });
+  const d = await r.json(); alert(`Sent: ${d.results.filter((x:any)=>x.ok).length}/${d.results.length}`);
+}
+<input type="file" accept=".csv" onChange={bulkSend} />
+
+6) Toaster: project-aware deep links
+
+Patch client/src/components/NotificationToaster.tsx:
+
+return (
+  <div className="fixed bottom-4 right-4 z-[80]">
+    <div className="px-3 py-2 bg-black text-white rounded shadow">
+      <a className="underline" href={toast?.link || "#"}>{toast.title}</a>
+    </div>
+  </div>
+);
+
+
+And include link when creating notifications (you already do for some — add for review.applied & signoff.doc.signed as shown in previous build).
+
+7) Mounts checklist
+
+In server/main.py ensure these include lines exist once:
+
+from .routers import invite_bulk
+app.include_router(invite_bulk.router)
+# (others already mounted: notifications, export_dataroom, ops_status, stages_templates, signoff_docs_gen, summaries_propose)
+
+
+If proxy strips /api, add aliases similar to previous runs.
+
+8) 2-minute verification
+
+Slack/Teams events show Open in TEAIM button.
+
+/digest/preview?respect_notify=true drops sections no one wants; weekly send personalizes.
+
+Meeting cards show Propose with Area + Confidence.
+
+Stage Wizard templates include Time and Integrations presets with durations; baseline date fills.
+
+Admin Invite CSV → bulk send; Mailgun logs show sends.
+
+Toaster clickable → navigates to page.

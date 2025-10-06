@@ -1,0 +1,355 @@
+Next Big Build v2.16.4 + v2.16.5 (double-sized)
+
+Everything below returns safe empties if a table/column is missing.
+
+v2.16.4 — Area Guides (How-To / Training) + capture from calls
+1) Backend — Guides CRUD, promote comment→guide, meeting clip→guide, search, HTML/CSV export
+
+server/routers/guides.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from typing import List, Optional
+from datetime import datetime, timezone
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+from fastapi.responses import HTMLResponse, StreamingResponse
+import io, csv
+
+router = APIRouter(prefix="/api/guides", tags=["guides"])
+PM_PLUS = require_role({"owner","admin","pm"})
+
+class Guide(BaseModel):
+    id: Optional[str] = None
+    title: str
+    area: Optional[str] = None
+    owner: Optional[str] = None       # user_id/email
+    visibility: Optional[str] = "team" # team|owners|public (future)
+    tags: Optional[List[str]] = []
+    steps: Optional[List[str]] = []    # simple markdown bullet steps
+    sources: Optional[List[dict]] = [] # [{type:'meeting', id:'...', clip:{start_ms,end_ms}}, {type:'comment', id:'...'}]
+    status: Optional[str] = "draft"    # draft|approved|archived
+
+@router.get("/list")
+def list_guides(project_id: str = Query(...), area: str | None = None,
+                ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        q = sb.table("guides").select("*").eq("org_id", ctx.org_id).eq("project_id", project_id)
+        if area: q = q.eq("area", area)
+        rows = q.order("updated_at", desc=True).limit(1000).execute().data or []
+        return {"items": rows}
+    except Exception:
+        return {"items": []}
+
+@router.get("/search")
+def search(project_id: str = Query(...), q: str = Query(""), area: str | None = None,
+           ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        qry = sb.table("guides").select("*").eq("org_id", ctx.org_id).eq("project_id", project_id)
+        if area: qry = qry.eq("area", area)
+        rows = qry.limit(1000).execute().data or []
+        ql = q.lower()
+        res = [g for g in rows if (ql in (g.get("title") or "").lower() 
+                                   or any(ql in (s or "").lower() for s in (g.get("steps") or []))
+                                   or any(ql in (t or "").lower() for t in (g.get("tags") or [])))]
+        return {"items": res[:200]}
+    except Exception:
+        return {"items": []}
+
+@router.post("/upsert")
+def upsert(body: Guide, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    try:
+        data = body.model_dump()
+        data.update({"org_id": ctx.org_id, "project_id": project_id, "updated_at": datetime.now(timezone.utc).isoformat()})
+        if body.id:
+            sb.table("guides").update(data).eq("org_id",ctx.org_id).eq("project_id",project_id).eq("id",body.id).execute()
+        else:
+            sb.table("guides").insert(data).execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+@router.post("/delete")
+def delete(id: str = Query(...), project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    try:
+        sb.table("guides").delete().eq("org_id",ctx.org_id).eq("project_id",project_id).eq("id",id).execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+# Promote area comment -> guide (quick capture)
+@router.post("/promote_comment")
+def promote_comment(project_id: str = Query(...), area: str = Query(...), comment_id: str = Query(...),
+                    ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        c = sb.table("area_comments").select("message,user_id,created_at").eq("org_id",ctx.org_id)\
+             .eq("project_id",project_id).eq("id",comment_id).single().execute().data or {}
+        if not c: return {"ok": False}
+        sb.table("guides").insert({
+            "org_id": ctx.org_id, "project_id": project_id,
+            "title": (c.get("message") or "").split("\n")[0][:120] or "Mini Guide",
+            "area": area, "owner": c.get("user_id"),
+            "steps": [c.get("message") or ""], 
+            "sources": [{"type":"comment","id":comment_id}],
+            "status":"draft", "updated_at": datetime.now(timezone.utc).isoformat()
+        }).execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+# Create from meeting clip (dev-safe; stores metadata only)
+class ClipBody(BaseModel):
+    meeting_id: str
+    start_ms: int
+    end_ms: int
+    title: str
+    area: Optional[str] = None
+    note: Optional[str] = None
+
+@router.post("/from_meeting_clip")
+def from_meeting_clip(body: ClipBody, project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        sb.table("guides").insert({
+            "org_id": ctx.org_id, "project_id": project_id,
+            "title": body.title, "area": body.area, "owner": ctx.user_id,
+            "steps": [body.note or ""],
+            "sources": [{"type":"meeting","id":body.meeting_id,"clip":{"start_ms":body.start_ms,"end_ms":body.end_ms}}],
+            "status":"draft", "updated_at": datetime.now(timezone.utc).isoformat()
+        }).execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+# Export HTML (printable) + CSV
+@router.get("/export.html", response_class=HTMLResponse)
+def export_html(project_id: str = Query(...), id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        g = sb.table("guides").select("*").eq("org_id",ctx.org_id).eq("project_id",project_id).eq("id",id).single().execute().data or {}
+    except Exception:
+        g={}
+    steps = "".join([f"<li>{s}</li>" for s in (g.get("steps") or [])]) or "<li>—</li>"
+    tags = ", ".join(g.get("tags") or [])
+    html = f"""<html><head><meta name="viewport" content="width=device-width, initial-scale=1"/></head>
+<body style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:880px;margin:auto">
+<h2>{g.get('title','Guide')}</h2>
+<div><b>Area:</b> {g.get('area','—')} • <b>Owner:</b> {g.get('owner','—')} • <b>Status:</b> {g.get('status','draft')} • <b>Tags:</b> {tags or '—'}</div>
+<ol>{steps}</ol>
+</body></html>"""
+    return HTMLResponse(html)
+
+@router.get("/export.csv")
+def export_csv(project_id: str = Query(...), area: str | None = None, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        q = sb.table("guides").select("*").eq("org_id",ctx.org_id).eq("project_id",project_id)
+        if area: q = q.eq("area", area)
+        rows = q.order("updated_at",desc=True).limit(5000).execute().data or []
+    except Exception:
+        rows=[]
+    s=io.StringIO(); w=csv.writer(s); w.writerow(["id","title","area","owner","status","tags","steps"])
+    for r in rows: w.writerow([r.get("id"),r.get("title"),r.get("area"),r.get("owner"),r.get("status"),
+                               "|".join(r.get("tags") or []), "|".join(r.get("steps") or [])])
+    s.seek(0)
+    return StreamingResponse(iter([s.read()]), media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="guides.csv"'})
+
+
+Mount in server/main.py:
+
+from .routers import guides
+app.include_router(guides.router)
+
+2) Frontend — Guides Tab + Editor + Promote Comment + Clip from Meeting
+
+A. Guides tab (WorkstreamArea)
+
+Patch client/src/pages/WorkstreamArea.tsx (add “Guides” to the tabs)
+
+const [tab,setTab]=useState<"open"|"risks"|"decisions"|"workbooks"|"guides">(initialTab as any || "open");
+// tab bar: add
+<button className={`brand-btn text-xs ${tab==='guides'?'pulse-once':''}`} onClick={()=>setTab("guides")}>Guides</button>
+
+
+Guide list loader:
+
+const [guides,setGuides]=useState<any[]>([]);
+useEffect(()=>{ (async()=>{ if(tab!=="guides") return;
+  const d=await getJSON(`/api/guides/list?project_id=${projectId}&area=${encodeURIComponent(area)}`); setGuides(d.items||[]);
+})(); },[tab, projectId, area]);
+
+
+Render Guides:
+
+{tab==="guides" && (
+  <div className="space-y-2">
+    <div className="flex items-center gap-2">
+      <button className="brand-btn text-xs" onClick={()=>setEditor({})}>New Guide</button>
+      <button className="brand-btn text-xs" onClick={()=>downloadGET(`/api/guides/export.csv?project_id=${projectId}&area=${encodeURIComponent(area)}`, "guides.csv")}>Export CSV</button>
+    </div>
+    <div className="grid md:grid-cols-2 gap-2">
+      {guides.map(g=>(
+        <div key={g.id} className="brand-card p-2 text-xs">
+          <div className="flex items-center justify-between">
+            <div className="font-medium">{g.title}</div>
+            <div className="text-[11px] text-muted-foreground">{g.status}</div>
+          </div>
+          <div className="text-muted-foreground">Owner: {g.owner||"—"} • Tags: {(g.tags||[]).join(", ")||"—"}</div>
+          <div className="mt-1 flex gap-1">
+            <button className="brand-btn text-[11px]" onClick={()=>setEditor(g)}>Edit</button>
+            <a className="brand-btn text-[11px]" target="_blank" rel="noreferrer" href={`/api/guides/export.html?project_id=${projectId}&id=${g.id}`}>Print</a>
+          </div>
+        </div>
+      ))}
+      {!guides.length && <div className="text-muted-foreground text-xs">No guides yet.</div>}
+    </div>
+  </div>
+)}
+
+
+B. Guide Editor modal
+
+client/src/components/GuideEditor.tsx (new)
+
+import { useEffect, useState } from "react";
+import { postJSON } from "@/lib/authFetch";
+
+export default function GuideEditor({projectId,area,initial,onClose}:{projectId:string;area?:string;initial?:any;onClose:()=>void}){
+  const [g,setG]=useState<any>(initial||{title:"", area, owner:"", tags:[], steps:[""], status:"draft"});
+  function setStep(i:number, val:string){ setG((s:any)=>{ const a=[...(s.steps||[])]; a[i]=val; return {...s, steps:a}; }); }
+  function addStep(){ setG((s:any)=> ({...s, steps:[...(s.steps||[]), ""]})); }
+  function remStep(i:number){ setG((s:any)=> ({...s, steps:(s.steps||[]).filter((_:any,idx:number)=>idx!==i)})); }
+  async function save(){ await postJSON(`/api/guides/upsert?project_id=${projectId}`, g); alert("Saved"); onClose(); }
+  return (
+    <div className="fixed inset-0 bg-black/40 z-[210]" onClick={onClose}>
+      <div className="mx-auto mt-[6vh] w-[820px] max-w-[97%] bg-white dark:bg-neutral-900 rounded shadow-xl border" onClick={e=>e.stopPropagation()}>
+        <div className="p-2 border-b text-sm font-medium">{g.id? "Edit Guide":"New Guide"}</div>
+        <div className="p-3 space-y-2">
+          <input className="border rounded p-2 w-full" placeholder="Title" value={g.title||""} onChange={e=>setG({...g, title:e.target.value})}/>
+          <div className="grid md:grid-cols-3 gap-2">
+            <input className="border rounded p-2" placeholder="Area" value={g.area||""} onChange={e=>setG({...g, area:e.target.value})}/>
+            <input className="border rounded p-2" placeholder="Owner (email)" value={g.owner||""} onChange={e=>setG({...g, owner:e.target.value})}/>
+            <select className="border rounded p-2" value={g.status||"draft"} onChange={e=>setG({...g, status:e.target.value})}>
+              {["draft","approved","archived"].map(s=><option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          <input className="border rounded p-2 w-full" placeholder="Tags (comma separated)" 
+                 value={(g.tags||[]).join(",")} onChange={e=>setG({...g, tags: e.target.value.split(",").map(t=>t.trim()).filter(Boolean)})}/>
+          <div className="space-y-1">
+            <div className="text-xs text-muted-foreground">Steps</div>
+            {(g.steps||[]).map((s:string, i:number)=>(
+              <div key={i} className="flex items-center gap-2">
+                <textarea className="border rounded p-2 text-sm w-full" rows={2} value={s} onChange={e=>setStep(i,e.target.value)}/>
+                <button className="brand-btn text-[11px]" onClick={()=>remStep(i)}>–</button>
+              </div>
+            ))}
+            <button className="brand-btn text-[11px]" onClick={addStep}>+ Step</button>
+          </div>
+        </div>
+        <div className="p-2 border-t flex justify-end gap-2">
+          <button className="brand-btn text-xs" onClick={onClose}>Cancel</button>
+          <button className="brand-btn text-xs swoosh" onClick={save}>Save</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+In WorkstreamArea.tsx, bring it in:
+
+import GuideEditor from "@/components/GuideEditor";
+const [editor,setEditor]=useState<any|null>(null);
+{editor && <GuideEditor projectId={projectId!} area={area} initial={editor.id? editor : {...editor, area}} onClose={()=>{ setEditor(null); if(tab==="guides") setTab("guides"); }}/>}
+
+
+C. Promote comment → guide (button in Comments list)
+
+In the comments list item:
+
+<button className="brand-btn text-[11px]" onClick={async()=>{
+  await fetch(`/api/guides/promote_comment?project_id=${projectId}&area=${encodeURIComponent(area)}&comment_id=${encodeURIComponent(c.id)}`, {method:"POST",credentials:"include"});
+  alert("Promoted to Guide"); setTab("guides");
+}}>Promote to Guide</button>
+
+
+(Assumes your area_comments rows include id in list payload; if not, expose it.)
+
+D. From Meetings → clip to guide (quick hook)
+
+On Meetings.tsx, when rendering extracted items, add a small “Create Guide” button:
+
+<button className="brand-btn text-[11px]" onClick={async()=>{
+  // dev-safe: no media slicing, just store metadata
+  await fetch(`/api/guides/from_meeting_clip?project_id=${projectId}`, {
+    method:"POST", credentials:"include", headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ meeting_id: m.id, start_ms: it.start_ms||0, end_ms: it.end_ms||0, title: it.title||"Training Note", area: it.area||"" })
+  });
+  alert("Guide created from meeting");
+}}>Create Guide</button>
+
+v2.16.5 — Guide cards on Dashboard + Slack hashtag → guide + print polish
+3) Dashboard — “Latest Guides” card
+
+client/src/pages/DashboardV2.tsx (augment)
+
+const [guides,setGuides]=useState<any[]>([]);
+useEffect(()=>{ (async()=>{ try{
+  const g = await getJSON(`/api/guides/list?project_id=${projectId}`); setGuides((g.items||[]).slice(0,6));
+}catch{ setGuides([]);} })(); },[projectId]);
+
+<div className="brand-card p-3">
+  <div className="text-xs text-muted-foreground mb-1">Latest Guides</div>
+  <ul className="text-xs list-disc pl-4">
+    {guides.map(g=>(<li key={g.id}><a className="underline" href={`/projects/${projectId}/workstreams/${encodeURIComponent(g.area||'')}`}>{g.title}</a></li>))}
+    {!guides.length && <li className="text-muted-foreground">No guides yet.</li>}
+  </ul>
+</div>
+
+4) Slack/Teams intake — #guide hashtag → auto-create guide
+
+server/routers/areas_webhook.py (append to webhook_incoming)
+
+# at end of webhook_incoming
+try:
+    txt = (body.text or "")
+    if "#guide" in txt.lower():
+        title = txt.strip()[:120]
+        sbs.table("guides").insert({
+            "org_id": None, "project_id": body.project_id, "area": area,
+            "title": title, "owner": body.actor or "webhook",
+            "steps": [txt], "sources": [{"type":"webhook","channel":body.channel}],
+            "status": "draft", "updated_at": datetime.now(timezone.utc).isoformat()
+        }).execute()
+except Exception: ...
+
+5) Print polish
+
+client/src/index.css (ensure these are present)
+
+@media print {
+  body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .brand-card, .border { border-color: #ccc !important; }
+  a { color: #111 !important; text-decoration: underline; }
+  .no-print { display: none !important; }
+  .brand-btn { display: none !important; }
+}
+
+2-Minute Validation
+
+Guides: per-area tab, editor with steps/tags/owner, promote comment → guide, create from meeting clip, search, export HTML/CSV, Dashboard shows Latest Guides
+
+Scheduling: owner digest queued nightly 08:00 local; breach-soon nudges queued 09:00; CR auto-archive covers closed & deployed >30d
+
+Workstreams: tabs are deep-linkable and remember last tab
+
+Releases: health badges; notes diff HTML printable; ICS month export
+
+Ops: comms queue list with retries/backoff & last_error, audit & config health present

@@ -1,0 +1,643 @@
+Here’s Next Big Build v2.6 — UI/UX revamp (phase 1) you can paste straight into Replit. It’s safe, feature-flagged, and sits on top of your working app:
+
+Global brand tokens (colors, gradients, typography, glow)
+
+Branded header (uses your org/project logos + theme color)
+
+Notification Drawer (clean, persistent, mark-read)
+
+Sidebar v2 (Planning / Execution / Governance / Insights)
+
+Feature flag (VITE_BRAND_V2) + local toggle (URL or “remember” in localStorage)
+
+Everything below is copy-paste. Minimal risk; if the flag is off, nothing changes.
+
+0) Turn on the flag (dev)
+
+.env / Replit secrets
+
+VITE_BRAND_V2=1
+
+
+You can also toggle at runtime with ?brandv2=1 in the URL (and it persists in localStorage) — see lib/brand.ts.
+
+1) Global brand tokens
+1A) Add tokens CSS
+
+client/src/brand/tokens.css
+
+/* Load brand fonts */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Poppins:wght@500;600;700&display=swap');
+
+:root {
+  --brand-bg: #0b0d10;
+  --brand-surface: #12161b;
+  --brand-text: #e6eef8;
+  --brand-muted: #8fa1b3;
+
+  --brand-primary: #5a73ff;    /* Royal */
+  --brand-accent:  #1de4ff;    /* Neon Aqua */
+  --brand-magenta: #f13cff;    /* Magenta */
+  --brand-warn:    #ffd34f;    /* Yellow */
+  --brand-good:    #19d492;    /* Green */
+
+  --brand-gradient: linear-gradient(90deg, var(--brand-primary), var(--brand-magenta));
+  --brand-glow: 0 0 18px rgba(29,228,255,0.35);
+  --brand-ring: 0 0 0 3px rgba(29,228,255,0.25);
+}
+
+/* Brand v2 “on” class flips typography + subtle background */
+.brand-v2 {
+  background: var(--brand-bg);
+  color: var(--brand-text);
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Arial, sans-serif;
+}
+
+.brand-v2 h1, .brand-v2 h2, .brand-v2 h3, .brand-v2 .heading {
+  font-family: Poppins, Inter, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Arial, sans-serif;
+}
+
+.brand-card {
+  background: var(--brand-surface);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 10px;
+}
+
+.brand-chip {
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 999px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.brand-btn {
+  border: 1px solid rgba(255,255,255,0.08);
+  padding: 8px 12px;
+  border-radius: 8px;
+  transition: box-shadow .15s ease, transform .15s ease;
+}
+.brand-btn:hover {
+  box-shadow: var(--brand-glow);
+  transform: translateY(-1px);
+}
+
+.gradient-text {
+  background: var(--brand-gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Focus ring */
+.brand-v2 :focus-visible {
+  outline: none;
+  box-shadow: var(--brand-ring);
+}
+
+1B) Import tokens once
+
+client/src/index.css (top or near the other imports)
+
+@import "./brand/tokens.css";
+
+2) Feature flag + helpers
+
+client/src/lib/brand.ts
+
+export function isBrandV2(): boolean {
+  if (typeof window !== "undefined") {
+    const u = new URL(window.location.href);
+    if (u.searchParams.has("brandv2")) {
+      const v = u.searchParams.get("brandv2") === "1";
+      if (v) localStorage.setItem("kap.brandv2","1"); else localStorage.removeItem("kap.brandv2");
+      return v;
+    }
+    if (localStorage.getItem("kap.brandv2") === "1") return true;
+  }
+  return import.meta.env.VITE_BRAND_V2 === "1";
+}
+
+3) Branded header (project aware + theme)
+
+You already have a header; this version is safe and brand-flagged.
+
+client/src/components/BrandedHeader.tsx
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import BrandTheme from "@/components/BrandTheme";
+
+export default function BrandedHeader(){
+  const { projectId } = useParams();
+  const [b,setB]=useState<any>(null);
+
+  useEffect(()=>{ (async()=>{
+    try{
+      const url = projectId ? `/branding/project_settings?project_id=${projectId}` : `/branding/settings`;
+      const r = await fetch(url, { credentials:"include" });
+      if (r.ok) setB(await r.json());
+    }catch{}
+  })(); },[projectId]);
+
+  if (!b) return null;
+
+  return (
+    <div className="w-full border-b" style={{borderColor: b.theme_color || "#111111"}}>
+      <BrandTheme color={b.theme_color}/>
+      <div className="flex items-center justify-between p-2">
+        <div className="flex items-center gap-2">
+          {b.customer_logo_path &&
+            <img src={`/branding/logo?which=customer${projectId?`&project_id=${projectId}`:""}`} alt="customer" className="h-6" />}
+          {b.customer_name && <div className="text-sm font-medium">{b.customer_name}</div>}
+        </div>
+        {b.header_text && <div className="text-xs text-muted-foreground">{b.header_text}</div>}
+        <div className="flex items-center gap-2">
+          {b.vendor_logo_path &&
+            <img src={`/branding/logo?which=vendor${projectId?`&project_id=${projectId}`:""}`} alt="vendor" className="h-6" />}
+          <div className="text-sm font-semibold" style={{color:b.theme_color || "#111111"}}>TEAIM</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+client/src/components/BrandTheme.tsx
+
+import { useEffect } from "react";
+export default function BrandTheme({ color }: { color?: string }){
+  useEffect(()=>{
+    if (!color) return;
+    document.documentElement.style.setProperty('--brand-color', color);
+  },[color]);
+  return null;
+}
+
+4) Notification Drawer
+
+client/src/components/NotificationDrawer.tsx
+
+import { useEffect, useState } from "react";
+import { getJSON } from "@/lib/authFetch";
+import { useParams } from "react-router-dom";
+
+export default function NotificationDrawer(){
+  const { projectId } = useParams();
+  const [open, setOpen] = useState(false);
+  const [items,setItems] = useState<any[]>([]);
+  const [loading,setLoading] = useState(false);
+
+  async function load(){
+    setLoading(true);
+    try{
+      const d = await getJSON(`/api/notifications/list?project_id=${projectId}`);
+      setItems(d.items || []);
+    }catch{}
+    setLoading(false);
+  }
+
+  useEffect(()=>{
+    load();
+    const h = (e:any)=> setOpen(!!e?.detail?.open);
+    window.addEventListener("kap:drawer", h);
+    const t = setInterval(load, 15000);
+    return ()=>{ window.removeEventListener("kap:drawer", h); clearInterval(t); };
+  },[projectId]);
+
+  async function markAll(){
+    await fetch(`/api/notifications/mark_all_read?project_id=${projectId}`, { method:"POST", credentials:"include" });
+    load();
+  }
+
+  return (
+    <>
+      <button className="brand-btn" onClick={()=>setOpen(o=>!o)}>🔔</button>
+      {open && (
+        <div className="fixed right-0 top-0 bottom-0 w-[380px] bg-white dark:bg-neutral-900 border-l shadow-xl z-[95] p-3">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-sm font-medium">Notifications</div>
+            <button className="text-xs underline" onClick={markAll}>Mark all read</button>
+          </div>
+          {loading && <div className="text-xs">Loading…</div>}
+          <div className="space-y-2">
+            {(items||[]).map((e:any,i:number)=>(
+              <div key={i} className={`border rounded p-2 ${e.is_read?'opacity-70':''}`}>
+                <div className="text-xs text-muted-foreground">{new Date(e.created_at).toLocaleString()}</div>
+                <div className="text-sm font-medium">{e.title}</div>
+                {e.body && <pre className="text-xs whitespace-pre-wrap">{JSON.stringify(e.body,null,2)}</pre>}
+                {e.link && <a className="text-xs underline" href={e.link}>Open</a>}
+              </div>
+            ))}
+            {!items?.length && <div className="text-xs text-muted-foreground">No notifications.</div>}
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+
+This doesn’t replace your existing inbox; it’s the shiny top-bar drawer for v2.
+
+5) Sidebar v2 (IA buckets)
+
+client/src/components/SidebarV2.tsx
+
+import { NavLink, useParams } from "react-router-dom";
+import { Home, Calendar, FileText, Settings, Users, LineChart, Box, Bell } from "lucide-react";
+
+function Group({title, children}:{title:string; children:any}){
+  return (
+    <div className="mb-4">
+      <div className="text-[11px] uppercase tracking-wider text-gray-400 mb-1">{title}</div>
+      <div className="space-y-1">{children}</div>
+    </div>
+  );
+}
+
+function Item({to, icon:Icon, label}:{to:string; icon:any; label:string}){
+  return (
+    <NavLink to={to}
+      className={({isActive})=>`flex items-center gap-2 px-2 py-1 rounded ${isActive?'bg-white/10 text-white':'text-gray-300 hover:bg-white/5'}`}>
+      <Icon size={16} /> <span className="text-sm">{label}</span>
+    </NavLink>
+  );
+}
+
+export default function SidebarV2(){
+  const { projectId } = useParams();
+  return (
+    <div className="h-full w-[220px] bg-[var(--brand-bg)] text-white p-3 border-r border-white/10">
+      <Group title="Planning">
+        <Item to={`/projects/${projectId}/stages/manage`} icon={Calendar} label="Stages" />
+        <Item to={`/projects/${projectId}/stages/wizard`} icon={Box} label="Stage Wizard" />
+        <Item to={`/admin/stage-templates`} icon={Settings} label="Templates" />
+      </Group>
+      <Group title="Execution">
+        <Item to={`/projects/${projectId}/documents`} icon={FileText} label="Documents" />
+        <Item to={`/projects/${projectId}/meetings`} icon={Calendar} label="Meetings" />
+        <Item to={`/projects/${projectId}/updates/review`} icon={Bell} label="Updates" />
+      </Group>
+      <Group title="Governance">
+        <Item to={`/projects/${projectId}/signoff/docs`} icon={FileText} label="Sign-Off Docs" />
+        <Item to={`/projects/${projectId}/admin/ops`} icon={Settings} label="Ops" />
+        <Item to={`/projects/${projectId}/admin/branding`} icon={Settings} label="Branding" />
+      </Group>
+      <Group title="Insights">
+        <Item to={`/projects/${projectId}/dashboard`} icon={Home} label="Dashboard" />
+        <Item to={`/projects/${projectId}/admin/method`} icon={LineChart} label="Method Insights" />
+      </Group>
+      <Group title="Team">
+        <Item to={`/projects/${projectId}/admin/invite`} icon={Users} label="Invite" />
+        <Item to={`/projects/${projectId}/admin/team-access`} icon={Users} label="Team Access" />
+      </Group>
+    </div>
+  );
+}
+
+6) Wire it all under a flag
+
+Patch client/src/App.jsx (pseudocode-level; keep your routing intact):
+
+import { isBrandV2 } from "@/lib/brand";
+import BrandedHeader from "@/components/BrandedHeader";
+import NotificationDrawer from "@/components/NotificationDrawer";
+import SidebarV2 from "@/components/SidebarV2";
+
+function AppContent(){
+  // extract userRole from your context as you fixed
+  const brand = isBrandV2();
+
+  return (
+    <div className={brand ? "brand-v2 min-h-screen" : "min-h-screen"}>
+      {brand && <BrandedHeader />}
+      <div className="flex">
+        {brand ? <SidebarV2 /> : <Sidebar /* your existing */ />}
+        <div className="flex-1 p-3">
+          {/* your existing Routes go here */}
+        </div>
+      </div>
+      {brand && (
+        <div className="fixed right-3 top-3 z-[96]">
+          <NotificationDrawer />
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+If anything complains, keep your existing <Sidebar /> import; V2 only renders when brand is true.
+
+7) Quick validation (dev)
+
+Add ?brandv2=1 to URL → page switches to new header/IA; remove → old UI returns.
+
+Header shows customer/vendor logos (via /branding/logo) and respects theme color.
+
+Drawer bell opens right panel; notifications load; “Mark all read” works.
+
+Sidebar shows the 5 buckets with sensible links.
+
+What I’ll queue next (you say “go”)
+
+Dashboard v2 (KPI glow cards + phase timeline, micro-interactions)
+
+PDF/Export styles (gradient header + watermark swoosh)
+
+Micro interactions (hover glow, button pulse, sign-off confetti)
+
+Figma-style themes for a secondary tenant (if you want a demo brand)
+
+If you want me to start Dashboard v2 immediately (recommended), I’ll paste the KPI cards + timeline component next.
+
+You said:
+go
+ChatGPT said:
+Thought for 27s
+
+Kris — rolling. Here’s Next Big Build v2.6.1 — Dashboard v2 you can paste straight into Replit. It’s brand-flagged (shows only when VITE_BRAND_V2=1 or ?brandv2=1) and sits on top of your existing APIs:
+
+KPI Glow Cards (docs/actions/risks/decisions/stages; overdue & sign-offs too)
+
+Phase Timeline (dates → bars; area colors; status glow)
+
+Micro-interactions (glow/pulse/shimmer)
+
+Brand-aware and resilient to missing/dev endpoints (skeletons & fallbacks)
+
+Everything is modular. Paste in, restart, done.
+
+0) Micro-interactions (CSS)
+
+client/src/brand/micro.css
+
+/* Shimmer skeleton */
+@keyframes shimmer {
+  0% { background-position: -400px 0 }
+  100% { background-position: 400px 0 }
+}
+.skeleton {
+  background: linear-gradient(90deg, rgba(255,255,255,0.04) 25%, rgba(255,255,255,0.10) 37%, rgba(255,255,255,0.04) 63%);
+  background-size: 800px 100%;
+  animation: shimmer 1.1s linear infinite;
+  border-radius: 8px;
+}
+
+/* Soft glow pulse for KPI cards */
+@keyframes glow {
+  0%,100% { box-shadow: 0 0 0 rgba(29,228,255,0) }
+  50%     { box-shadow: 0 0 18px rgba(29,228,255,0.35) }
+}
+.kpi-glow:hover { animation: glow 1.8s ease-in-out 1 }
+
+/* Subtle pop on hover */
+.hover-pop { transition: transform .12s ease, box-shadow .12s ease }
+.hover-pop:hover { transform: translateY(-1px); box-shadow: var(--brand-glow) }
+
+/* Brand gradient line */
+.rule-gradient {
+  height: 2px; border: 0; background: var(--brand-gradient); opacity: .6; border-radius: 2px;
+}
+
+
+Import once (already importing tokens.css)
+
+/* client/src/index.css */
+@import "./brand/micro.css";
+
+1) KPI Card component
+
+client/src/components/DashboardKPICard.tsx
+
+import React from "react";
+
+export default function DashboardKPICard({
+  label, value, sub, color, onClick
+}:{
+  label:string; value:React.ReactNode; sub?:string; color?:"primary"|"magenta"|"aqua"|"warn"|"good"; onClick?:()=>void
+}){
+  const map:any = {
+    primary: "var(--brand-primary)",
+    magenta: "var(--brand-magenta)",
+    aqua: "var(--brand-accent)",
+    warn: "var(--brand-warn)",
+    good: "var(--brand-good)",
+  };
+  const stroke = map[color||"primary"];
+  return (
+    <div onClick={onClick}
+      className="brand-card p-3 hover-pop cursor-default select-none"
+      style={{ borderColor: "rgba(255,255,255,0.08)" }}>
+      <div className="text-xs" style={{ color: "var(--brand-muted)" }}>{label}</div>
+      <div className="flex items-baseline gap-2">
+        <div className="text-2xl font-semibold" style={{ color: "var(--brand-text)" }}>{value}</div>
+        {sub && <div className="text-[11px]" style={{ color: "var(--brand-muted)" }}>{sub}</div>}
+      </div>
+      <hr className="rule-gradient mt-3" style={{ background: `linear-gradient(90deg, ${stroke}, transparent)`}}/>
+    </div>
+  );
+}
+
+2) Phase Timeline component
+
+client/src/components/PhaseTimeline.tsx
+
+import { useEffect, useMemo, useState } from "react";
+import { getJSON } from "@/lib/authFetch";
+
+type Stage = { id:string; title:string; area?:string; start_date?:string; end_date?:string; status?:string };
+
+function clamp(n:number,min:number,max:number){ return Math.max(min, Math.min(max, n)); }
+
+export default function PhaseTimeline({ projectId }:{ projectId:string }){
+  const [stages,setStages]=useState<Stage[]>([]);
+  const [loading,setLoading]=useState(false);
+
+  useEffect(()=>{ (async()=>{
+    setLoading(true);
+    try{
+      const d = await getJSON<{items:Stage[]}>(`/api/stages/list?project_id=${projectId}`);
+      setStages((d.items||[]));
+    }catch{ setStages([]); }
+    setLoading(false);
+  })(); },[projectId]);
+
+  const span = useMemo(()=>{
+    const dates = (stages||[]).flatMap(s=>[s.start_date, s.end_date]).filter(Boolean) as string[];
+    if (!dates.length) return null;
+    const min = new Date(dates.reduce((a,b)=> a!<b! ? a! : b!)); // naive
+    const max = new Date(dates.reduce((a,b)=> a!>b! ? a! : b!));
+    const days = Math.max(1, Math.ceil((+max - +min)/86400000));
+    return { min, max, days };
+  },[stages]);
+
+  if (loading) return <div className="skeleton h-[120px]" />;
+
+  if (!stages.length || !span) {
+    return <div className="text-xs text-muted-foreground brand-card p-3">No timeline data yet. Add stage dates in the Stage Editor.</div>;
+  }
+
+  const colors:any = {
+    HCM: "var(--brand-primary)",
+    Payroll: "var(--brand-warn)",
+    Financials: "var(--brand-magenta)",
+    Integrations: "var(--brand-accent)",
+    Time: "var(--brand-good)",
+    default: "rgba(255,255,255,0.35)"
+  };
+
+  return (
+    <div className="brand-card p-3">
+      <div className="text-sm font-medium mb-2">Phase Timeline</div>
+      <div className="space-y-2">
+        {stages.map(s=>{
+          const start = s.start_date ? new Date(s.start_date) : span.min;
+          const end   = s.end_date   ? new Date(s.end_date)   : span.max;
+          const off = clamp(Math.floor(((+start - +span.min)/86400000)), 0, span.days);
+          const len = clamp(Math.max(2, Math.ceil((+end - +start)/86400000)), 2, span.days);
+          const pctStart = (off/span.days)*100;
+          const pctW = (len/span.days)*100;
+          const col = colors[s.area||"default"] || colors.default;
+          const glow = s.status==="in_review" ? "0 0 14px rgba(29,228,255,0.35)" : "none";
+          return (
+            <div key={s.id}>
+              <div className="text-xs flex justify-between mb-1">
+                <span>{s.title} {s.area? `• ${s.area}`:""}</span>
+                <span className="text-muted-foreground">{s.status || ""}</span>
+              </div>
+              <div className="relative h-2 bg-white/10 rounded">
+                <div className="absolute h-2 rounded"
+                  style={{ left:`${pctStart}%`, width:`${pctW}%`, background: col, boxShadow: glow }} />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+3) Dashboard v2 page
+
+client/src/pages/DashboardV2.tsx
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { getJSON } from "@/lib/authFetch";
+import DashboardKPICard from "@/components/DashboardKPICard";
+import PhaseTimeline from "@/components/PhaseTimeline";
+
+type Summary = { actions:number; risks:number; decisions:number; docs:number; stages_in_review:number };
+
+export default function DashboardV2(){
+  const { projectId } = useParams();
+  const [sum,setSum]=useState<Summary|null>(null);
+  const [overdue,setOverdue]=useState<number>(0);
+  const [signs,setSigns]=useState<{signed:number; total:number}>({signed:0,total:0});
+  const [loading,setLoading]=useState(true);
+
+  useEffect(()=>{ (async()=>{
+    setLoading(true);
+    try{
+      const s = await getJSON(`/api/analytics/summary?project_id=${projectId}`);
+      setSum(s || null);
+    }catch{ setSum(null); }
+    try{
+      const od = await getJSON(`/api/actions/overdue?project_id=${projectId}`);
+      setOverdue((od.items||[]).length);
+    }catch{ setOverdue(0); }
+    try{
+      const d = await getJSON(`/api/signoff/docs/list?project_id=${projectId}`);
+      const items = d.items||[];
+      setSigns({ signed: items.filter((x:any)=>x.status==="signed").length, total: items.length });
+    }catch{ setSigns({signed:0,total:0}); }
+    setLoading(false);
+  })(); },[projectId]);
+
+  const k = (label:string, value:any, sub?:string, color?:any)=>(
+    <DashboardKPICard label={label} value={value} sub={sub} color={color}/>
+  );
+
+  return (
+    <div className="space-y-4">
+      {/* Hero / empty state */}
+      {!loading && sum && sum.docs===0 && (
+        <div className="brand-card p-4">
+          <div className="text-xl heading gradient-text">Welcome to TEAIM</div>
+          <div className="text-sm text-muted-foreground mt-1">
+            Upload your first document to kick off discovery and auto-extractions.
+          </div>
+        </div>
+      )}
+
+      {/* KPI row */}
+      <div className="grid md:grid-cols-6 gap-3">
+        <div className="md:col-span-2">{loading ? <div className="skeleton h-[84px]" /> : k("Documents", sum?.docs ?? "—", undefined, "primary")}</div>
+        <div className="md:col-span-1">{loading ? <div className="skeleton h-[84px]" /> : k("Actions", sum?.actions ?? "—", undefined, "aqua")}</div>
+        <div className="md:col-span-1">{loading ? <div className="skeleton h-[84px]" /> : k("Risks", sum?.risks ?? "—", undefined, "magenta")}</div>
+        <div className="md:col-span-1">{loading ? <div className="skeleton h-[84px]" /> : k("Decisions", sum?.decisions ?? "—")}</div>
+        <div className="md:col-span-1">{loading ? <div className="skeleton h-[84px]" /> : k("Overdue", overdue, overdue>0?"+ attention":undefined, overdue>0?"warn":"good")}</div>
+      </div>
+
+      {/* Governance row */}
+      <div className="grid md:grid-cols-3 gap-3">
+        <div className="md:col-span-1">
+          {loading ? <div className="skeleton h-[84px]" /> :
+            k("Stages In Review", sum?.stages_in_review ?? "—", undefined, "primary")}
+        </div>
+        <div className="md:col-span-2 brand-card p-3">
+          <div className="text-sm font-medium mb-2">Sign-Offs</div>
+          {loading ? <div className="skeleton h-[44px]" /> :
+            <div className="text-sm">
+              <span className="font-semibold">{signs.signed}</span> signed of <span className="font-semibold">{signs.total}</span> total
+            </div>}
+        </div>
+      </div>
+
+      {/* Timeline */}
+      <PhaseTimeline projectId={projectId!} />
+    </div>
+  );
+}
+
+4) Wire Dashboard v2 under the brand flag
+
+Patch client/src/App.jsx where you define routes:
+
+import { isBrandV2 } from "@/lib/brand";
+import DashboardV2 from "@/pages/DashboardV2";
+
+function AppContent(){
+  const brand = isBrandV2();
+  // ...
+  return (
+    // ...
+    <Routes>
+      {/* For the dashboard route, render v2 when brand on */}
+      <Route path="/projects/:projectId/dashboard" element={ brand ? <DashboardV2/> : <Dashboard /* your legacy */ /> } />
+      {/* ...rest of your routes... */}
+    </Routes>
+  );
+}
+
+
+Nothing else changes—everything is feature-flagged.
+
+5) Optional: small “go-to” links on KPI tiles
+
+If you want the KPIs clickable:
+
+// in DashboardV2, pass onClick handlers:
+k("Actions", sum?.actions ?? "—", undefined, "aqua", () => navigate(`/projects/${projectId}/actions/kanban`))
+
+
+(You can update the KPI component to accept onClick as in its signature.)
+
+6) 90-second validation
+
+Go to /projects/:projectId/dashboard?brandv2=1 → brand shell + KPI glow cards + timeline.
+
+Remove ?brandv2=1 → old dashboard returns.
+
+With empty data, hero prompt appears. With stages’ dates, timeline bars render.

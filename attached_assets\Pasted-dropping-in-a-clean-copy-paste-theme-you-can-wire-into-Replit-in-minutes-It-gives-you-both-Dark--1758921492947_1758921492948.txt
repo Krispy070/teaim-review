@@ -1,0 +1,189 @@
+dropping in a clean, copy-paste theme you can wire into Replit in minutes. It gives you both Dark + Light modes with semantic tokens (so your UI stays consistent as we evolve the brand).
+
+1) CSS variables (drop in src/styles/theme.css or your global CSS)
+/* TEAIM Theme – Light & Dark (v1) */
+:root {
+  /* BRAND – light mode */
+  --brand-charcoal: #1C1C1E;
+  --brand-orange:   #F26B1D;
+  --brand-yellow:   #FFC933;
+
+  /* SEMANTIC – light */
+  --bg:            #FFFFFF;
+  --fg:            #1C1C1E;
+  --muted:         #7D7D7D;
+  --panel:         #F7F7F8;
+  --panel-contrast:#ECECEE;
+  --border:        #EAEAEA;
+
+  /* ACTIONS */
+  --primary:       var(--brand-orange);
+  --primary-fg:    #FFFFFF;
+  --primary-hover: #FF7A33;    /* 8–10% lighter than orange */
+  --accent:        var(--brand-yellow);
+  --accent-fg:     #1C1C1E;
+
+  /* STATUS */
+  --success:       #2ECC71;
+  --warning:       #FFC107;
+  --error:         #E74C3C;
+
+  /* SHADOWS/FOCUS */
+  --focus:         rgba(242,107,29,0.35); /* orange glow */
+}
+
+[data-theme="dark"] {
+  /* BRAND – dark mode keeps same brand hues */
+  --brand-charcoal: #111214;
+  --brand-orange:   #F26B1D;
+  --brand-yellow:   #FFC933;
+
+  /* SEMANTIC – dark */
+  --bg:            #0E0F11;
+  --fg:            #EDEDED;
+  --muted:         #B6B6B6;
+  --panel:         #17181B;
+  --panel-contrast:#1F2125;
+  --border:        #2A2C31;
+
+  /* ACTIONS */
+  --primary:       var(--brand-orange);
+  --primary-fg:    #FFFFFF;
+  --primary-hover: #D95F1B;
+  --accent:        var(--brand-yellow);
+  --accent-fg:     #111214;
+
+  /* STATUS */
+  --success:       #27AE60;
+  --warning:       #E0A800;
+  --error:         #D6453A;
+
+  /* SHADOWS/FOCUS */
+  --focus:         rgba(242,107,29,0.45);
+}
+
+/* Utility tokens derived from vars */
+:root, [data-theme="dark"] {
+  --ring: var(--focus);
+}
+
+/* Optional: default body styles */
+html, body { background: var(--bg); color: var(--fg); }
+
+2) Tailwind config (replace/merge in tailwind.config.js)
+/** @type {import('tailwindcss').Config} */
+module.exports = {
+  darkMode: ['class', '[data-theme="dark"]'], // support either strategy
+  content: [
+    './index.html',
+    './src/**/*.{ts,tsx,js,jsx,mdx}',
+  ],
+  theme: {
+    extend: {
+      colors: {
+        // semantic aliases using CSS variables
+        bg:            'var(--bg)',
+        fg:            'var(--fg)',
+        muted:         'var(--muted)',
+        panel:         'var(--panel)',
+        panelc:        'var(--panel-contrast)',
+        border:        'var(--border)',
+
+        primary:       'var(--primary)',
+        'primary-fg':  'var(--primary-fg)',
+        'primary-hover':'var(--primary-hover)',
+        accent:        'var(--accent)',
+        'accent-fg':   'var(--accent-fg)',
+
+        success:       'var(--success)',
+        warning:       'var(--warning)',
+        error:         'var(--error)',
+
+        // raw brand tokens if you need them
+        brand: {
+          charcoal: 'var(--brand-charcoal)',
+          orange:   'var(--brand-orange)',
+          yellow:   'var(--brand-yellow)',
+        },
+      },
+      boxShadow: {
+        focus: '0 0 0 3px var(--ring)',
+      },
+      borderColor: {
+        DEFAULT: 'var(--border)',
+      },
+    },
+  },
+  plugins: [],
+};
+
+3) Example component classes (use anywhere)
+// Button
+<button className="
+  inline-flex items-center gap-2 rounded-xl px-4 py-2
+  bg-primary text-primary-fg hover:bg-primary-hover
+  shadow-sm focus:outline-none focus:shadow-focus
+  border border-border
+">
+  Get Started
+</button>
+
+// Card
+<div className="rounded-2xl bg-panel border border-border">
+  <div className="p-4 text-fg">Card content</div>
+</div>
+
+// Page wrapper
+<div className="min-h-screen bg-bg text-fg">...</div>
+
+// Subtle label
+<span className="text-muted">Overdue Actions</span>
+
+// Timeline bar (primary w/ accent hover)
+<div className="h-2 rounded bg-primary hover:bg-accent transition-colors"></div>
+
+4) Theme toggle (drop-in utility)
+// theme.ts
+export function setTheme(mode: 'light'|'dark') {
+  const root = document.documentElement;
+  if (mode === 'dark') {
+    root.setAttribute('data-theme', 'dark');
+    root.classList.add('dark');
+  } else {
+    root.removeAttribute('data-theme');
+    root.classList.remove('dark');
+  }
+  localStorage.setItem('teaim_theme', mode);
+}
+
+export function initTheme() {
+  const saved = localStorage.getItem('teaim_theme');
+  const prefersDark = window.matchMedia?.('(prefers-color-scheme: dark)').matches;
+  setTheme((saved as 'light'|'dark') || (prefersDark ? 'dark' : 'light'));
+}
+
+// In your app root (e.g., App.tsx)
+import { useEffect } from 'react';
+import { initTheme, setTheme } from './theme';
+import './styles/theme.css';
+
+export default function App() {
+  useEffect(() => { initTheme(); }, []);
+  return (
+    <div className="min-h-screen bg-bg text-fg">
+      <header className="flex items-center justify-between p-4 border-b border-border bg-panel">
+        <h1 className="text-xl font-semibold">TEAIM</h1>
+        <div className="flex items-center gap-2">
+          <button onClick={() => setTheme('light')} className="px-3 py-1 rounded border border-border">Light</button>
+          <button onClick={() => setTheme('dark')}  className="px-3 py-1 rounded border border-border">Dark</button>
+        </div>
+      </header>
+      {/* ... */}
+    </div>
+  );
+}
+
+5) “AI” accent treatment in text (subtle brand cue)
+<h1 className="text-2xl font-bold tracking-tight">
+  TE<span className="text-brand-orange">AI</span>M
+</h1>

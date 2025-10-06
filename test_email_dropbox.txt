@@ -1,0 +1,5 @@
+ACME Payroll WG – Minutes
+Decision: adopt retro policy v2.
+Risk: payroll calendar slippage (High).
+Action: Jane Doe to deliver retro doc by 2025-09-21.
+ADP → Workday daily SFTP; Workday → GL weekly API.

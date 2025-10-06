@@ -1,0 +1,345 @@
+On it, Kris. Data moat coming right up. The rule is simple: every byte in the pipeline must be tagged with (org_id, project_id) and every read/write must be hard-filtered and membership-checked server-side—then backed by RLS so a missed filter can’t hurt you. Plus, the RAG/ChatGPT calls only ever see chunks from the active project’s namespace.
+
+Below are paste-ready snippets to drop into your app. I’ll wire this in 7 layers (defense-in-depth). If your file paths differ, tell me and I’ll adapt.
+
+0) Table you’ll need (if not already): project_members
+
+Supabase SQL
+
+-- Who belongs to which projects (and with what role)
+create table if not exists public.project_members (
+  org_id uuid not null,
+  project_id uuid not null,
+  user_id uuid not null,  -- auth.uid()
+  role text not null check (role in ('admin','pm','member','customer_signer','viewer')),
+  created_at timestamptz not null default now(),
+  primary key (org_id, project_id, user_id)
+);
+
+create index if not exists idx_pm_user on public.project_members(user_id);
+create index if not exists idx_pm_proj on public.project_members(project_id);
+
+
+We’ll use this for every policy: “only members of this project in this org can see/write rows.”
+
+1) Supabase RLS (global policy pattern)
+
+Apply this to every tenant table (projects, artifacts, artifact_chunks, mem_entries, project_stages, audit_events, actions, risks, decisions, etc.). Two helpers:
+
+Supabase SQL
+
+-- Helpers (reuse from earlier if present)
+create or replace function public.current_role() returns text language sql stable as $$
+  select coalesce(nullif(current_setting('request.jwt.claims', true)::jsonb->>'role',''), 'member');
+$$;
+
+create or replace function public.current_org() returns uuid language sql stable as $$
+  select nullif(current_setting('request.jwt.claims', true)::jsonb->>'org_id','')::uuid;
+$$;
+
+-- Generic membership check for policies
+create or replace function public.is_member(_org uuid, _project uuid) returns boolean
+language sql stable as $$
+  select exists(
+    select 1 from public.project_members pm
+    where pm.org_id = _org and pm.project_id = _project and pm.user_id = auth.uid()
+  );
+$$;
+
+Example: apply to project_stages
+alter table public.project_stages enable row level security;
+
+-- Read only if same org + member of the project
+create policy "stages_select" on public.project_stages
+for select using (
+  org_id = public.current_org() and public.is_member(org_id, project_id)
+);
+
+-- PM/Admin can insert/update within their org *and* membership
+create policy "stages_insert" on public.project_stages
+for insert with check (
+  org_id = public.current_org()
+  and public.is_member(org_id, project_id)
+  and public.current_role() in ('admin','pm')
+);
+
+create policy "stages_update" on public.project_stages
+for update using (
+  org_id = public.current_org() and public.is_member(org_id, project_id)
+) with check (
+  org_id = public.current_org() and public.is_member(org_id, project_id)
+);
+
+Example: apply to artifact_chunks (RAG store)
+alter table public.artifact_chunks enable row level security;
+
+create policy "chunks_select" on public.artifact_chunks
+for select using (
+  org_id = public.current_org() and public.is_member(org_id, project_id)
+);
+
+create policy "chunks_insert" on public.artifact_chunks
+for insert with check (
+  org_id = public.current_org() and public.is_member(org_id, project_id)
+);
+
+
+Do the same for projects, artifacts, mem_entries, audit_events, actions, risks, decisions, etc.
+
+2) Supabase Storage isolation (files)
+
+Use a canonical key path: org/<org_id>/project/<project_id>/<uuid>__filename.ext
+
+Supabase SQL (Storage policies)
+
+-- Assume bucket_id = 'artifacts'
+-- Path format: org/{org_id}/project/{project_id}/...
+
+create policy "storage_read_tenant"
+on storage.objects for select
+using (
+  bucket_id = 'artifacts'
+  and ( (regexp_split_to_array(name,'/'))[1] = 'org'
+        and ((regexp_split_to_array(name,'/'))[2])::uuid = public.current_org()
+        and public.is_member(((regexp_split_to_array(name,'/'))[2])::uuid,
+                              ((regexp_split_to_array(name,'/'))[4])::uuid)
+  )
+);
+
+create policy "storage_write_tenant"
+on storage.objects for insert
+with check (
+  bucket_id = 'artifacts'
+  and ( (regexp_split_to_array(name,'/'))[1] = 'org'
+        and ((regexp_split_to_array(name,'/'))[2])::uuid = public.current_org()
+        and public.is_member(((regexp_split_to_array(name,'/'))[2])::uuid,
+                              ((regexp_split_to_array(name,'/'))[4])::uuid)
+  )
+);
+
+3) FastAPI: Tenant context + guards (server-side gate)
+
+Never trust client org_id. Read it from the JWT (issued by Supabase) and enforce membership for any project_id used.
+
+server/app/tenant.py
+
+from fastapi import Depends, HTTPException, Header
+from pydantic import BaseModel
+import jwt, os
+from typing import Optional
+from .deps import get_supabase  # your existing factory
+
+JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")  # from Supabase settings
+JWT_ALG = "HS256"
+
+class TenantCtx(BaseModel):
+    user_id: str
+    org_id: str
+    role: str
+
+def tenant_ctx(authorization: Optional[str] = Header(None)) -> TenantCtx:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "Missing Bearer token")
+    token = authorization.split(" ",1)[1]
+    try:
+        claims = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG], options={"verify_aud": False})
+    except Exception:
+        raise HTTPException(401, "Invalid token")
+    org_id = claims.get("org_id")
+    if not org_id:
+        raise HTTPException(403, "Missing org context")
+    return TenantCtx(user_id=claims.get("sub"), org_id=org_id, role=claims.get("role","member"))
+
+def require_project_member(project_id: str, ctx: TenantCtx = Depends(tenant_ctx), sb=Depends(get_supabase)) -> TenantCtx:
+    # Service-role bypasses RLS, so enforce membership explicitly here too.
+    res = sb.table("project_members").select("user_id").eq("org_id", ctx.org_id)\
+           .eq("project_id", project_id).eq("user_id", ctx.user_id).limit(1).execute()
+    if not res.data:
+        raise HTTPException(403, "Not a member of this project")
+    return ctx
+
+
+Use tenant_ctx for endpoints that need org scope; use require_project_member(project_id) for project-scoped endpoints.
+
+4) FastAPI: Scoped Supabase wrapper (always filters)
+
+server/app/db_guard.py
+
+from .deps import get_supabase
+
+class ScopedDB:
+    def __init__(self, sb, org_id: str, project_id: str | None = None):
+        self.sb = sb
+        self.org_id = org_id
+        self.project_id = project_id
+
+    def table(self, name: str):
+        q = self.sb.table(name).eq("org_id", self.org_id)
+        if self.project_id and "project_id" in [c["name"] for c in q.schema["columns"]]:  # best-effort
+            q = q.eq("project_id", self.project_id)
+        return q
+
+def scoped_db(org_id: str, project_id: str | None, sb=Depends(get_supabase)) -> ScopedDB:
+    return ScopedDB(sb, org_id, project_id)
+
+
+Now your routes can’t “forget” filters; the guard injects them.
+
+5) RAG: Per-project namespace (vector search filters)
+
+Your chunk table already has (org_id, project_id, embedding). Always restrict on both before cosine search.
+
+server/app/rag.py
+
+from typing import List, Dict
+from pydantic import BaseModel
+import numpy as np
+
+class Hit(BaseModel):
+    artifact_id: str
+    chunk_id: str
+    text: str
+    score: float
+
+def search_chunks(sb, org_id: str, project_id: str, query_embedding: List[float], k=8) -> List[Hit]:
+    # Supabase RPC with pgvector (preferred) or client-side scoring fallback.
+    # Server-side pgvector example (replace 'embedding' with your column):
+    res = sb.rpc("match_chunks", {
+        "query_embedding": query_embedding,
+        "match_count": k,
+        "match_org": org_id,
+        "match_project": project_id
+    }).execute()
+    return [Hit(**r) for r in res.data]
+
+# Example SQL function (run in Supabase SQL editor):
+# create or replace function public.match_chunks(query_embedding vector(1536), match_count int, match_org uuid, match_project uuid)
+# returns table(artifact_id uuid, chunk_id uuid, text text, score float)
+# language sql stable as $$
+#   select artifact_id, id as chunk_id, text,
+#          1 - (embedding <=> query_embedding) as score
+#   from public.artifact_chunks
+#   where org_id = match_org and project_id = match_project
+#   order by embedding <=> query_embedding
+#   limit match_count
+# $$;
+
+
+Guarded LLM call—only pass retrieved texts from the same (org_id, project_id):
+
+def answer_with_rag(llm, sb, ctx, project_id, question: str):
+    # get embedding for question
+    q_emb = llm.embed(question)
+    hits = search_chunks(sb, ctx.org_id, project_id, q_emb, k=8)
+    context = "\n\n---\n\n".join([h.text for h in hits])
+    prompt = f"You are answering for project {project_id}. Use ONLY the context.\n\nContext:\n{context}\n\nQ: {question}\nA:"
+    return llm.chat(prompt)  # ChatGPT sees only this project's chunks
+
+
+No cross-project retrieval = no cross-contamination in prompts.
+
+6) Frontend: Don’t send org_id; server derives it
+
+Anywhere you previously did org_id from client state, drop it. Send only project_id. The server reads org_id from JWT and enforces membership.
+
+Before
+
+await apiGet('/projects/list', { org_id, ... })
+
+
+After
+
+await apiGet('/projects/list', { project_id }) // Authorization bearer handles org_id
+
+
+On the backend route, do:
+
+@router.get("/projects/list")
+def list_projects(project_id: Optional[str] = None, ctx: TenantCtx = Depends(tenant_ctx), sb=Depends(get_supabase)):
+    q = sb.table("projects").select("*").eq("org_id", ctx.org_id)
+    if project_id:
+        # verify membership if filtering by project
+        res = sb.table("project_members").select("user_id").eq("org_id", ctx.org_id).eq("project_id", project_id)\
+              .eq("user_id", ctx.user_id).limit(1).execute()
+        if not res.data: raise HTTPException(403, "Not a member")
+        q = q.eq("id", project_id)
+    return {"projects": q.execute().data}
+
+7) Supabase client usage: Two clients, two lanes
+
+User-lane (normal API): use the user’s JWT (forward Authorization header to PostgREST). This keeps RLS live.
+
+Service-lane (back office jobs): service role key, never exposed to browser; use only for admin/batch tasks and still include org_id/project_id filters.
+
+If your FastAPI currently uses the service key for everything, keep the RLS as a safety net but DO NOT accept client org_id. Always derive from JWT; always enforce membership with project_members.
+
+8) Mailgun links: Scoped sign-off
+
+When generating sign-off URLs, include only stage_id (opaque). The approval page calls /api/stages/resolve?stage_id=...; server looks up the (org_id, project_id) for that stage, then checks membership and role before showing anything.
+
+Server
+
+@router.get("/resolve")
+def resolve_stage(stage_id: str, ctx: TenantCtx = Depends(tenant_ctx), sb=Depends(get_supabase)):
+    st = sb.table("project_stages").select("org_id,project_id,title,status").eq("id", stage_id).single().execute().data
+    if not st or st["org_id"] != ctx.org_id:
+        raise HTTPException(403, "Forbidden")
+    # also require signer membership or whitelisted email mapping if you support external signers
+    return {"stage": st}
+
+9) Observability guardrails
+
+Audit every cross-project denial: write to audit_events(kind='security.denied').
+
+Add a “tenant leak sentinel” test: try to read a known row from Project B while authenticated as user in Project A → must 403.
+
+Add rate limits per user/org on /mem/search, /rag/ask, /stages/*.
+
+10) Quick test recipes (paste & run)
+
+Create membership
+
+insert into public.project_members (org_id, project_id, user_id, role)
+values ('<ORG_UUID>','<PROJ_A_UUID>','<USER_A_UUID>','pm'),
+       ('<ORG_UUID>','<PROJ_B_UUID>','<USER_B_UUID>','pm');
+
+
+Leak test (expect 403)
+
+# Using USER_A’s token; trying to access project B
+curl -s -H "Authorization: Bearer <USER_A_JWT>" \
+  "https://<app>/api/stages/list?project_id=<PROJ_B_UUID>"
+
+
+RAG filter test (expect only project A chunks)
+
+curl -s -H "Authorization: Bearer <USER_A_JWT>" \
+  -X POST "https://<app>/api/rag/ask" \
+  -H "Content-Type: application/json" \
+  -d '{"project_id":"<PROJ_A_UUID>","question":"What did we decide yesterday?"}'
+
+11) Bonus: per-org encryption (optional, easy win)
+
+Encrypt artifact bodies client-side with a per-org key (KMS or passphrase → envelope). Store ciphertext in storage; keep embeddings server-side only (never send raw doc to LLM during embedding—use server to read/decrypt → embed).
+
+Store the per-org key encrypted with a master KMS key. Rotate periodically.
+
+TL;DR (Kap’s “don’t-cross-the-streams” checklist)
+
+JWT owns org_id, not the client.
+
+Project membership check on every route that touches project_id.
+
+RLS everywhere as backstop (select/insert/update).
+
+Storage path policy binds files to (org, project).
+
+RAG namespaces filter org_id + project_id before vector search.
+
+LLM prompts only include retrieved chunks from that project.
+
+Two Supabase lanes: user-JWT for normal API, service-key only for jobs.
+
+Leak tests + audit in CI.
+
+If you paste these in, you’ll have true multi-tenant isolation end-to-end. If you want, drop me your current deps/get_supabase and auth glue, and I’ll snap the guards in exactly where they belong.

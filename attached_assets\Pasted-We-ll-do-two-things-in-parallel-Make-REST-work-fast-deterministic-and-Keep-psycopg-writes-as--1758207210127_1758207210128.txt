@@ -1,0 +1,153 @@
+We’ll do two things in parallel:
+
+Make REST work (fast, deterministic), and
+
+Keep psycopg writes as a permanent fallback so you’re never blocked again.
+
+A) Quick Supabase fixes (run these in SQL editor)
+1) Ensure tables are visible & cached
+-- sanity: confirm tables are in the *public* schema
+select table_schema, table_name
+from information_schema.tables
+where table_schema='public'
+  and table_name in ('artifacts','artifact_chunks','summaries','mem_entries');
+
+-- force PostgREST to reload schema
+NOTIFY pgrst, 'reload schema';
+
+2) Privileges (service_role should bypass RLS, but grant usage explicitly)
+grant usage on schema public to anon, authenticated, service_role;
+
+grant select, insert, update, delete on all tables in schema public to service_role;
+alter default privileges in schema public
+  grant select, insert, update, delete on tables to service_role;
+
+-- if you created tables in multiple sessions, re-run for safety:
+grant select on all sequences in schema public to service_role;
+
+
+Using the service role key server-side should bypass RLS, so 404s are almost always cache or privileges. The above removes doubt.
+
+3) (If still 404) Hard reset cache
+
+Supabase → Project Settings → Database → Restart (safe; short blip)
+
+Then run NOTIFY pgrst, 'reload schema'; again.
+
+B) Make Storage overwrites deterministic (no 409s)
+
+Update your /ingest-sync to always write a unique object key. Example:
+
+from uuid import uuid4
+from werkzeug.utils import secure_filename  # if available; otherwise sanitize manually
+
+safe = secure_filename(file.filename) if hasattr(file, 'filename') else 'upload.txt'
+key  = f"{project_id}/{uuid4().hex}_{safe}"
+
+
+Add an env toggle if you ever want to overwrite intentionally:
+
+OVERWRITE = os.getenv("STORAGE_OVERWRITE","false").lower()=="true"
+sb.storage.from_(BUCKET).upload(
+    path=key,
+    file=data,
+    file_options={"content-type": file.content_type or "application/octet-stream"},
+    upsert=OVERWRITE
+)
+
+C) REST writes as a switch (keep psycopg too)
+
+In /server/main.py (ingest-sync), branch on an env flag so you can develop either way:
+
+WRITE_MODE = os.getenv("DB_WRITE_MODE", "psycopg")  # or "rest"
+
+if WRITE_MODE == "rest":
+    # artifacts via REST
+    art = sb.table("artifacts").insert({
+      "org_id": org_id, "project_id": project_id,
+      "path": key, "mime_type": file.content_type,
+      "title": file.filename, "source": source
+    }).execute().data[0]
+
+    # chunks in batches
+    for i in range(0, len(rows), 200):
+        sb.table("artifact_chunks").insert([
+          {"org_id": org_id, "project_id": project_id,
+           "artifact_id": art["id"], "chunk_index": r["chunk_index"],
+           "content": r["content"], "embedding": r["embedding"]}
+          for r in rows[i:i+200]
+        ]).execute()
+
+    sb.table("summaries").insert({
+      "org_id": org_id, "project_id": project_id,
+      "artifact_id": art["id"], "level": "artifact",
+      "summary": text[:2000]
+    }).execute()
+else:
+    # existing psycopg path you already wired
+    ...
+
+
+Set in Replit → Secrets:
+
+DB_WRITE_MODE = rest
+
+
+(or switch back to psycopg later).
+
+D) Test scripts (no jq needed)
+1) Mini sanity burst
+BASE="http://localhost:5000/api"
+ORG="d915376c-2bd7-4e79-b9c9-aab9d7fcb5a8"
+PROJ="dced0b98-87b4-46ff-b2a4-2cf8e627e8d2"
+
+echo "[1] DB diag";       curl -s "$BASE/diag/db"; echo
+echo "[2] Storage diag";  curl -s "$BASE/diag/storage"; echo
+
+echo "[3] Ingest-sync"
+echo "Payroll retro rules and SIT exit criteria." > /tmp/teaim-sync.txt
+curl -s -X POST "$BASE/ingest-sync" \
+  -F "org_id=$ORG" -F "project_id=$PROJ" \
+  -F "file=@/tmp/teaim-sync.txt"; echo
+
+echo "[4] Index stats"; curl -s "$BASE/diag/index-stats?org_id=$ORG&project_id=$PROJ"; echo
+
+echo "[5] Ask"; curl -s -X POST "$BASE/ask" \
+  -H "Content-Type: application/json" \
+  -d "{\"org_id\":\"$ORG\",\"project_id\":\"$PROJ\",\"question\":\"Summarize the latest document and list any exit criteria.\",\"k\":3}"; echo
+
+
+Pass criteria
+
+diag db → {"ok":true}
+
+diag storage → {"ok":true,...}
+
+ingest-sync → {"ok":true,"artifact_id":"...","chunks":1+}
+
+index stats → "chunks": 1+
+
+ask → answer with Sources: (your filename)
+
+2) Direct REST table test (proves PostgREST visibility)
+
+Run locally with your service key (replace placeholders):
+
+curl -s "https://hixirmwsvbjyeecfclgx.supabase.co/rest/v1/artifacts?select=id,title&limit=1" \
+  -H "apikey: <SERVICE_ROLE_KEY>" \
+  -H "Authorization: Bearer <SERVICE_ROLE_KEY>"
+
+
+If this returns rows → PostgREST is happy.
+
+If you get 404 here → it’s definitely cache/privileges; rerun the SQL grants + NOTIFY and/or restart DB.
+
+E) What I’d do right now
+
+Run the SQL grants + NOTIFY above.
+
+Set DB_WRITE_MODE=rest temporarily; try ingest-sync again.
+
+If REST still 404s, do a DB restart in Supabase (1 minute), then re-test the REST curl.
+
+Once ingestion writes succeed and chunks > 0, try /api/ask; you should get an answer with Sources:.

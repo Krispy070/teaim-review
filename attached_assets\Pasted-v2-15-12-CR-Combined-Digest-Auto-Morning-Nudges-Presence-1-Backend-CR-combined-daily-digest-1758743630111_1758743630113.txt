@@ -1,0 +1,312 @@
+v2.15.12 — CR Combined Digest + Auto Morning Nudges + Presence
+1) Backend — CR combined daily digest (owners + assignees)
+
+server/routers/cr_digest.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from datetime import datetime, timezone
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+import os
+
+router = APIRouter(prefix="/api/cr_digest", tags=["changes"])
+
+@router.post("/daily")
+def daily(project_id: str = Query(...), ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    sb = get_user_supabase(ctx); sent=0
+    try:
+        # CRs not closed/deployed
+        crs = sb.table("changes").select("id,title,area,priority,status,due_date,assignee")\
+              .eq("org_id",ctx.org_id).eq("project_id",project_id).execute().data or []
+        open_cr = [c for c in crs if (c.get("status") or "").lower() not in ("deployed","closed")]
+
+        # recipients: owners per area + assignees
+        owners = sb.table("area_admins").select("area,user_id").eq("org_id",ctx.org_id).eq("project_id",project_id).execute().data or []
+        area_to_owners = {}
+        for r in owners: area_to_owners.setdefault(r["area"], set()).add(r["user_id"])
+        profiles = sb.table("users_profile").select("user_id,email").execute().data or []
+        uid_to_email = {p["user_id"]: p.get("email") for p in profiles if p.get("user_id")}
+        recips = set()
+        for c in open_cr:
+            if c.get("assignee"): recips.add(c["assignee"])
+            for uid in area_to_owners.get(c.get("area") or "", []):
+                em = uid_to_email.get(uid); 
+                if em: recips.add(em)
+
+        if not recips: return {"ok": True, "sent": 0}
+
+        # send
+        from ..email.util import mailgun_send_html, send_guard
+        base = os.getenv("APP_BASE_URL","").rstrip("/")
+        for em in recips:
+            ok,_ = send_guard(sb, ctx.org_id, project_id, "cr_owner_assignee_digest", em)
+            if not ok: continue
+            body = "<h3>Change Requests (open)</h3><ul>"
+            owned = [c for c in open_cr if (c.get("assignee")==em or c.get("area") in area_to_owners and uid_to_email and em in uid_to_email.values())]
+            if not owned: body += "<li>None</li>"
+            else:
+                for c in owned[:50]:
+                    link = f"{base}/projects/{project_id}/changes/list"
+                    body += f"<li><b>{c.get('title')}</b> — {c.get('area')} • P:{c.get('priority')} • due {c.get('due_date') or 'n/a'} • {c.get('status')} • <a href='{link}'>open</a></li>"
+            body += "</ul>"
+            try:
+                mailgun_send_html([em], "[TEAIM] Daily CR Digest", body)
+                sent += 1
+            except Exception:
+                ...
+        return {"ok": True, "sent": sent}
+    except Exception:
+        return {"ok": False, "sent": sent}
+
+
+Mount in server/main.py:
+
+from .routers import cr_digest
+app.include_router(cr_digest.router)
+
+2) Backend — auto-schedule breach-soon nudges for next morning
+
+server/scheduler.py (append)
+
+import asyncio, datetime as dt, pytz, os, json
+from .deps import get_service_supabase
+
+async def schedule_breach_soon_nudges_nightly():
+    """Each night: queue morning nudges for CRs in breach-soon/overdue (assignees). Dev-safe."""
+    sbs = get_service_supabase()
+    while True:
+        try:
+            # iterate projects (dev-safe)
+            try:
+                projs = sbs.table("projects").select("id,org_id").limit(1000).execute().data or []
+            except Exception:
+                projs=[]
+            for p in projs:
+                pid = p["id"]; org = p["org_id"]
+                # timezone
+                tzname = "UTC"
+                try:
+                    tzname = (sbs.table("org_comms_settings").select("timezone").eq("org_id", org).single().execute().data or {}).get("timezone") or "UTC"
+                except Exception: ...
+                tz = pytz.timezone(tzname)
+                local_now = dt.datetime.now(tz)
+                due_utc = (local_now + dt.timedelta(days=1)).replace(hour=9,minute=0,second=0,microsecond=0).astimezone(pytz.UTC).isoformat()
+
+                # breach soon / overdue
+                try:
+                    crs = sbs.table("changes").select("id,title,priority,due_date,assignee,status")\
+                           .eq("org_id",org).eq("project_id",pid).execute().data or []
+                except Exception:
+                    crs=[]
+                def sla_state(due,prio):
+                    if not due: return "none", None
+                    try:
+                        dd = dt.datetime.fromisoformat(due).date()
+                        today = dt.datetime.now(dt.timezone.utc).date()
+                        days = (dd - today).days
+                        thr = {"urgent":2,"high":3,"medium":5,"low":7}.get((prio or "medium").lower(),5)
+                        if days < 0: return "overdue", days
+                        if days <= thr: return "breach_soon", days
+                        return "ok", days
+                    except Exception:
+                        return "none", None
+                for c in crs:
+                    if not c.get("assignee"): continue
+                    st,_ = sla_state(c.get("due_date"), c.get("priority"))
+                    if st not in ("overdue","breach_soon"): continue
+                    try:
+                        sbs.table("comms_queue").insert({
+                            "org_id": org, "project_id": pid,
+                            "kind": "cr_nudge_bulk", "to_email": c["assignee"],
+                            "not_before": due_utc,
+                            "details": {"id": c["id"], "title": c.get("title"), "due": c.get("due_date"),
+                                        "priority": c.get("priority"), "min_hours_between": 12}
+                        }).execute()
+                    except Exception: ...
+        except Exception:
+            ...
+        await asyncio.sleep(24*60*60)
+
+
+Register in server/main.py:
+
+from .scheduler import schedule_breach_soon_nudges_nightly
+@app.on_event("startup")
+async def _start_4():
+    asyncio.create_task(schedule_breach_soon_nudges_nightly())
+
+
+(Dev-safe: if tables don’t exist, it no-ops.)
+
+3) Backend — Presence ping & presence list (area owners)
+
+server/routers/presence.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from datetime import datetime, timedelta, timezone
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/presence", tags=["presence"])
+
+@router.post("/ping")
+def ping(project_id: str = Query(...), area: str | None = None, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        sb.table("area_presence").upsert({
+            "org_id": ctx.org_id, "project_id": project_id, "user_id": ctx.user_id, "area": area or "_global",
+            "last_seen": datetime.now(timezone.utc).isoformat()
+        }, on_conflict="org_id,project_id,user_id,area").execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+@router.get("/list")
+def list_presence(project_id: str = Query(...), area: str | None = None, minutes:int=15, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max(1,minutes))).isoformat()
+    try:
+        q = sb.table("area_presence").select("user_id,last_seen").eq("org_id",ctx.org_id).eq("project_id",project_id).gte("last_seen", cutoff)
+        if area: q = q.eq("area", area)
+        rows = q.limit(200).execute().data or []
+        return {"items": rows}
+    except Exception:
+        return {"items": []}
+
+# convenience
+@router.get("/me")
+def me(ctx: TenantCtx = Depends(member_ctx)):
+    return {"user_id": ctx.user_id}
+
+
+Mount in server/main.py:
+
+from .routers import presence
+app.include_router(presence.router)
+
+
+Front-end presence chips (Workstreams/Area pages):
+
+// WorkstreamArea.tsx
+useEffect(()=>{ const t=setInterval(()=>{ fetch(`/api/presence/ping?project_id=${projectId}&area=${encodeURIComponent(area)}`, {method:"POST",credentials:"include"}); }, 60_000); return ()=>clearInterval(t); },[projectId, area]);
+const [presence,setPresence]=useState<any[]>([]);
+useEffect(()=>{ (async()=>{ const d=await getJSON(`/api/presence/list?project_id=${projectId}&area=${encodeURIComponent(area)}&minutes=15`); setPresence(d.items||[]); })(); },[projectId, area]);
+
+<div className="text-[11px] text-muted-foreground mt-1">
+  Present: {presence.length? presence.map((p:any)=>p.user_id).slice(0,5).join(", ") : "—"}
+</div>
+
+v2.15.13 — Releases Diff Notes HTML + Ops Error Telemetry + Config Health
+4) Backend — Release Diff Notes HTML (brand header)
+
+server/routers/releases_compare.py (append)
+
+from fastapi.responses import HTMLResponse
+from ..brand.export_header import export_header_html
+
+@router.get("/notes_diff.html", response_class=HTMLResponse)
+def notes_diff_html(project_id: str = Query(...), a: str = Query(...), b: str = Query(...),
+                    ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    org = sb.table("org_branding").select("*").eq("org_id",ctx.org_id).single().execute().data or {}
+    proj = sb.table("projects").select("code").eq("id", project_id).single().execute().data or {}
+    hdr = export_header_html(org, proj.get("code") or project_id)
+    try:
+        ca = sb.table("releases").select("cr_ids").eq("org_id",ctx.org_id).eq("project_id",project_id).eq("id",a).single().execute().data or {}
+        cb = sb.table("releases").select("cr_ids").eq("org_id",ctx.org_id).eq("project_id",project_id).eq("id",b).single().execute().data or {}
+        A=set(ca.get("cr_ids") or []); B=set(cb.get("cr_ids") or [])
+        added = list(B-A); removed=list(A-B)
+        cr = {}
+        if added or removed:
+            ids = list(set(added+removed))
+            rows = sb.table("changes").select("id,title,area,status").eq("org_id",ctx.org_id).eq("project_id",project_id).in_("id",ids).execute().data or []
+            cr = {r["id"]:r for r in rows}
+    except Exception:
+        added=[]; removed=[]; cr={}
+    def li(ids, tag):
+        if not ids: return f"<i>None</i>"
+        return "<ul>" + "".join([f"<li>{cr.get(i,{}).get('title',i)} — {cr.get(i,{}).get('area','—')} • {tag}</li>" for i in ids]) + "</ul>"
+    html = f"<html><body style='font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:880px;margin:auto'>{hdr}<h2>Release Diff Notes</h2><h3>Added</h3>{li(added,'added')}<h3>Removed</h3>{li(removed,'removed')}</body></html>"
+    return HTMLResponse(html)
+
+
+UI (in Releases.tsx compare bar):
+
+<a className="brand-btn text-xs" target="_blank" rel="noreferrer" href={`/api/releases/notes_diff.html?project_id=${projectId}&a=${ra}&b=${rb}`}>
+  Open Diff Notes HTML
+</a>
+
+5) Backend — Error telemetry & Config health
+
+server/routers/ops_errors.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from datetime import datetime, timedelta, timezone
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_service_supabase
+import os
+
+router = APIRouter(prefix="/api/ops", tags=["ops"])
+
+@router.get("/errors")
+def errors(project_id: str | None = Query(None), days:int=7, ctx: TenantCtx = Depends(require_role({"owner","admin"}))):
+    sb = get_service_supabase()
+    start = (datetime.now(timezone.utc)-timedelta(days=max(1,days))).isoformat()
+    out = []
+    try:
+        q = sb.table("comms_send_log").select("created_at,kind,to_email,details")\
+             .gte("created_at", start).ilike("details","%error%")  # assuming you log errors in details; dev-safe
+        if project_id: q = q.eq("project_id", project_id)
+        out = q.order("created_at", desc=True).limit(500).execute().data or []
+    except Exception:
+        out=[]
+    return {"items": out}
+
+@router.get("/config_health")
+def config_health(ctx: TenantCtx = Depends(require_role({"owner","admin"}))):
+    # simple env presence check; dev-safe
+    need = ["APP_BASE_URL","MAILGUN_API_KEY"]
+    have = {k: bool(os.getenv(k)) for k in need}
+    return {"env": have}
+
+
+Mount in server/main.py:
+
+from .routers import ops_errors
+app.include_router(ops_errors.router)
+
+
+Frontend cards (Ops/Admin page):
+
+// Error telemetry
+const [errs,setErrs]=useState<any[]>([]);
+useEffect(()=>{ (async()=>{ const d=await getJSON(`/api/ops/errors?project_id=${projectId}&days=7`); setErrs(d.items||[]); })(); },[projectId]);
+
+<div className="brand-card p-3">
+  <div className="text-xs text-muted-foreground">Error Telemetry (7d)</div>
+  <div className="text-xs max-h-[28vh] overflow-auto mt-1">
+    {errs.map((e,i)=><div key={i} className="border-b py-1">{new Date(e.created_at).toLocaleString()} • {e.kind} → {e.to_email}</div>)}
+    {!errs.length && <div className="text-muted-foreground">None</div>}
+  </div>
+</div>
+
+// Config health
+const [conf,setConf]=useState<any>(null);
+useEffect(()=>{ (async()=>{ const d=await getJSON(`/api/ops/config_health`); setConf(d||{}); })(); },[]);
+<div className="brand-card p-3">
+  <div className="text-xs text-muted-foreground">Config Health</div>
+  <div className="text-xs">APP_BASE_URL: {conf?.env?.APP_BASE_URL? "✅":"❌"} · MAILGUN_API_KEY: {conf?.env?.MAILGUN_API_KEY? "✅":"❌"}</div>
+</div>
+
+2-Minute Validation
+
+CRs: bulk nudge scheduled for 9am (and saved groups); nightly auto-queue for breach-soon; list & Kanban quick-edit keep teams moving
+
+Owners: daily combined owner/assignee digest; presence on area pages; owners auto-notified on new comments
+
+Releases: Diff Notes HTML + ICS month export
+
+Ops: Audit feed with search/date; Error telemetry + Config health so you know what’s misconfigured

@@ -1,0 +1,183 @@
+two fixes to make this feel “alive”:
+
+wire the left nav to real routes (no more dead links),
+
+make the dashboard widgets/pages pull live data (and never explode if an endpoint hiccups).
+
+Below are drop-in patches. Paste them and refresh.
+
+1) Router + Layout (real pages)
+/web/src/main.jsx
+import React from 'react'
+import { createRoot } from 'react-dom/client'
+import { BrowserRouter } from 'react-router-dom'
+import App from './App'
+
+createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </React.StrictMode>
+)
+
+/web/src/App.jsx – shell + routes
+import React, { useState, createContext, useContext } from 'react'
+import { Routes, Route, NavLink, useNavigate } from 'react-router-dom'
+import ChatDock from './components/ChatDock'
+import { LiveDashboardWidgets } from './components/LiveDashboard'   // you created this earlier
+import FunctionalAreas from './components/FunctionalAreas'         // your new dynamic grid
+import Library from './pages/Library'                               // you already have
+// lightweight stubs for now:
+const Page = ({title, children}) => (<div className="space-y-4"><h2 className="text-xl font-semibold">{title}</h2>{children}</div>)
+
+const OrgCtx = createContext(null)
+export const useOrg = () => useContext(OrgCtx)
+
+export default function App(){
+  const [orgId, setOrgId] = useState('')
+  const [projectId, setProjectId] = useState('')
+  const value = { orgId, projectId, setOrgId, setProjectId }
+
+  return (
+    <OrgCtx.Provider value={value}>
+      <div className="min-h-screen bg-slate-950 text-slate-100 flex">
+        <Sidebar />
+        <div className="flex-1">
+          <Topbar />
+          <main className="max-w-7xl mx-auto px-4 py-6">
+            <Routes>
+              <Route path="/" element={<Dashboard />} />
+              <Route path="/dashboard" element={<Dashboard />} />
+              <Route path="/timeline" element={<Page title="Timeline">Coming soon</Page>} />
+              <Route path="/workstreams" element={<Workstreams />} />
+              <Route path="/integrations" element={<Page title="Integrations & Tech">Coming soon</Page>} />
+              <Route path="/actions" element={<Page title="Actions">Coming soon</Page>} />
+              <Route path="/documents" element={<Library orgId={orgId} projectId={projectId} />} />
+              <Route path="/training" element={<Page title="Training">Coming soon</Page>} />
+              <Route path="/testing" element={<Page title="Testing">Coming soon</Page>} />
+              <Route path="/logistics" element={<Page title="Logistics">Coming soon</Page>} />
+              <Route path="/data" element={<Page title="Data & Reporting">Coming soon</Page>} />
+              <Route path="/wellness" element={<Page title="Team Wellness">Coming soon</Page>} />
+              <Route path="/financials" element={<Page title="Financials">Coming soon</Page>} />
+              <Route path="*" element={<Page title="Not Found">Check the URL.</Page>} />
+            </Routes>
+          </main>
+          <ChatDock />
+        </div>
+      </div>
+    </OrgCtx.Provider>
+  )
+}
+
+function Sidebar(){
+  const link = (to, label) => (
+    <NavLink to={to}
+      className={({isActive}) => `block px-4 py-2 rounded-lg text-sm ${isActive ? 'bg-slate-800 text-white' : 'text-slate-300 hover:bg-slate-800/60'}`}>
+      {label}
+    </NavLink>
+  )
+  return (
+    <aside className="w-60 border-r border-slate-800 p-3 sticky top-0 h-screen overflow-y-auto">
+      <div className="font-bold mb-3">TEAIM</div>
+      {link('/dashboard','Dashboard')}
+      {link('/timeline','Timeline')}
+      {link('/workstreams','Workstreams')}
+      {link('/integrations','Integrations & Tech')}
+      {link('/actions','Actions')}
+      {link('/documents','Documents')}
+      {link('/training','Training')}
+      {link('/testing','Testing')}
+      {link('/logistics','Logistics')}
+      {link('/data','Data & Reporting')}
+      {link('/wellness','Team Wellness')}
+      {link('/financials','Financials')}
+    </aside>
+  )
+}
+
+function Topbar(){
+  const { orgId, projectId, setOrgId, setProjectId } = useOrg()
+  return (
+    <header className="border-b border-slate-800">
+      <div className="max-w-7xl mx-auto px-4 py-3 flex items-center gap-2 justify-end">
+        <input className="px-2 py-1 border rounded-full text-sm w-48 bg-slate-900 border-slate-700"
+               placeholder="org_id (UUID)" value={orgId} onChange={e=>window.__ORG__=e.target.value||'', setOrgId(e.target.value)} />
+        <input className="px-2 py-1 border rounded-full text-sm w-56 bg-slate-900 border-slate-700"
+               placeholder="project_id (UUID)" value={projectId} onChange={e=>window.__PROJ__=e.target.value||'', setProjectId(e.target.value)} />
+      </div>
+    </header>
+  )
+}
+
+function Dashboard(){
+  const { orgId, projectId } = useOrg()
+  return (
+    <div className="space-y-6">
+      <h2 className="text-xl font-semibold">Project Dashboard</h2>
+      {/* KPIs + Red Flags + Pending + Timeline */}
+      <LiveDashboardWidgets />
+      {/* Functional Areas (dynamic, SOW-driven) */}
+      <FunctionalAreas orgId={orgId} projectId={projectId} />
+    </div>
+  )
+}
+
+function Workstreams(){
+  const { orgId, projectId } = useOrg()
+  return (
+    <Page title="Workstreams">
+      <FunctionalAreas orgId={orgId} projectId={projectId} />
+    </Page>
+  )
+}
+
+
+Now the left sidebar actually navigates to /dashboard, /workstreams, etc. If you prefer hash routes (/#/dashboard), swap BrowserRouter for HashRouter and you’re done—either works; your Express SPA fallback already ignores /api/* and serves the app for everything else.
+
+2) Remove the scary “Error: Internal Server Error” banner
+
+That banner is probably rendering raw error text when /api/dashboard/overview throws. Make the widget graceful:
+
+/web/src/components/LiveDashboard.jsx (or where you render KPIs)
+// ... inside your component render:
+{err
+  ? <div className="text-sm text-amber-500">Dashboard data isn’t ready yet. Upload a doc or try again shortly.</div>
+  : null}
+
+
+And in the effect where you fetch data, already catch .catch(e => setErr(e.message)). That keeps the UI clean; logs still show errors.
+
+3) Seed functional areas & verify
+
+Once the SQL grants/caching are fixed, seed via curl (or use the Edit Areas inline admin):
+
+BASE="http://localhost:5000/api"
+ORG="d915376c-2bd7-4e79-b9c9-aab9d7fcb5a8"
+PROJ="dced0b98-87b4-46ff-b2a4-2cf8e627e8d2"
+
+curl -s -X POST "$BASE/workstreams/set" -H "Content-Type: application/json" -d @- <<JSON
+{"org_id":"$ORG","project_id":"$PROJ","items":[
+  {"name":"HCM","description":"Core HR & business processes"},
+  {"name":"Recruiting"},{"name":"Talent"},{"name":"Compensation"},
+  {"name":"Benefits"},{"name":"Time & Absence"},{"name":"Payroll"},
+  {"name":"Finance"},{"name":"Projects"},{"name":"Procurement"},
+  {"name":"Expenses"},{"name":"Security"},{"name":"Integrations"},
+  {"name":"Reporting/Prism"},{"name":"Cutover"}
+]}
+JSON
+
+
+Reload Dashboard and Workstreams pages—the title Functional Areas should show 15/30, and cards with tooltips.
+
+4) Quick health checks
+
+/api/dashboard/overview returns JSON (no 500) → KPIs render.
+
+/api/dashboard/workstreams returns JSON (no 500) → Functional Areas grid fills in.
+
+Sidebar links now change the URL and update content.
+
+If you want hash routing (/#/dashboard) because of your hosting constraints, say the word and I’ll flip the router + links to HashRouter for zero 404s on static hosting. Otherwise, this setup is ready for Vercel/Express SPA fallback.
+
+Once your SQL grants are run and these patches are in, call out any lingering “Error 500” banner and I’ll pinpoint the exact endpoint and hand you a one-liner fix.

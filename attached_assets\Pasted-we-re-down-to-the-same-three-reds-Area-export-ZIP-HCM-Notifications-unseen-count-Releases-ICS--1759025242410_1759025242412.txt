@@ -1,0 +1,150 @@
+we’re down to the same three reds:
+
+Area export ZIP (HCM)
+
+Notifications unseen count
+
+Releases ICS
+
+Your seed shows the right rows (artifacts:2, notifications:1, calendarEvents:1, releases:1), so this is wiring/params, not data. Let’s flip them fast.
+
+0) Quick reality check in your browser console
+
+Paste these exactly (replace PID and HCM only if your area key differs):
+
+const PID = "e1ec6ad0-a4e8-45dd-87b0-e123776ffe6e";
+
+// ZIP (should show hasArtifact:true, kind:'area_zip')
+fetch(`/api/areas/HCM/zip?projectId=${PID}&dryRun=1`).then(r=>r.json()).then(x=>console.log("ZIP", x));
+
+// Notifications (should be {ok:true,count:1})
+fetch(`/api/notifications/unseen-count?projectId=${PID}`).then(r=>r.json()).then(x=>console.log("NOTIF", x));
+
+// ICS (should start with BEGIN:VCALENDAR)
+fetch(`/api/releases/ics?projectId=${PID}`).then(r=>r.text()).then(t=>console.log("ICS", t.slice(0,32)));
+
+
+Tell me which one fails and what it returns (404, {ok:false}, etc.). That pinpoints the exact filter.
+
+While you run that, here are the most common fixes that solve this 99% of the time:
+
+1) Area ZIP (HCM)
+Likely cause
+
+Runner calling with project_id instead of projectId
+
+Route uses /api/area/zip?areaKey=HCM instead of /api/areas/HCM/zip
+
+SQL only looks for wb_export_csv, ignoring area_zip
+
+One-line confirmations
+
+Route definition should be:
+GET /api/areas/{area_key}/zip and accept camel projectId.
+
+SQL must include both kinds and prefer area_zip:
+
+select filename, mime, data, kind
+from artifacts
+where project_id=$1 and area_id=$2 and kind in ('area_zip','wb_export_csv')
+order by case when kind='area_zip' then 0 else 1 end, created_at desc
+limit 1;
+
+Runner test call (fix if needed)
+
+In your test runner, make sure it hits:
+
+await fetch(`/api/areas/HCM/zip?projectId=${projectId}&dryRun=1`)
+
+2) Notifications unseen count
+Likely cause
+
+Endpoint expects userId but runner doesn’t send it
+
+Or endpoint only counts user_id = ? and your seeded row is project-level (no user)
+
+Make it pass either way
+
+Endpoint: allow project-only fallback in DEV:
+
+-- if userId present
+select count(*) from notifications where project_id=$1 and user_id=$2 and seen=false;
+-- else (dev friendly)
+select count(*) from notifications where project_id=$1 and seen=false;
+
+
+Runner: preferably include user:
+
+await fetch(`/api/notifications/unseen-count?projectId=${projectId}&userId=${currentUserId}`)
+
+
+If you can’t (yet) pass userId, the fallback above will still return 1 with your seed.
+
+3) Releases ICS
+Likely cause
+
+ICS endpoint filtering wrong window (e.g., past-only)
+
+Returning application/json instead of text/calendar
+
+Using project_id (snake) and not picking up projectId
+
+Minimal ICS that matches your seed
+@router.get("/api/releases/ics")
+def ics(projectId: str = Query(...)):
+    rows = pg.query("""
+      select id, title, starts_at, coalesce(ends_at, starts_at) as ends_at, channel
+      from calendar_events
+      where project_id=%s and starts_at between now() and now() + interval '60 days'
+      order by starts_at asc
+    """, (projectId,))
+    lines = ["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//TEAIM//Releases//EN"]
+    for r in rows:
+        lines += [
+            "BEGIN:VEVENT",
+            f"UID:{r['id']}@teaim",
+            f"SUMMARY:{r['title']}",
+            f"DTSTART:{fmt(r['starts_at'])}",
+            f"DTEND:{fmt(r['ends_at'])}",
+            f"CATEGORIES:{r.get('channel','staging')}",
+            "END:VEVENT",
+        ]
+    lines.append("END:VCALENDAR")
+    return Response("\r\n".join(lines) + "\r\n", media_type="text/calendar")
+
+
+Where fmt converts to UTC YYYYMMDDTHHMMSSZ.
+
+Runner call must be:
+
+await fetch(`/api/releases/ics?projectId=${projectId}`)
+
+4) Make the runner unambiguous (tiny patch)
+
+If your runner centralizes the calls, normalize the params once:
+
+const pid = projectId;              // camel
+const uid = currentUserId ?? "";    // if available
+
+// ZIP
+await fetch(`/api/areas/HCM/zip?projectId=${pid}&dryRun=1`);
+
+// Notifications
+await fetch(`/api/notifications/unseen-count?projectId=${pid}${uid ? `&userId=${uid}` : ""}`);
+
+// ICS
+await fetch(`/api/releases/ics?projectId=${pid}`);
+
+5) If the console smokes all pass but runner stays red
+
+The runner may still be reading the old response field or hitting the old route.
+
+Open DevTools → Network while clicking Seed & Run:
+
+Confirm each request URL matches the above
+
+Confirm status 200
+
+Confirm response shapes (ZIP returns {ok:true,...}, NOTIF returns {ok:true,count:n}, ICS returns text/calendar)
+
+Update the runner assertions accordingly.

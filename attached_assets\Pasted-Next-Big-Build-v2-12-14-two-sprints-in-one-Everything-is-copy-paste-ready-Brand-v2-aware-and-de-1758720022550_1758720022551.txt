@@ -1,0 +1,362 @@
+Next Big Build v2.12.14 (two sprints in one). Everything is copy-paste ready, Brand v2–aware, and dev-safe (new endpoints no-op gracefully if tables/columns are missing).
+
+Landing now:
+
+Request Sign-Off v4.3 — scheduled reminders (queue for “tomorrow 9am local”), domain filter presets in UI, token aging heat-map in the pending table
+
+Stages — Project-wide template ops — Restore/Apply from template (whole project) with area filters and ±days diff preview; audited
+
+Digests — Changes by Owner API + Dashboard card; Digest Preview: simulate “mute empty sections” per recipient
+
+Wellness — Trend CSV/HTML per area/owner (ready for Excel/PDF) with brand header
+
+1) Request Sign-Off v4.3 — scheduled reminders + domain presets + aging heat-map
+1A) Backend — schedule reminders (queue) + scheduler to send when due
+
+server/routers/signoff_tokens_admin.py (append)
+
+from pydantic import BaseModel, Field
+from typing import List, Optional
+from datetime import datetime, timedelta
+import pytz, os
+
+class ScheduleBody(BaseModel):
+    tokens: List[str] = Field(min_items=1)
+    at_local: Optional[str] = "09:00"   # HH:MM
+    timezone: Optional[str] = None      # e.g., "America/Los_Angeles"
+    min_hours_between: int = 12
+
+@router.post("/schedule_reminders")
+def schedule_reminders(body: ScheduleBody, project_id: str = Query(...),
+                       ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    sb = get_user_supabase(ctx)
+    tzname = body.timezone or (sb.table("org_comms_settings").select("timezone").eq("org_id", ctx.org_id).single().execute().data or {}).get("timezone") or "UTC"
+    tz = pytz.timezone(tzname)
+    hh, mm = (body.at_local or "09:00").split(":")
+    local_now = datetime.now(tz)
+    # tomorrow at HH:MM local
+    tomorrow = (local_now + timedelta(days=1)).replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+    due_utc = tomorrow.astimezone(pytz.UTC).isoformat()
+
+    try:
+        for tok in body.tokens:
+            sb.table("comms_queue").insert({
+                "org_id": ctx.org_id,
+                "project_id": project_id,
+                "kind": "signoff_reminder",
+                "to_token": tok,
+                "not_before": due_utc,
+                "details": {"min_hours_between": body.min_hours_between}
+            }).execute()
+        return {"ok": True, "scheduled_for": due_utc, "tokens": len(body.tokens)}
+    except Exception:
+        return {"ok": False}
+
+
+server/scheduler.py (append to existing background loop file)
+
+import asyncio, datetime as dt, pytz
+from .deps import get_service_supabase
+
+async def process_comms_queue():
+    """Every 5 minutes: send queued reminders due now; dev-safe."""
+    sbs = get_service_supabase()
+    while True:
+        try:
+            now = dt.datetime.now(dt.timezone.utc).isoformat()
+            # fetch due items
+            try:
+                qs = sbs.table("comms_queue").select("id,org_id,project_id,kind,to_token,details")\
+                     .lte("not_before", now).is_("sent_at","null").limit(50).execute().data or []
+            except Exception:
+                qs = []
+            for q in qs:
+                try:
+                    # resolve token -> signer email
+                    tok = sbs.table("signoff_doc_tokens").select("signer_email")\
+                           .eq("org_id", q["org_id"]).eq("token", q["to_token"])\
+                           .is_("used_at","null").is_("revoked_at","null").single().execute().data
+                    if not tok or not tok.get("signer_email"):
+                        # mark sent anyway to avoid loops
+                        sbs.table("comms_queue").update({"sent_at":"now()"}).eq("id", q["id"]).execute()
+                        continue
+                    email = tok["signer_email"]
+
+                    # throttle by min_hours_between
+                    mhb = int((q.get("details") or {}).get("min_hours_between", 12))
+                    last = sbs.table("comms_send_log").select("created_at")\
+                           .eq("org_id", q["org_id"]).eq("project_id", q.get("project_id"))\
+                           .eq("kind","signoff_reminder").eq("to_email", email)\
+                           .order("created_at", desc=True).limit(1).execute().data
+                    ok_throttle = True
+                    if last:
+                        dt_last = dt.datetime.fromisoformat(last[0]["created_at"].replace("Z","+00:00"))
+                        if (dt.datetime.now(dt.timezone.utc) - dt_last) < dt.timedelta(hours=mhb):
+                            ok_throttle = False
+
+                    if ok_throttle:
+                        from .email.util import mailgun_send_html, send_guard
+                        ok,_ = send_guard(sbs, q["org_id"], q.get("project_id"), "signoff_reminder", email)
+                        if ok:
+                            base = os.getenv("APP_BASE_URL","").rstrip("/")
+                            link = f"{base}/signoff/doc/{q['to_token']}"
+                            mailgun_send_html([email], "[Reminder] Sign-off request", f"<p>Your sign-off link: <a href='{link}'>Open</a></p>")
+                            sbs.table("comms_send_log").insert({
+                              "org_id": q["org_id"], "project_id": q.get("project_id"),
+                              "kind": "signoff_reminder", "to_email": email,
+                              "details": {"token": q["to_token"], "queued": True}
+                            }).execute()
+                    # mark sent regardless (prevents repeat send)
+                    sbs.table("comms_queue").update({"sent_at":"now()"}).eq("id", q["id"]).execute()
+                except Exception:
+                    # mark and continue
+                    sbs.table("comms_queue").update({"sent_at":"now()"}).eq("id", q["id"]).execute()
+        except Exception:
+            ...
+        await asyncio.sleep(300)  # every 5 min
+
+
+server/main.py (startup)
+
+from .scheduler import process_comms_queue
+@app.on_event("startup")
+async def _start_2():
+    asyncio.create_task(process_comms_queue())
+
+
+Dev-safe: if queue table doesn’t exist, loop no-ops.
+
+1B) Pending UI — schedule button + domain chips + aging heat-map
+
+Patch client/src/components/SignoffRequestModal.tsx (pending controls)
+
+Add Schedule (9am local tomorrow):
+
+<button className="brand-btn text-[11px]" disabled={!anySel} onClick={async()=>{
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  const tokens = Object.keys(selTok).filter(k=>selTok[k]);
+  await fetch(`/api/signoff/schedule_reminders?project_id=${projectId}`, {
+    method:"POST", credentials:"include", headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ tokens, at_local: "09:00", timezone: tz, min_hours_between: 12 })
+  });
+  alert("Scheduled for tomorrow 09:00 local");
+}}>Schedule for 9am tomorrow</button>
+
+
+Add a simple aging heat-map color on each row (older → warmer):
+
+function ageClass(hoursLeft?:number|null){
+  if (hoursLeft==null) return "";
+  if (hoursLeft < 12) return "text-red-500 font-medium";
+  if (hoursLeft < 24) return "text-orange-500";
+  if (hoursLeft < 48) return "text-yellow-600";
+  return "text-muted-foreground";
+}
+// in row rendering:
+<span className={ageClass(p.hours_left)}>
+  {p.expires_at ? ` • exp ${new Date(p.expires_at).toLocaleString()} (~${p.hours_left}h)` : ""}
+</span>
+
+
+Domain chips (as in previous push) are already included.
+
+2) Stages — Project-wide apply/restore from template (with diff preview) + audit
+2A) Backend was added in v2.12.13 (/api/stages/apply_template + /restore_last_template). No changes needed here.
+2B) Frontend — Project preview dialog (whole project, area filters)
+
+client/src/components/StageTemplateApplyProject.tsx (new)
+
+import { useEffect, useMemo, useState } from "react";
+import { getJSON, postJSON } from "@/lib/authFetch";
+
+export default function StageTemplateApplyProject({ projectId, stages, onClose }:{
+  projectId:string; stages:{id:string; title:string; area?:string; start_date?:string; end_date?:string}[]; onClose:()=>void
+}){
+  const [templates,setTemplates]=useState<any[]>([]);
+  const [tplKey,setTplKey]=useState<string>("");
+  const [base,setBase]=useState<string>("");
+  const [areas,setAreas]=useState<string[]>([]);
+  const [rails,setRails]=useState<{min_days:number;max_days:number}>({min_days:1,max_days:365});
+
+  useEffect(()=>{ (async()=>{
+    try{ const t = await getJSON(`/stages/templates/org`); setTemplates(t.items||[]); }catch{ setTemplates([]); }
+    try{ const r = await getJSON(`/api/stages/guardrails?project_id=${projectId}`); setRails(r); }catch{}
+  })(); },[projectId]);
+
+  const targets = useMemo(()=>{
+    if (!areas.length) return stages;
+    return stages.filter(s=> areas.includes(s.area||"(Unassigned)"));
+  },[areas, stages]);
+
+  const preview = useMemo(()=>{
+    const t = templates.find((x:any)=>x.key===tplKey);
+    if (!t || !base) return [];
+    const map:Record<string,{start_offset_weeks?:number;duration_weeks?:number}> = {};
+    (t.stages||[]).forEach((s:any)=> { if (s.title) map[s.title] = { start_offset_weeks:s.start_offset_weeks||0, duration_weeks:s.duration_weeks||2 }; });
+    const baseDate = new Date(base+"T00:00:00");
+    function addDays(d:Date,n:number){ const c=new Date(d); c.setDate(c.getDate()+n); return c.toISOString().slice(0,10) }
+    const diffDays = (a?:string,b?:string)=> (a&&b)? Math.round((+new Date(b+"T00:00:00") - +new Date(a+"T00:00:00"))/86400000) : null;
+    return targets.map(s=>{
+      const m = map[s.title||""]; if (!m) return {...s, new_start:s.start_date, new_end:s.end_date, delta:null, will_update:false};
+      const start = addDays(baseDate, (m.start_offset_weeks||0)*7);
+      let days = Math.max(rails.min_days, Math.min(rails.max_days, (m.duration_weeks||2)*7));
+      const end = addDays(new Date(start+"T00:00:00"), days);
+      const delta = (diffDays(s.start_date, s.end_date) ?? 0) - (diffDays(start, end) ?? 0);
+      return {...s, new_start:start, new_end:end, delta, will_update:(s.start_date!==start || s.end_date!==end)};
+    });
+  },[templates, tplKey, base, targets, rails]);
+
+  async function apply(){
+    const changes:any = {};
+    preview.forEach((p:any)=> { if (p.will_update) changes[p.id] = { start_date: p.new_start, end_date: p.new_end }; });
+    await postJSON(`/api/stages/apply_template?project_id=${projectId}`, {
+      area: areas.join(",") || "(ALL)", template_key: tplKey, baseline: base, changes
+    });
+    alert("Applied template to project"); onClose();
+  }
+
+  const areasAll = Array.from(new Set(stages.map(s=> s.area || "(Unassigned)"))).sort();
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-[200]" onClick={onClose}>
+      <div className="mx-auto mt-[6vh] w-[980px] max-w-[97%] bg-white dark:bg-neutral-900 rounded shadow-xl border"
+           onClick={e=>e.stopPropagation()}>
+        <div className="p-3 border-b text-sm font-medium">Apply Template to Project (Preview)</div>
+        <div className="p-3 space-y-2 max-h-[75vh] overflow-auto">
+          <div className="flex items-center gap-2">
+            <select className="border rounded p-2 text-sm" value={tplKey} onChange={e=>setTplKey(e.target.value)}>
+              <option value="">Pick template…</option>
+              {templates.map((t:any)=> <option key={t.key} value={t.key}>{t.label}</option>)}
+            </select>
+            <label className="text-xs">Baseline</label>
+            <input type="date" className="border rounded p-2 text-sm" value={base} onChange={e=>setBase(e.target.value)} />
+            <div className="text-xs text-muted-foreground">Guardrails: {rails.min_days}-{rails.max_days} days</div>
+          </div>
+          <div className="flex items-center gap-2 text-xs">
+            {areasAll.map(a=>(
+              <label key={a} className="flex items-center gap-1"><input type="checkbox" checked={areas.includes(a)} onChange={e=> setAreas(x=> e.target.checked? [...x, a] : x.filter(z=>z!==a)) } />{a}</label>
+            ))}
+          </div>
+          <table className="w-full text-sm">
+            <thead><tr><th className="text-left p-1">Area</th><th className="text-left p-1">Title</th><th className="text-left p-1">Current</th><th className="text-left p-1">New</th><th className="text-left p-1">Δ days</th><th className="text-left p-1">Update?</th></tr></thead>
+            <tbody>
+              {preview.map((p:any)=>(
+                <tr key={p.id}>
+                  <td className="p-1">{p.area||"—"}</td>
+                  <td className="p-1">{p.title}</td>
+                  <td className="p-1">{p.start_date||"—"} → {p.end_date||"—"}</td>
+                  <td className="p-1">{p.new_start||"—"} → {p.new_end||"—"}</td>
+                  <td className={`p-1 ${p.delta>0?'text-red-500':p.delta<0?'text-[var(--brand-good)]':'text-muted-foreground'}`}>{p.delta>0?`+${p.delta}`: p.delta}</td>
+                  <td className="p-1">{p.will_update? "✓": "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="p-3 border-t flex justify-end gap-2">
+          <button className="brand-btn text-xs" onClick={onClose}>Cancel</button>
+          <button className="brand-btn text-xs swoosh" onClick={apply} disabled={!preview.some((p:any)=>p.will_update)}>Apply</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+Hook it on the Stages page (global toolbar):
+
+const [applyProjOpen,setApplyProjOpen]=useState(false);
+<button className="brand-btn text-xs" onClick={()=>setApplyProjOpen(true)}>Apply Template to Project</button>
+{applyProjOpen && <StageTemplateApplyProject projectId={projectId!} stages={stages} onClose={()=>setApplyProjOpen(false)} />}
+
+3) Digests — /api/digest/changes + Dashboard Compact Grid (done above)
+
+You already dropped DigestChangesGrid in DashboardV2. The backend endpoint here supplies the data.
+
+4) Wellness Admin — Trend CSV per area/owner + HTML per area/owner
+4A) Backend — trend per area/owner CSV + HTML
+
+server/routers/wellness_trend_by_csv.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse, HTMLResponse
+import io, csv
+from datetime import datetime, timedelta, timezone
+from ..tenant import TenantCtx
+from ..guards import require_role, member_ctx
+from ..deps import get_user_supabase
+from ..brand.export_header import export_header_html
+
+router = APIRouter(prefix="/api/wellness", tags=["wellness"])
+
+def counts(sb, org_id, project_id, start, end=None, by="user_id", value=None):
+    q = sb.table("team_wellness_comments").select("created_at,user_id,comment,score")\
+         .eq("org_id", org_id).eq("project_id", project_id).gte("created_at", start.isoformat())
+    if end: q = q.lte("created_at", end.isoformat())
+    if by=="user_id" and value: q = q.eq("user_id", value)
+    try: return q.execute().data or []
+    except Exception: return []
+
+@router.get("/trend_by.csv")
+def trend_by_csv(project_id: str = Query(...), days: int = 30,
+                 by: str = "user_id", value: str | None = None,
+                 ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    sb = get_user_supabase(ctx)
+    days = 7 if int(days)==7 else 30
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days-1)
+    data = counts(sb, ctx.org_id, project_id, start, None, by, value)
+    # daily count
+    byday={}
+    for r in data:
+        d=(r.get("created_at") or "")[:10]; 
+        if d: byday[d]=byday.get(d,0)+1
+    s=io.StringIO(); w=csv.writer(s); w.writerow(["date","count"])
+    for i in range(days):
+        day=(start+timedelta(days=i)).isoformat(); w.writerow([day, byday.get(day,0)])
+    s.seek(0)
+    return StreamingResponse(iter([s.read()]), media_type="text/csv",
+      headers={"Content-Disposition": f'attachment; filename="wellness_trend_{by}_{(value or 'all')}.csv"'} )
+
+@router.get("/trend_by.html", response_class=HTMLResponse)
+def trend_by_html(project_id: str = Query(...), days: int = 30, by: str = "user_id", value: str | None = None,
+                  ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    org = sb.table("org_branding").select("*").eq("org_id", ctx.org_id).single().execute().data or {}
+    proj = sb.table("projects").select("code").eq("id", project_id).single().execute().data or {}
+    header = export_header_html(org, proj.get("code") or project_id)
+
+    days = 7 if int(days)==7 else 30
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days-1)
+    data = counts(sb, ctx.org_id, project_id, start, None, by, value)
+    rows = "".join([f"<li>{r.get('created_at')} • score {r.get('score')} — {(r.get('comment') or '')}</li>" for r in data])
+    html = f"<html><body style='font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:880px;margin:auto'>{header}<h2>Wellness Trend — {by}={value or 'All'} (last {days}d)</h2><ul>{rows or '<li>No data</li>'}</ul></body></html>"
+    return HTMLResponse(html)
+
+
+Mount in server/main.py:
+
+from .routers import wellness_trend_by_csv
+app.include_router(wellness_trend_by_csv.router)
+
+
+Admin UI — add small export buttons:
+
+<button className="brand-btn text-xs" onClick={()=>downloadGET(`/api/wellness/trend_by.csv?project_id=${projectId}&days=${range}&by=user_id&value=${encodeURIComponent(selected||"")}`, `wellness_trend_user_${selected||"all"}.csv`)}>
+  Export Trend (user)
+</button>
+<a className="brand-btn text-xs" target="_blank" rel="noreferrer"
+   href={`/api/wellness/trend_by.html?project_id=${projectId}&days=${range}&by=user_id&value=${encodeURIComponent(selected||"")}`}>
+  Print Trend (user)
+</a>
+
+6) 2-minute validation
+
+Sign-Off v4.2/4.3: schedule reminders for tomorrow 9am local; domain chips; aging heat-map; server-side pagination; custom resend templates remembered per project
+
+Stages: project-wide Apply/Restore from template with area filters; ±days delta shown; audit recorded
+
+Digests: changes endpoint powers dashboard compact grid; preview supports mute empty sections; deep links still open filters & scroll/glow rows
+
+Wellness: trend exports by user (CSV) and printable HTML (brand header) ready for PDF

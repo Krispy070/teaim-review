@@ -1,0 +1,100 @@
+1) Fix the DB connection string (psycopg)
+
+Supabase requires SSL. Make sure your SUPABASE_DB_URL includes ?sslmode=require.
+
+Supabase → Settings → Database → Connection string → URI
+
+It should look like:
+
+postgresql://postgres:<DB_PASSWORD>@<project-ref>.supabase.co:5432/postgres?sslmode=require
+
+
+In Replit Secrets, set/replace:
+SUPABASE_DB_URL = postgresql://…?sslmode=require
+
+If you don’t know the DB password, reset it in Settings → Database → Reset password, then update the URI.
+
+2) Quick diagnostics for DB + Storage
+
+Add these two endpoints so we can see exactly what’s failing.
+
+A) DB ping (psycopg)
+# /server/main.py
+from .db import get_conn
+
+@app.get("/diag/db")
+def diag_db():
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("select 1")
+            ok = cur.fetchone()[0] == 1
+        return {"ok": ok}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+B) Storage smoke test
+# /server/main.py
+import os, time
+
+@app.get("/diag/storage")
+def diag_storage():
+    try:
+        key = f"diag/{int(time.time())}.txt"
+        content = b"teaim-storage-smoke"
+        sb.storage.from_(BUCKET).upload(key, content, {"contentType":"text/plain","upsert":True})
+        signed = sb.storage.from_(BUCKET).create_signed_url(key, 600)
+        url = signed.get("signedURL") or signed.get("signed_url")
+        return {"ok": True, "key": key, "signed_url": url}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+Then hit:
+
+/api/diag/db → should return {"ok":true}
+
+/api/diag/storage → should return {"ok":true, "signed_url": ...}
+
+3) Re-enable full ingest (remove the “SKIPPED_FOR_DEBUG” storage bypass)
+
+Once /api/diag/db and /api/diag/storage are ok:true, switch your /ingest-sync back to the normal flow (upload to bucket + insert artifacts + insert artifact_chunks). If you commented out upload earlier, revert to:
+
+sb.storage.from_(BUCKET).upload(key, data, {"contentType": file.content_type or "application/octet-stream", "upsert": True})
+art = sb.table("artifacts").insert({ ... }).execute().data[0]
+# then chunks + embeddings insert
+
+4) Sanity sequence (copy–paste)
+# A) DB & storage sanity
+curl -s http://localhost:5000/api/diag/db
+curl -s http://localhost:5000/api/diag/storage
+
+# B) Ingest inline
+echo "Payroll retro rules and SIT exit criteria." > /tmp/teaim2.txt
+curl -s -X POST http://localhost:5000/api/ingest-sync \
+  -F "org_id=d915376c-2bd7-4e79-b9c9-aab9d7fcb5a8" \
+  -F "project_id=dced0b98-87b4-46ff-b2a4-2cf8e627e8d2" \
+  -F "file=@/tmp/teaim2.txt"
+
+# C) Index stats
+curl -s "http://localhost:5000/api/diag/index-stats?org_id=d915376c-2bd7-4e79-b9c9-aab9d7fcb5a8&project_id=dced0b98-87b4-46ff-b2a4-2cf8e627e8d2"
+
+
+Expect chunks > 0.
+
+5) Ask Kap
+
+In the Chat Dock:
+“Summarize the latest document and list any exit criteria.”
+You should see an answer + Sources: teaim2.txt.
+
+6) If storage still fails
+
+Typical culprits (fast checks):
+
+Bucket name mismatch → must be project-artifacts (private).
+
+Service role key missing/typo → Replit Secret SUPABASE_SERVICE_ROLE_KEY must match Settings → API → service_role.
+
+Supabase URL typo → https://<project-ref>.supabase.co in SUPABASE_URL.
+
+RLS doesn’t affect Storage (we’re using service key), but ensure bucket exists: Storage → Buckets → project-artifacts.

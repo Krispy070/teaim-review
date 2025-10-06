@@ -1,0 +1,345 @@
+Here’s a copy-paste Next Big Build you can drop into Replit now. It delivers:
+
+Richer Slack/Teams events per table (real fields, not just JSON)
+
+Personalized digests (each recipient only gets the sections they subscribed to)
+
+Inline “Propose as …” on Meeting Summaries (with confidence slider)
+
+Stage Wizard templates with baseline dates (HCM/Payroll presets with auto dates)
+
+Invite email send (token creation + Mailgun email)
+
+Toaster polish (no duplicate pops)
+
+Everything is small, isolated, and dev-safe.
+
+1) Event formatters v2.3 (table-aware fields)
+1A) Send richer details on review.applied
+
+Patch server/routers/updates.py → in approve_update right after _apply_change:
+
+from ..utils.events import emit_event
+# ...
+applied, old = _apply_change(sbs, ctx.org_id, project_id, row)
+# Pack a few useful fields if available
+out_fields = {}
+try:
+    if isinstance(applied, dict):
+        for k in ("id","title","owner","status","area","severity","decided_by","name"):
+            if k in applied: out_fields[k] = applied[k]
+except Exception:
+    pass
+
+emit_event(ctx.org_id, project_id, "review.applied", {
+  "update_id": update_id,
+  "table": row["target_table"],
+  "target_id": row.get("target_id") or (applied and applied.get("id")),
+  **out_fields
+})
+
+
+(Repeat the same emit in edit_and_approve after success.)
+
+1B) Format per event kind
+
+Patch server/utils/events.py (replace ONLY what’s inside emit_event’s title/fields block so it reads nicer):
+
+    title = f"TEAIM: {kind}{(' • '+project_id) if project_id else ''}"
+    fields: list[tuple[str,str]] = []
+
+    if kind == "review.applied":
+        table = details.get("table") or details.get("target_table")
+        tid = details.get("target_id") or details.get("update_id") or "—"
+        title = f"TEAIM: Review Applied • {table} {tid}"
+        # show most relevant fields for table
+        if table == "actions":
+            fields = [("Title", details.get("title") or "—"),
+                      ("Owner", details.get("owner") or "—"),
+                      ("Status", details.get("status") or "—"),
+                      ("Area", details.get("area") or "—")]
+        elif table == "risks":
+            fields = [("Title", details.get("title") or "—"),
+                      ("Severity", details.get("severity") or "—"),
+                      ("Owner", details.get("owner") or "—"),
+                      ("Area", details.get("area") or "—")]
+        elif table == "decisions":
+            fields = [("Title", details.get("title") or "—"),
+                      ("Decided By", details.get("decided_by") or "—"),
+                      ("Area", details.get("area") or "—")]
+        else:
+            fields = [("Target", tid)]
+    elif kind == "signoff.doc.signed":
+        title = f"TEAIM: Document Signed • {details.get('doc_id')}"
+        fields = [("Doc", details.get("doc_id") or "—"),
+                  ("Signer", details.get("email") or "—"),
+                  ("Name", details.get("name") or "—")]
+    elif kind == "reminder.sent":
+        title = f"TEAIM: Reminder Sent • action {details.get('action_id')}"
+        fields = [("Action", details.get("action_id") or "—")]
+
+
+(Blocks/cards building stays as you already have it.)
+
+2) Personalized digests by subscriptions
+2A) Recipients helper (backward-compatible)
+
+Patch your _recipients in server/routers/digest.py (or wherever you keep it). Use this version which honors digest_weekly/digest_monthly AND legacy notify_weekly/notify_monthly:
+
+def _recipients(sb, org_id: str, project_id: str, period: str = "weekly"):
+    roles = ['owner','admin','pm','lead']
+    ms = sb.table("project_members").select("user_id, role")\
+         .eq("org_id", org_id).eq("project_id", project_id).in_("role", roles).execute().data or []
+    user_ids = [m["user_id"] for m in ms]
+
+    subs = sb.table("team_subscriptions").select("user_id,digest_weekly,digest_monthly,notify_weekly,notify_monthly,notify_actions,notify_risks,notify_decisions")\
+           .eq("org_id", org_id).eq("project_id", project_id).in_("user_id", user_ids).execute().data or []
+
+    if period == "weekly":
+        allowed = {s["user_id"] for s in subs if (s.get("digest_weekly") or s.get("notify_weekly"))}
+    else:
+        allowed = {s["user_id"] for s in subs if (s.get("digest_monthly") or s.get("notify_monthly"))}
+
+    def resolve(emails_for: set[str]):
+        emails: list[str] = []
+        if emails_for:
+            try:
+                cs = sb.table("contacts").select("user_id,email").in_("user_id", list(emails_for)).execute().data or []
+                emails.extend([c["email"] for c in cs if c.get("email")])
+            except Exception: ...
+            if not emails:
+                up = sb.table("users_profile").select("user_id,email").in_("user_id", list(emails_for)).execute().data or []
+                emails.extend([u["email"] for u in up if u.get("email")])
+        return sorted(set([e for e in emails if e]))
+
+    return resolve(allowed), {s["user_id"]: s for s in subs}
+
+2B) Personalized send
+
+Patch your /send-weekly route so each recipient only gets sections they opted in to:
+
+@router.post("/send-weekly")
+def send_weekly(project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    local_now, s = _get_local_now(sb, ctx.org_id)
+    period_key = _iso_week_key(local_now)
+
+    # dedupe per week
+    existing = sb.table("comms_send_log").select("id", count="exact")\
+       .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+       .eq("kind","digest").eq("period_key", period_key).execute()
+    if (existing.count or 0) > 0:
+        return {"ok": True, "already_sent": True, "period_key": period_key}
+
+    # personalized recipients
+    emails, subsmap = _recipients(sb, ctx.org_id, project_id, "weekly")
+    if not emails: return {"ok": True, "sent": [], "note": "no recipients"}
+
+    proj = sb.table("projects").select("code").eq("id", project_id).single().execute().data
+    code = proj["code"] if proj else project_id
+
+    sent = []
+    for email in emails:
+        # resolve user_id from contacts/users_profile
+        uid = None
+        try:
+            c = sb.table("contacts").select("user_id,email").eq("email", email).single().execute().data
+            uid = c and c.get("user_id")
+        except Exception:
+            try:
+                u = sb.table("users_profile").select("user_id,email").eq("email", email).single().execute().data
+                uid = u and u.get("user_id")
+            except Exception: pass
+
+        subs = subsmap.get(uid or "", {}) if uid else {}
+        wanted = {"actions","risks","decisions"}
+        if subs:
+            if not subs.get("notify_actions", True): wanted.discard("actions")
+            if not subs.get("notify_risks", True): wanted.discard("risks")
+            if not subs.get("notify_decisions", True): wanted.discard("decisions")
+
+        counts = {}
+        if "actions"   in wanted: counts["actions"]   = _compose_count(sb, ctx.org_id, project_id, "actions")
+        if "risks"     in wanted: counts["risks"]     = _compose_count(sb, ctx.org_id, project_id, "risks")
+        if "decisions" in wanted: counts["decisions"] = _compose_count(sb, ctx.org_id, project_id, "decisions")
+        html = _digest_html_filtered(code, counts, wanted)
+
+        ok, reason = send_guard(sb, ctx.org_id, project_id, "digest", email)
+        if not ok: continue
+        mailgun_send_html(email, f"Weekly Digest — {code}", html)
+        log_send(sb, ctx.org_id, project_id, "digest", email)
+        sent.append(email)
+
+    return {"ok": True, "sent": sent, "period_key": period_key}
+
+
+(Assumes you have _compose_count and _digest_html_filtered helpers; they’re trivial wrappers around your existing counting and HTML builder.)
+
+3) Meeting Summaries — inline “Propose as …” (with confidence)
+
+Add lightweight inline propose buttons to your Meeting Summaries card(s).
+
+Patch the page that renders extracted items (e.g., client/src/pages/MeetingSummaries.tsx):
+
+import { postJSON } from "@/lib/authFetch";
+
+function ExtractedItem({ artifactId, kind, idx, text }:{
+  artifactId:string; kind:"action"|"risk"|"decision"; idx:number; text:string
+}){
+  const [conf, setConf] = useState(0.82);
+  const [busy, setBusy] = useState(false);
+  async function proposeOne(){
+    setBusy(true);
+    try{
+      await postJSON(`/api/summaries/propose?project_id=${projectId}`, { items: [{ artifact_id: artifactId, kind, index: idx, confidence: conf }]});
+      alert("Proposed to Updates Monitor");
+    } finally { setBusy(false); }
+  }
+  return (
+    <div className="flex items-center justify-between border rounded p-2 text-sm">
+      <div className="truncate">{text}</div>
+      <div className="flex items-center gap-2">
+        <label className="text-xs">conf</label>
+        <input type="number" min={0} max={1} step={0.01} className="border rounded p-1 w-[70px]" value={conf} onChange={e=>setConf(parseFloat(e.target.value||"0.82"))}/>
+        <button className="px-2 py-1 border rounded text-xs" onClick={proposeOne} disabled={busy}>
+          {busy? "…" : "Propose"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+
+Render ExtractedItem inside each list (actions/risks/decisions) with the appropriate kind and idx.
+
+4) Stage Wizard templates with baseline dates
+4A) Template durations
+
+Patch server/routers/stages_templates.py:
+
+from datetime import date, timedelta
+
+TEMPLATES = {
+  "workday_core": [
+    {"title":"Discovery","area":"HCM","days":14},
+    {"title":"Build P1","area":"HCM","days":45},
+    {"title":"Test","area":"HCM","days":30},
+    {"title":"Cutover","area":"HCM","days":5},
+  ],
+  "workday_payroll_finance": [
+    {"title":"Discovery","area":"Payroll","days":14},
+    {"title":"Build P1","area":"Payroll","days":45},
+    {"title":"Test","area":"Payroll","days":30},
+    {"title":"Cutover","area":"Payroll","days":5},
+    {"title":"GL Alignment","area":"Financials","days":10},
+  ],
+}
+
+@router.get("/templates")
+def templates():
+    return {"items": [{"key":k, "label":k.replace('_',' ').title(), "stages":v} for k,v in TEMPLATES.items()]}
+
+4B) Wizard UI: baseline start → auto dates
+
+Patch client/src/pages/StageWizard.tsx:
+
+const [baseDate, setBaseDate] = useState("");
+
+async function applyTemplate(key:string){
+  const t = (tpls||[]).find((x:any)=>x.key===key);
+  if (!t) return;
+  if (!baseDate){ alert("Pick a baseline start date first"); return; }
+  const start = new Date(baseDate+"T00:00:00");
+  let cur = new Date(start);
+  const rowsNew = t.stages.map((s:any)=>{
+    const sdate = new Date(cur);
+    const edate = new Date(cur); edate.setDate(edate.getDate() + (s.days||7));
+    // next stage starts the day after end
+    cur = new Date(edate); cur.setDate(cur.getDate()+1);
+    return { title:s.title, area:s.area||"", start_date: sdate.toISOString().slice(0,10), end_date: edate.toISOString().slice(0,10) };
+  });
+  setRows(rowsNew);
+}
+
+// Put this near controls:
+<input type="date" className="border rounded p-2" value={baseDate} onChange={e=>setBaseDate(e.target.value)} />
+<select className="border rounded p-2" onChange={e=>applyTemplate(e.target.value)}>
+  <option value="">(apply template)</option>
+  {tpls.map(t=><option key={t.key} value={t.key}>{t.label}</option>)}
+</select>
+
+5) Invite email send (token + Mailgun)
+
+Patch server/routers/invite_token.py to add a send endpoint:
+
+from ..email.util import mailgun_send_html
+
+class InviteSendBody(InviteTokenBody):
+  pass
+
+@router.post("/send_token")
+def send_token(body: InviteSendBody, project_id: str = Query(...), ctx: TenantCtx = Depends(ADMIN)):
+  # reuse create_token
+  resp = create_token(body, project_id, ctx)
+  link = resp.get("link")
+  if not link: raise HTTPException(500, "Failed to create invite link")
+  subj = "TEAIM Project Invite"
+  html = f"<p>You have been invited to a TEAIM project.</p><p><a href='{link}'>Accept Invite</a></p>"
+  try: mailgun_send_html(body.email, subj, html)
+  except Exception: pass
+  return {"ok": True, "link": link}
+
+
+(Frontend: add a “Send Invite” button on AdminInvite if you like; it just POSTs to /api/invite/send_token with same body.)
+
+6) Toaster polish (no duplicate pops)
+
+Patch client/src/components/NotificationToaster.tsx:
+
+const lastTopId = useRef<string>("");
+
+async function poll(){
+  try{
+    const r = await fetch(`/api/notifications/list?project_id=${projectId}`, { credentials:"include" });
+    if (!r.ok) return;
+    const d = await r.json();
+    const unread = (d.items||[]).filter((x:any)=>!x.is_read);
+    const latest = unread[0];
+    if (latest && latest.id !== lastTopId.current){
+      lastTopId.current = latest.id;
+      setToast({ title: latest.title || "New notification", when: Date.now() });
+      setTimeout(()=>setToast(null), 4000);
+    }
+  }catch{}
+}
+
+7) Mounts (confirm)
+
+Make sure these are included exactly once in server/main.py:
+
+from .routers import signoff_docs_gen, stages_templates, stages_batch, summaries_propose, notifications, export_dataroom, ops_status, invite_token
+app.include_router(signoff_docs_gen.router)
+app.include_router(stages_templates.router)
+app.include_router(stages_batch.router)
+app.include_router(summaries_propose.router)
+app.include_router(notifications.router)
+app.include_router(export_dataroom.router)
+app.include_router(ops_status.router)
+app.include_router(invite_token.router)
+
+
+(Aliases you already added can stay.)
+
+8) 2-minute validation
+
+Review Apply → Slack/Teams show table-specific fields (title/owner/status/area, etc.).
+
+Digest send → only subscribers get sections they opted into; preview with respect_notify=true.
+
+Meeting card → each extracted item has Propose + confidence slider; shows up in Updates Monitor.
+
+Stage Wizard → choose baseline date, apply template; dates fill; Save works.
+
+Invite → send_token returns link + email goes out (Mailgun logs).
+
+Toaster → no duplicate pop; inbox still persistent.

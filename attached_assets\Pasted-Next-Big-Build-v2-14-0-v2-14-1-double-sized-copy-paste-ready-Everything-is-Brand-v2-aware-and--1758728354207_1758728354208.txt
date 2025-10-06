@@ -1,0 +1,392 @@
+Next Big Build v2.14.0 + v2.14.1 (double-sized, copy-paste ready)
+
+Everything is Brand v2–aware and dev-safe (new endpoints return safe empties if a table/column is missing).
+
+v2.14.0 — Workstreams “source of truth” framework
+1) Backend — Areas summaries, comments, and last-update feed
+
+A. Areas summary endpoints
+
+server/routers/areas.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from datetime import datetime, timezone
+from typing import Optional
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+DEFAULT_AREAS = ["HCM","Absence","Time Tracking","Payroll","Financials","Integrations","Security","Reporting","Cutover"]
+
+router = APIRouter(prefix="/api/areas", tags=["areas"])
+
+@router.get("/list")
+def list_areas(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    # future: read from org settings; dev-safe default list
+    return {"items": DEFAULT_AREAS}
+
+def _safe_count(sb, table, org_id, project_id, area_field="area", area:Optional[str]=None, where:dict|None=None):
+    try:
+        q = sb.table(table).select("id", count="exact").eq("org_id", org_id).eq("project_id", project_id)
+        if area: q = q.eq(area_field, area)
+        if where:
+            for k,v in where.items(): q = q.eq(k, v)
+        r = q.execute()
+        return r.count or 0
+    except Exception:
+        return 0
+
+def _last_update(sb, org_id, project_id, area:Optional[str]=None):
+    ts = []
+    try:
+        r = sb.table("audit_events").select("created_at").eq("org_id", org_id).eq("project_id", project_id)\
+             .order("created_at", desc=True).limit(1 if not area else 500).execute().data or []
+        if area:
+            # naive scan for area mention in details
+            for e in r:
+                ts.append(e.get("created_at"))
+        else:
+            return r and r[0].get("created_at")
+    except Exception: ...
+    # also look at actions/risks/decisions/worksheet runs
+    for t in ["actions","risks","decisions","workbook_runs"]:
+        try:
+            q = sb.table(t).select("created_at").eq("org_id", org_id).eq("project_id", project_id).order("created_at", desc=True).limit(1)
+            if area and t!="workbook_runs": q = q.eq("area", area)
+            rr = q.execute().data or []
+            if rr and rr[0].get("created_at"): ts.append(rr[0]["created_at"])
+        except Exception: ...
+    return max(ts) if ts else None
+
+def _status(actions_open:int, days_to_due:Optional[int], risks_open:int):
+    # simple rule-of-thumb status
+    if risks_open>0 and (days_to_due is not None and days_to_due<=3): return "at_risk"
+    if actions_open==0 and risks_open==0: return "green"
+    if days_to_due is not None and days_to_due<0: return "late"
+    return "yellow"
+
+@router.get("/summary")
+def summary(project_id: str = Query(...), area: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        actions_open = _safe_count(sb,"actions",ctx.org_id,project_id,area=area,where={"status":"open"})
+        risks_open   = _safe_count(sb,"risks",ctx.org_id,project_id,area=area,where={"status":"open"})
+        decisions    = _safe_count(sb,"decisions",ctx.org_id,project_id,area=area)
+        # workbooks: planned vs done
+        wb_total = _safe_count(sb,"workbooks",ctx.org_id,project_id,area=area)
+        wb_done  = _safe_count(sb,"workbooks",ctx.org_id,project_id,area=area,where={"status":"done"})
+        # next meeting: naive (latest from summaries/meetings)
+        next_meeting = None
+        try:
+            r = sb.table("meetings").select("starts_at").eq("org_id",ctx.org_id).eq("project_id",project_id)\
+                .order("starts_at",asc=True).limit(5).execute().data or []
+            next_meeting = r and r[0].get("starts_at")
+        except Exception: ...
+        # days_to_due from nearest workbook due
+        days_to_due = None
+        try:
+            w = sb.table("workbooks").select("due_date").eq("org_id",ctx.org_id).eq("project_id",project_id)\
+                .eq("area",area).not_.is_("due_date","null").order("due_date",asc=True).limit(1).execute().data or []
+            if w and w[0].get("due_date"):
+                dd = datetime.fromisoformat(w[0]["due_date"]).date()
+                today = datetime.now(timezone.utc).date()
+                days_to_due = (dd - today).days
+        except Exception: ...
+        last_update = _last_update(sb, ctx.org_id, project_id, area)
+        status = _status(actions_open, days_to_due, risks_open)
+        return {"area": area, "metrics": {
+            "actions_open": actions_open, "risks_open": risks_open, "decisions": decisions,
+            "workbooks_done": wb_done, "workbooks_total": wb_total,
+            "next_meeting": next_meeting, "days_to_due": days_to_due, "last_update": last_update, "status": status
+        }}
+    except Exception:
+        return {"area": area, "metrics": {}}
+
+@router.get("/summary_all")
+def summary_all(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        out = []
+        for a in DEFAULT_AREAS:
+            try:
+                out.append(summary(project_id, a, ctx))
+            except Exception:
+                out.append({"area": a, "metrics": {}})
+        return {"items": out}
+    except Exception:
+        return {"items": []}
+
+@router.get("/last_updates")
+def last_updates(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        data = {}
+        for a in DEFAULT_AREAS:
+            data[a] = _last_update(sb, ctx.org_id, project_id, a)
+        # a coarse "page update" — latest audit
+        data["_global"] = _last_update(sb, ctx.org_id, project_id, None)
+        return {"items": data}
+    except Exception:
+        return {"items": {}}
+
+
+Mount in server/main.py:
+
+from .routers import areas
+app.include_router(areas.router)
+
+
+B. Area comments (lightweight)
+
+server/routers/area_comments.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/areas", tags=["areas"])
+
+class CommentBody(BaseModel):
+    area: str
+    message: str
+
+@router.get("/comments")
+def comments(project_id: str = Query(...), area: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        rows = sb.table("area_comments").select("created_at,user_id,message")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("area", area)\
+               .order("created_at", desc=True).limit(200).execute().data or []
+        return {"items": rows}
+    except Exception:
+        return {"items": []}
+
+@router.post("/comments/add")
+def add_comment(body: CommentBody, project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        sb.table("area_comments").insert({
+            "org_id": ctx.org_id, "project_id": project_id, "area": body.area,
+            "user_id": ctx.user_id, "message": body.message
+        }).execute()
+        return {"ok": True}
+    except Exception:
+        return {"ok": False}
+
+
+Mount in server/main.py:
+
+from .routers import area_comments
+app.include_router(area_comments.router)
+
+
+Dev-safe: if area_comments table doesn’t exist yet, endpoints return {items: []} and {ok: False} without crashing.
+
+2) Frontend — Workstreams overview + Area page + update dots
+
+A. Overview grid
+
+client/src/pages/Workstreams.tsx (new)
+
+import { useEffect, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
+import { getJSON } from "@/lib/authFetch";
+
+export default function Workstreams(){
+  const { projectId } = useParams(); const nav = useNavigate();
+  const [items,setItems]=useState<any[]>([]);
+  useEffect(()=>{ (async()=>{ try{
+    const d = await getJSON(`/api/areas/summary_all?project_id=${projectId}`); setItems(d.items||[]);
+  }catch{ setItems([]);} })(); },[projectId]);
+
+  return (
+    <div className="grid md:grid-cols-3 gap-3">
+      {items.map(i=>{
+        const m=i.metrics||{}; const s=(m.status||"").toLowerCase();
+        const bg = s==="green"?"bg-emerald-500/10":s==="at_risk"?"bg-red-500/10":s==="late"?"bg-orange-500/10":"bg-amber-500/10";
+        return (
+          <button key={i.area} className={`brand-card p-3 text-left ${bg}`} onClick={()=>nav(`/projects/${projectId}/workstreams/${encodeURIComponent(i.area)}`)}>
+            <div className="text-sm font-medium">{i.area}</div>
+            <div className="text-xs text-muted-foreground">
+              Actions open: <b>{m.actions_open??"—"}</b> · Risks: <b>{m.risks_open??"—"}</b><br/>
+              Workbooks: <b>{m.workbooks_done??0}/{m.workbooks_total??0}</b> · Next mtg: {m.next_meeting? new Date(m.next_meeting).toLocaleString():"—"}
+            </div>
+          </button>
+        );
+      })}
+      {!items.length && <div className="p-3 text-xs text-muted-foreground">No areas yet.</div>}
+    </div>
+  );
+}
+
+
+Route in client/src/App.jsx:
+
+import Workstreams from "@/pages/Workstreams";
+import WorkstreamArea from "@/pages/WorkstreamArea";
+// …
+<Route path="/projects/:projectId/workstreams" element={<Workstreams/>} />
+<Route path="/projects/:projectId/workstreams/:areaKey" element={<WorkstreamArea/>} />
+
+
+B. Area page (summary + open items + next meeting + comments)
+
+client/src/pages/WorkstreamArea.tsx (new)
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { getJSON, postJSON } from "@/lib/authFetch";
+
+export default function WorkstreamArea(){
+  const { projectId, areaKey } = useParams();
+  const area = decodeURIComponent(areaKey||"");
+  const [sum,setSum]=useState<any>(null);
+  const [actions,setActions]=useState<any[]>([]);
+  const [comments,setComments]=useState<any[]>([]);
+  const [msg,setMsg]=useState("");
+
+  useEffect(()=>{ (async()=>{
+    try{ const s = await getJSON(`/api/areas/summary?project_id=${projectId}&area=${encodeURIComponent(area)}`); setSum(s.metrics||{}); }catch{ setSum(null); }
+    try{ const a = await getJSON(`/api/export/actions.csv?project_id=${projectId}`); }catch{}
+    try{ const d = await getJSON(`/api/areas/comments?project_id=${projectId}&area=${encodeURIComponent(area)}`); setComments(d.items||[]);}catch{ setComments([]); }
+    // lightweight open actions list (dev-safe)
+    try{
+      const r = await getJSON(`/api/export/actions.csv?project_id=${projectId}`); // if csv-only -> skip
+    }catch{}
+  })(); },[projectId, area]);
+
+  async function addComment(){
+    if (!msg.trim()) return;
+    await postJSON(`/api/areas/comments/add?project_id=${projectId}`, { area, message: msg.trim() });
+    setMsg("");
+    const d = await getJSON(`/api/areas/comments?project_id=${projectId}&area=${encodeURIComponent(area)}`); setComments(d.items||[]);
+    // mark as seen
+    try{ localStorage.setItem(`kap.area.lastSeen.${projectId}.${area}`, new Date().toISOString()); }catch{}
+  }
+
+  // mark 'seen' on enter
+  useEffect(()=>{ try{ localStorage.setItem(`kap.area.lastSeen.${projectId}.${area}`, new Date().toISOString()); }catch{} },[projectId, area]);
+
+  return (
+    <div className="space-y-3">
+      <div className="brand-card p-3">
+        <div className="text-sm font-medium">{area} — Summary</div>
+        <div className="text-xs text-muted-foreground">
+          Actions open: <b>{sum?.actions_open??"—"}</b> · Risks: <b>{sum?.risks_open??"—"}</b> · Decisions: <b>{sum?.decisions??"—"}</b><br/>
+          Workbooks: <b>{sum?.workbooks_done??0}/{sum?.workbooks_total??0}</b> · Days to due: {sum?.days_to_due??"—"}<br/>
+          Next meeting: {sum?.next_meeting? new Date(sum.next_meeting).toLocaleString() : "—"} · Last update: {sum?.last_update? new Date(sum.last_update).toLocaleString(): "—"}
+        </div>
+      </div>
+
+      {/* Open items stub (hook your list later) */}
+      <div className="brand-card p-3">
+        <div className="text-sm font-medium">Open Items</div>
+        <div className="text-xs text-muted-foreground">Use the Actions page filtered by this area for full control. (Inline open list can be added later.)</div>
+      </div>
+
+      {/* Comments */}
+      <div className="brand-card p-3">
+        <div className="text-sm font-medium">Comments / Notes</div>
+        <div className="space-y-1 max-h-[40vh] overflow-auto">
+          {comments.map((c,i)=>(<div key={i} className="border rounded p-2 text-xs">
+            <div className="text-muted-foreground">{new Date(c.created_at).toLocaleString()} • {c.user_id}</div>
+            <div>{c.message}</div>
+          </div>))}
+          {!comments.length && <div className="text-xs text-muted-foreground">No comments yet.</div>}
+        </div>
+        <div className="flex items-center gap-2 mt-2">
+          <input className="border rounded p-2 text-sm flex-1" placeholder="Add a note, question, or correction…" value={msg} onChange={e=>setMsg(e.target.value)}/>
+          <button className="brand-btn text-xs" onClick={addComment}>Post</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+C. Update dots (red •) next to area links
+
+client/src/hooks/useAreaUpdates.ts (new)
+
+import { useEffect, useState } from "react";
+import { getJSON } from "@/lib/authFetch";
+
+export function useAreaUpdates(projectId:string){
+  const [last,setLast]=useState<Record<string,string>>({});
+  useEffect(()=>{ (async()=>{
+    try{ const d=await getJSON(`/api/areas/last_updates?project_id=${projectId}`); setLast(d.items||{}); }catch{ setLast({}); }
+  })(); },[projectId]);
+  function hasNew(area:string){
+    const key = `kap.area.lastSeen.${projectId}.${area}`;
+    try{
+      const seen = localStorage.getItem(key);
+      const lu = last?.[area];
+      return (lu && (!seen || new Date(lu) > new Date(seen)));
+    }catch{ return false; }
+  }
+  return { last, hasNew };
+}
+
+
+Use this in SidebarV2 where you render Workstreams sub-nav (areas). Add:
+
+import { useAreaUpdates } from "@/hooks/useAreaUpdates";
+const { projectId } = useParams();
+const { hasNew } = useAreaUpdates(projectId!);
+
+// in each area link label
+<span>{label}{hasNew(label) ? <span className="ml-1 text-red-500">•</span> : null}</span>
+
+
+On visiting an area page, we set kap.area.lastSeen.<projectId>.<area> to “now”, so the dot clears next visit.
+
+Global page dot idea: You can apply the same pattern for any page by storing kap.page.lastSeen.<projectId>.<routeKey> and comparing to /api/areas/last_updates value for _global.
+
+v2.14.1 — Nav sub-links, layout, and “update” dots polish
+
+Sub-nav: In Workstreams route, add a horizontal sub-nav for areas (chips) at top of overview and on the area page (so PMs can hop between areas fast).
+
+Placement: Summary + comments are center stage on the area page; on other pages (Actions/Reports) they remain the single source of truth links via deep links. If you want a right pane persistent, we can mount the summary/comments in a collapsible drawer; for now it’s page-local to keep UI clean.
+
+Chips sub-nav (drop at top of Workstreams/Area pages):
+
+function AreaChips({areas}:{areas:string[]}){
+  const { projectId } = useParams(); const nav=useNavigate();
+  return (
+    <div className="flex flex-wrap gap-1 mb-2">
+      {areas.map(a=>(
+        <button key={a} className="brand-btn text-[11px]" onClick={()=>nav(`/projects/${projectId}/workstreams/${encodeURIComponent(a)}`)}>{a}</button>
+      ))}
+    </div>
+  );
+}
+
+
+On Workstreams.tsx:
+
+const [alist,setAlist]=useState<string[]>([]);
+useEffect(()=>{ (async()=>{ try{ const d=await getJSON(`/api/areas/list?project_id=${projectId}`); setAlist(d.items||[]);}catch{ setAlist([]);} })(); },[projectId]);
+<AreaChips areas={alist}/>
+
+
+On WorkstreamArea.tsx, same chips so users can hop between areas.
+
+Slack/Teams chat question — my take
+
+Short answer: Don’t replace Slack/Teams inside TEAIM yet.
+
+What to do now: Keep signals flowing into TEAIM (we already have outbound webhooks; we can add a light incoming webhook from Slack/Teams → /api/areas/comments/add to append notes to a specific area via a command like /team hcm "Need to update comp rules"). That gives centralized context without rebuilding a chat client.
+
+Later: If you want an integrated threaded chat, we’ll use a right-side drawer component that binds to area, stage, or action context with a small socket presence. Worth doing only after we freeze core PM flows.
+
+90-second validation
+
+Workstreams overview shows status boxes for each area (actions/risks/workbooks/next meeting); click through to the area page
+
+Area page shows summary, open items (stub), comments (post/view); last-seen timestamps update
+
+Update dots show near area links when there’s new activity since last visit
+
+Backend endpoints are dev-safe and will return empties if a table is missing (no crashes)

@@ -1,0 +1,439 @@
+copy-paste snippets for Drizzle, seed, and a bootstrap endpoint, then the UI architecture plan to stop the layout drift.
+
+Track A — Drizzle fix: schema + migration + seed (v2)
+1) Drizzle schema: add the 8 core tables
+
+Create (or extend) server/db/schema/core.ts:
+
+// server/db/schema/core.ts
+import { pgTable, varchar, uuid, text, jsonb, boolean, timestamp } from "drizzle-orm/pg-core";
+
+export const areas = pgTable("areas", {
+  id: uuid("id").primaryKey().notNull(),
+  projectId: uuid("project_id").notNull().index(),
+  key: varchar("key", { length: 50 }).notNull().index(),
+  name: varchar("name", { length: 120 }).notNull(),
+  status: varchar("status", { length: 24 }).notNull().default("active"),
+  createdAt: timestamp("created_at", { withTimezone: false }).defaultNow(),
+});
+
+export const workbooks = pgTable("workbooks", {
+  id: uuid("id").primaryKey().notNull(),
+  projectId: uuid("project_id").notNull().index(),
+  areaId: uuid("area_id").notNull().index(),
+  title: varchar("title", { length: 200 }).notNull(),
+  metrics: jsonb("metrics").$type<Record<string, unknown>>().default({}),
+  createdAt: timestamp("created_at", { withTimezone: false }).defaultNow(),
+});
+
+export const reports = pgTable("reports", {
+  id: uuid("id").primaryKey().notNull(),
+  projectId: uuid("project_id").notNull().index(),
+  areaId: uuid("area_id").notNull().index(),
+  type: varchar("type", { length: 64 }).notNull().index(), // e.g. wb_export_csv
+  title: varchar("title", { length: 200 }).notNull(),
+  payload: jsonb("payload").$type<Record<string, unknown>>().default({}),
+  createdAt: timestamp("created_at", { withTimezone: false }).defaultNow(),
+});
+
+export const changes = pgTable("changes", {
+  id: uuid("id").primaryKey().notNull(),
+  projectId: uuid("project_id").notNull().index(),
+  areaId: uuid("area_id").notNull().index(),
+  kind: varchar("kind", { length: 24 }).notNull(), // add | update | remove
+  summary: text("summary").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: false }).defaultNow(),
+});
+
+export const comments = pgTable("comments", {
+  id: uuid("id").primaryKey().notNull(),
+  projectId: uuid("project_id").notNull().index(),
+  areaId: uuid("area_id").notNull().index(),
+  body: text("body").notNull(),
+  author: varchar("author", { length: 120 }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: false }).defaultNow(),
+});
+
+export const releases = pgTable("releases", {
+  id: uuid("id").primaryKey().notNull(),
+  projectId: uuid("project_id").notNull().index(),
+  kind: varchar("kind", { length: 24 }).notNull().index(),     // ics
+  channel: varchar("channel", { length: 24 }).notNull().index(), // staging/prod
+  tag: varchar("tag", { length: 80 }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: false }).defaultNow(),
+});
+
+export const notifications = pgTable("notifications", {
+  id: uuid("id").primaryKey().notNull(),
+  projectId: uuid("project_id").notNull().index(),
+  kind: varchar("kind", { length: 48 }).notNull().index(),     // digest_ready
+  seen: boolean("seen").notNull().default(false),
+  payload: jsonb("payload").$type<Record<string, unknown>>().default({}),
+  createdAt: timestamp("created_at", { withTimezone: false }).defaultNow(),
+});
+
+export const signoffs = pgTable("signoffs", {
+  token: varchar("token", { length: 64 }).primaryKey().notNull(),
+  projectId: uuid("project_id").notNull().index(),
+  status: varchar("status", { length: 24 }).notNull().default("issued"),
+  expiresAt: timestamp("expires_at", { withTimezone: false }),
+  createdAt: timestamp("created_at", { withTimezone: false }).defaultNow(),
+});
+
+
+Ensure you export these from your schema index, e.g. server/db/schema/index.ts.
+
+2) Drizzle migration
+
+If you use drizzle-kit:
+
+Add/confirm drizzle.config.ts points to the schema files.
+
+Generate SQL and apply:
+
+npx drizzle-kit generate
+npx drizzle-kit push
+
+
+(If you prefer programmatic apply at boot, keep the bootstrap endpoint below as a dev convenience.)
+
+3) Bootstrap-and-Seed (Drizzle version)
+
+Add a one-shot dev helper that creates any missing tables and then seeds.
+
+// server/admin/test/bootstrap.ts
+import { Router } from "express";
+import { db } from "../../db"; // your Drizzle db instance
+import { sql } from "drizzle-orm";
+import { seedMinimal } from "./seedMinimal";
+
+export const bootstrapRouter = Router();
+
+bootstrapRouter.post("/bootstrap-and-seed", async (req, res) => {
+  const projectId = req.body?.projectId;
+  if (!projectId) return res.status(400).json({ ok: false, error: "projectId required" });
+
+  try {
+    // Minimal DDL so dev never blocks
+    await db.execute(sql`
+      create table if not exists areas (
+        id uuid primary key,
+        project_id uuid not null,
+        key varchar(50) not null,
+        name varchar(120) not null,
+        status varchar(24) not null default 'active',
+        created_at timestamp default now()
+      );
+      create index if not exists idx_areas_project on areas(project_id);
+      create index if not exists idx_areas_key on areas(key);
+
+      create table if not exists workbooks (
+        id uuid primary key,
+        project_id uuid not null,
+        area_id uuid not null,
+        title varchar(200) not null,
+        metrics jsonb default '{}'::jsonb,
+        created_at timestamp default now()
+      );
+      create index if not exists idx_workbooks_project on workbooks(project_id);
+      create index if not exists idx_workbooks_area on workbooks(area_id);
+
+      create table if not exists reports (
+        id uuid primary key,
+        project_id uuid not null,
+        area_id uuid not null,
+        type varchar(64) not null,
+        title varchar(200) not null,
+        payload jsonb default '{}'::jsonb,
+        created_at timestamp default now()
+      );
+      create index if not exists idx_reports_project on reports(project_id);
+      create index if not exists idx_reports_area on reports(area_id);
+      create index if not exists idx_reports_type on reports(type);
+
+      create table if not exists changes (
+        id uuid primary key,
+        project_id uuid not null,
+        area_id uuid not null,
+        kind varchar(24) not null,
+        summary text not null,
+        created_at timestamp default now()
+      );
+
+      create table if not exists comments (
+        id uuid primary key,
+        project_id uuid not null,
+        area_id uuid not null,
+        body text not null,
+        author varchar(120) not null,
+        created_at timestamp default now()
+      );
+
+      create table if not exists releases (
+        id uuid primary key,
+        project_id uuid not null,
+        kind varchar(24) not null,
+        channel varchar(24) not null,
+        tag varchar(80) not null,
+        created_at timestamp default now()
+      );
+
+      create table if not exists notifications (
+        id uuid primary key,
+        project_id uuid not null,
+        kind varchar(48) not null,
+        seen boolean not null default false,
+        payload jsonb default '{}'::jsonb,
+        created_at timestamp default now()
+      );
+
+      create table if not exists signoffs (
+        token varchar(64) primary key,
+        project_id uuid not null,
+        status varchar(24) not null default 'issued',
+        expires_at timestamp,
+        created_at timestamp default now()
+      );
+    `);
+
+    const out = await seedMinimal(projectId);
+    res.json({ ok: true, action: "bootstrap-and-seed", out });
+  } catch (e: any) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+
+Mount it (if not already):
+
+// server/index.ts
+import { bootstrapRouter } from "./admin/test/bootstrap";
+app.use("/admin/test", bootstrapRouter);
+
+4) Seed (v2) using Drizzle
+
+Replace your seed with Drizzle-native inserts + verified counts.
+
+// server/admin/test/seedMinimal.ts
+import { db } from "../../db";
+import { sql, eq } from "drizzle-orm";
+import { v4 as uuid } from "uuid";
+import dayjs from "dayjs";
+import { areas, workbooks, reports, changes, comments, releases, notifications, signoffs } from "../../db/schema/core";
+
+export async function seedMinimal(projectId: string) {
+  const now = dayjs().toISOString();
+
+  const ids = {
+    areaHcm: uuid(), areaFin: uuid(),
+    wbHcm: uuid(), wbFin: uuid(),
+    rptHcm: uuid(), rptFin: uuid(),
+    change1: uuid(), change2: uuid(),
+    cmt1: uuid(), cmt2: uuid(),
+    rel1: uuid(), notif1: uuid(),
+    sign1: uuid(),
+  };
+
+  // Wipe project rows (idempotent)
+  await db.transaction(async (tx) => {
+    await tx.delete(notifications).where(eq(notifications.projectId, projectId));
+    await tx.delete(releases).where(eq(releases.projectId, projectId));
+    await tx.delete(comments).where(eq(comments.projectId, projectId));
+    await tx.delete(changes).where(eq(changes.projectId, projectId));
+    await tx.delete(reports).where(eq(reports.projectId, projectId));
+    await tx.delete(workbooks).where(eq(workbooks.projectId, projectId));
+    await tx.delete(areas).where(eq(areas.projectId, projectId));
+    await tx.delete(signoffs).where(eq(signoffs.projectId, projectId));
+  });
+
+  // Insert minimal dataset
+  await db.transaction(async (tx) => {
+    await tx.insert(areas).values([
+      { id: ids.areaHcm, projectId, key: "HCM", name: "HCM", status: "active", createdAt: now },
+      { id: ids.areaFin, projectId, key: "FIN", name: "Financials", status: "active", createdAt: now },
+    ]);
+
+    await tx.insert(workbooks).values([
+      { id: ids.wbHcm, projectId, areaId: ids.areaHcm, title: "HCM Workbook", createdAt: now, metrics: { items: 12, open: 4, closed: 8 } },
+      { id: ids.wbFin, projectId, areaId: ids.areaFin, title: "FIN Workbook", createdAt: now, metrics: { items: 9, open: 3, closed: 6 } },
+    ]);
+
+    await tx.insert(reports).values([
+      { id: ids.rptHcm, projectId, areaId: ids.areaHcm, type: "wb_export_csv", title: "HCM Export", createdAt: now, payload: { rows: 12 } },
+      { id: ids.rptFin, projectId, areaId: ids.areaFin, type: "wb_export_csv", title: "FIN Export", createdAt: now, payload: { rows: 9 } },
+    ]);
+
+    await tx.insert(changes).values([
+      { id: ids.change1, projectId, areaId: ids.areaHcm, kind: "update", summary: "Updated HCM position sync", createdAt: now },
+      { id: ids.change2, projectId, areaId: ids.areaFin, kind: "add", summary: "Added GL segment validation", createdAt: now },
+    ]);
+
+    await tx.insert(comments).values([
+      { id: ids.cmt1, projectId, areaId: ids.areaHcm, body: "Please verify job catalog mapping.", author: "System", createdAt: now },
+      { id: ids.cmt2, projectId, areaId: ids.areaFin, body: "Need sign-off on journal import.", author: "System", createdAt: now },
+    ]);
+
+    await tx.insert(releases).values([
+      { id: ids.rel1, projectId, kind: "ics", channel: "staging", tag: "v0.1.0-test", createdAt: now },
+    ]);
+
+    await tx.insert(notifications).values([
+      { id: ids.notif1, projectId, kind: "digest_ready", seen: false, createdAt: now, payload: { areas: ["HCM","FIN"] } },
+    ]);
+
+    await tx.insert(signoffs).values([
+      { token: ids.sign1, projectId, status: "issued", createdAt: now },
+    ]);
+  });
+
+  // Verify counts
+  const count = async (table: any) =>
+    Number((await db.execute(sql`select count(*)::int as c from ${table} where project_id = ${projectId}`)).rows?.[0]?.c ?? 0);
+
+  const inserted = {
+    areas: await count(areas),
+    workbooks: await count(workbooks),
+    reports: await count(reports),
+    changes: await count(changes),
+    comments: await count(comments),
+    releases: await count(releases),
+    notifications: await count(notifications),
+    signoffs: await count(signoffs),
+  };
+
+  return { ok: true, projectId, inserted };
+}
+
+5) Use it once
+
+Call POST /admin/test/bootstrap-and-seed with { projectId } (DevTools console or your Test Runner button).
+
+Then click Seed & Run. You should see 7/8 green (invalid-token negative stays red).
+
+Track B — Navigation & Layout: make it uniform, fast, and premium
+The plan
+
+AppShell (single source of truth)
+
+AppShell.tsx lays out: HeaderBar (top), Sidebar (left), Content (right), Footer (optional).
+
+Every page mounts inside <Outlet /> (React Router) or nested routes (Next.js style).
+
+No page redefines its own header/nav.
+
+Route-level layouts
+
+/customer/* uses AppShell with customer nav sections.
+
+/vendor/* can reuse the same shell with a different menu config.
+
+Keep config in nav.config.ts (labels, icons, paths, permission flags).
+
+Design tokens
+
+Already added; ensure all pages use variables (var(--ui-*), var(--text-*), var(--brand-*)) so brand changes are one-file updates.
+
+Active state & breadcrumbs
+
+Sidebar highlights current route; header center shows customer identity + project pill.
+
+Optional breadcrumb under header for deep pages.
+
+Performance
+
+Defer non-critical scripts (defer/async); lazy-load heavy pages (Documents, Reports).
+
+Add route-level skeletons and Suspense boundaries.
+
+Memoize large lists; virtualize tables where needed.
+
+Preload fonts and the TEAIM/customer logos.
+
+AppShell (drop-in)
+// ui/shell/AppShell.tsx
+import React from "react";
+import HeaderBar from "../components/HeaderBar";
+import Sidebar from "../components/Sidebar";
+import { Outlet } from "react-router-dom";
+
+export default function AppShell({ brand, project, env }: any) {
+  return (
+    <div className="min-h-screen" style={{ background: "var(--ui-bg)", color: "var(--text)" }}>
+      <HeaderBar
+        teaim={{ src: brand.teaimLogoUrl, alt: "TEAIM", href: "/" }}
+        customer={{ src: project.customerLogoUrl, alt: project.customerName }}
+        implementor={{ src: project.implementorLogoUrl, alt: "Implementor" }}
+        projectName={project.name}
+        env={env}
+      />
+      <div className="mx-auto grid max-w-[1320px] grid-cols-[260px_1fr] gap-0 px-4">
+        <aside className="pr-4">
+          <Sidebar items={project.navItems} />
+        </aside>
+        <main className="pb-10">
+          <Outlet />
+        </main>
+      </div>
+    </div>
+  );
+}
+
+Sidebar (uniform, accessible)
+// ui/components/Sidebar.tsx
+import React from "react";
+import { NavLink } from "react-router-dom";
+
+export default function Sidebar({ items }: { items: Array<{ label: string; icon: React.FC<any>; to: string; section?: string; }>; }) {
+  const sections = groupBy(items, i => i.section || "MAIN");
+  return (
+    <nav className="sidebar">
+      {Object.entries(sections).map(([section, list]) => (
+        <div key={section} className="mb-4">
+          <div className="section">{section}</div>
+          <div className="flex flex-col gap-1">
+            {list.map(item => (
+              <NavLink key={item.to} to={item.to} className={({isActive}) => `item ${isActive ? "active" : ""}`}>
+                <item.icon className="icon h-4 w-4" />
+                <span className="truncate">{item.label}</span>
+              </NavLink>
+            ))}
+          </div>
+        </div>
+      ))}
+    </nav>
+  );
+}
+
+function groupBy<T>(arr: T[], key: (t:T)=>string) {
+  return arr.reduce<Record<string,T[]>>((m, v) => ((m[key(v)] ||= []).push(v), m), {});
+}
+
+
+You already have the CSS tokens/styles; this locks every page to the same chrome.
+
+Performance checklist (do now)
+
+Add defer to scripts that don’t block first paint.
+
+Code-split the heaviest pages:
+
+const Documents = React.lazy(()=>import("../pages/Documents"));
+
+
+Wrap in Suspense with lightweight skeletons.
+
+Memoize computed props in dashboards (useMemo) and list rows.
+
+Ensure images (logos) set width/height and use loading="lazy" where appropriate.
+
+Quick finish line
+
+Drop the Drizzle schema, run drizzle-kit push (or call bootstrap-and-seed once).
+
+Hit Seed & Run — expect 7/8 green.
+
+Move every page under the AppShell route so header/nav are never duplicated or missing.
+
+Apply the performance tweaks; you’ll feel the load time tighten up.
+
+If you want, tell me your exact repo paths for db, routes, and ui/pages/AdminTestRunner.tsx, and I’ll hand you precise file-patch diffs so you can paste with zero hunting.

@@ -1,0 +1,400 @@
+Here’s the complete next build — Drizzle models, FastAPI routers, and a React review panel — so every “how it should work / change / process” line becomes a test candidate that the PM can approve line-by-line.
+
+1) Drizzle models (Postgres)
+server/db/schema/tests.ts
+import { pgTable, uuid, varchar, text, jsonb, timestamp, integer } from "drizzle-orm/pg-core";
+
+export const stagingTests = pgTable("staging_tests", {
+  id: uuid("id").primaryKey().notNull(),
+  projectId: uuid("project_id").notNull().index(),
+  transcriptId: uuid("transcript_id").notNull().index(),
+  dedupeKey: varchar("dedupe_key", { length: 160 }).notNull(),
+  title: varchar("title", { length: 240 }).notNull(),
+  gherkin: text("gherkin").notNull(),
+  steps: jsonb("steps").$type<string[]>().notNull().default([]),
+  areaKey: varchar("area_key", { length: 24 }),
+  bpCode: varchar("bp_code", { length: 80 }),
+  priority: varchar("priority", { length: 4 }).notNull().default("P2"),
+  type: varchar("type", { length: 16 }).notNull().default("happy"),
+  ownerHint: varchar("owner_hint", { length: 120 }),
+  tags: jsonb("tags").$type<string[]>().notNull().default([]),
+  trace: jsonb("trace").$type<string[]>().notNull(),       // transcript quotes/spans
+  confidence: integer("confidence").notNull(),              // 0..100 to avoid float hassles
+  createdAt: timestamp("created_at").defaultNow(),
+});
+export const testsLibrary = pgTable("tests_library", {
+  id: uuid("id").primaryKey().notNull(),
+  projectId: uuid("project_id").notNull().index(),
+  areaKey: varchar("area_key", { length: 24 }),
+  bpCode: varchar("bp_code", { length: 80 }),
+  title: varchar("title", { length: 240 }).notNull(),
+  version: integer("version").notNull().default(1),
+  gherkin: text("gherkin").notNull(),
+  steps: jsonb("steps").$type<string[]>().notNull(),
+  priority: varchar("priority", { length: 4 }).notNull().default("P2"),
+  type: varchar("type", { length: 16 }).notNull().default("happy"),
+  tags: jsonb("tags").$type<string[]>().notNull().default([]),
+  sourceTranscriptId: uuid("source_transcript_id"),
+  createdBy: uuid("created_by"),
+  createdAt: timestamp("created_at").defaultNow(),
+  dedupeKey: varchar("dedupe_key", { length: 160 }).notNull().index(),
+});
+export const testsHistory = pgTable("tests_history", {
+  id: uuid("id").primaryKey().notNull(),
+  testId: uuid("test_id").notNull().index(),
+  version: integer("version").notNull(),
+  diff: jsonb("diff").$type<any>().notNull(),
+  committedAt: timestamp("committed_at").defaultNow(),
+  committedBy: uuid("committed_by"),
+});
+
+
+Dev DDL adds (if you bootstrap via SQL):
+
+create unique index if not exists uq_staging_tests on staging_tests(project_id, dedupe_key);
+create index if not exists idx_tests_library_dedupe on tests_library(project_id, dedupe_key);
+
+2) FastAPI routers
+server/routers/tests_review.py
+from fastapi import APIRouter, Query, Body, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional, Any, Dict
+from uuid import uuid4
+from datetime import datetime
+from db import pg  # your helper returning dict rows
+
+router = APIRouter(prefix="/admin/review", tags=["tests"])
+
+class ApproveItem(BaseModel):
+  id: str
+  overrides: Optional[Dict[str, Any]] = None
+
+class CommitBody(BaseModel):
+  projectId: str
+  approved: List[ApproveItem] = []
+  edited:   List[Dict[str, Any]] = []   # {id, ...fields}
+  rejected: List[str] = []
+  createdBy: Optional[str] = None
+
+@router.get("/tests")
+def list_staged_tests(projectId: str = Query(...)):
+  rows = pg.query("""
+    select id, project_id as "projectId", transcript_id as "transcriptId",
+           dedupe_key as "dedupeKey", title, gherkin, steps, area_key as "areaKey",
+           bp_code as "bpCode", priority, type, owner_hint as "ownerHint",
+           tags, trace, confidence, created_at as "createdAt"
+    from staging_tests where project_id=%s
+    order by confidence desc, created_at desc
+  """, (projectId,))
+  return {"ok": True, "items": rows}
+
+@router.post("/tests/commit")
+def commit_tests(body: CommitBody):
+  pid = body.projectId
+  if not pid:
+    raise HTTPException(400, "projectId required")
+
+  # 1) Apply edits (mutate staged rows before approval)
+  for ed in body.edited:
+    tid = ed.pop("id", None)
+    if not tid: continue
+    sets = []
+    vals = []
+    for k,v in ed.items():
+      col = {
+        "title":"title","gherkin":"gherkin","steps":"steps",
+        "areaKey":"area_key","bpCode":"bp_code","priority":"priority",
+        "type":"type","tags":"tags"
+      }.get(k)
+      if not col: continue
+      sets.append(f"{col}=%s"); vals.append(pg.json(v) if col in ("steps","tags") else v)
+    if sets:
+      vals += [pid, tid]
+      pg.exec(f"update staging_tests set {', '.join(sets)} where project_id=%s and id=%s", tuple(vals))
+
+  applied = {"created":0, "updated":0, "rejected":0}
+
+  # 2) Approve -> upsert into tests_library (by dedupe_key) + history
+  for ap in body.approved:
+    row = pg.one("select * from staging_tests where project_id=%s and id=%s", (pid, ap.id))
+    if not row: 
+      continue
+    merged = {**row, **(ap.overrides or {})}
+
+    existing = pg.one("""
+      select * from tests_library where project_id=%s and dedupe_key=%s
+      """,(pid, row["dedupe_key"]))
+    if existing:
+      new_ver = existing["version"] + 1
+      pg.exec("""update tests_library
+                 set title=%s, area_key=%s, bp_code=%s, gherkin=%s, steps=%s,
+                     priority=%s, type=%s, tags=%s, version=%s, source_transcript_id=%s
+                 where id=%s""",
+              (merged["title"], merged.get("areaKey"), merged.get("bpCode"),
+               merged["gherkin"], pg.json(merged["steps"]),
+               merged["priority"], merged["type"], pg.json(merged.get("tags",[])),
+               new_ver, row["transcript_id"], existing["id"]))
+      # history diff (simple: store entire before/after)
+      pg.exec("""insert into tests_history (id, test_id, version, diff, committed_by)
+                 values (%s, %s, %s, %s::jsonb, %s)""",
+              (str(uuid4()), existing["id"], new_ver,
+               pg.json({"before": existing, "after": merged}), body.createdBy))
+      applied["updated"] += 1
+    else:
+      new_id = str(uuid4())
+      pg.exec("""insert into tests_library
+                 (id, project_id, area_key, bp_code, title, version, gherkin, steps,
+                  priority, type, tags, source_transcript_id, created_by, dedupe_key)
+                 values
+                 (%s,%s,%s,%s,%s,1,%s,%s,%s,%s,%s,%s,%s,%s)""",
+              (new_id, pid, merged.get("areaKey"), merged.get("bpCode"),
+               merged["title"], merged["gherkin"], pg.json(merged["steps"]),
+               merged["priority"], merged["type"], pg.json(merged.get("tags",[])),
+               row["transcript_id"], body.createdBy, row["dedupe_key"]))
+      pg.exec("""insert into tests_history (id, test_id, version, diff, committed_by)
+                 values (%s, %s, %s, %s::jsonb, %s)""",
+              (str(uuid4()), new_id, 1,
+               pg.json({"before": None, "after": merged}), body.createdBy))
+      applied["created"] += 1
+
+    # remove from staging
+    pg.exec("delete from staging_tests where project_id=%s and id=%s", (pid, ap.id))
+
+  # 3) Reject
+  for rid in body.rejected:
+    pg.exec("delete from staging_tests where project_id=%s and id=%s", (pid, rid))
+    applied["rejected"] += 1
+
+  return {"ok": True, "applied": applied}
+
+Mount it
+# server/main.py
+from routers.tests_review import router as tests_review_router
+app.include_router(tests_review_router)
+
+3) React: Transcript Review → Tests panel
+client/src/components/review/TestsReviewPanel.tsx
+import * as React from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+
+type StagedTest = {
+  id:string; title:string; gherkin:string; steps:string[];
+  areaKey?:string; bpCode?:string; priority:"P0"|"P1"|"P2"|"P3";
+  type:"happy"|"edge"|"negative"|"regression"; tags:string[];
+  confidence:number; trace:string[];
+};
+
+export default function TestsReviewPanel({ projectId }:{ projectId:string }) {
+  const qc = useQueryClient();
+  const [edited, setEdited] = React.useState<Record<string, Partial<StagedTest>>>({});
+  const [approved, setApproved] = React.useState<Record<string, Partial<StagedTest>>>({});
+  const [rejected, setRejected] = React.useState<Record<string, true>>({});
+
+  const { data, isLoading } = useQuery(["staging-tests", projectId], async () => {
+    const r = await fetch(`/admin/review/tests?projectId=${projectId}`);
+    return r.json();
+  }, { staleTime: 10000 });
+
+  const commit = useMutation(async (body:any)=>{
+    const r = await fetch(`/admin/review/tests/commit`, {
+      method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)
+    });
+    return r.json();
+  }, { onSuccess: ()=> qc.invalidateQueries(["staging-tests", projectId]) });
+
+  if (isLoading) return <div className="card p-4">Loading tests…</div>;
+  const items: StagedTest[] = data?.items || [];
+
+  const approve = (id:string, overrides:Partial<StagedTest>={}) =>
+    setApproved(s=>({...s, [id]: overrides}));
+  const reject = (id:string) => setRejected(s=>({...s, [id]: true}));
+  const markEdit = (id:string, patch:Partial<StagedTest>) =>
+    setEdited(s=>({...s, [id]: {...s[id], ...patch}}));
+
+  const onCommit = () => {
+    const body = {
+      projectId,
+      approved: Object.entries(approved).map(([id,overrides])=>({id, overrides})),
+      edited: Object.entries(edited).map(([id,patch])=>({id, ...patch})),
+      rejected: Object.keys(rejected),
+      createdBy: "PM-REVIEW" // swap with real user id
+    };
+    commit.mutate(body);
+  };
+
+  return (
+    <div className="card p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="card__title">Test Candidates</h3>
+        <div className="flex gap-2">
+          <button className="k-btn" onClick={()=> {
+            // approve all >=85 confidence (suggested)
+            const next:Record<string,Partial<StagedTest>> = {};
+            for (const it of items) if (it.confidence>=85) next[it.id] = {};
+            setApproved(next);
+          }}>Suggest Approvals (≥85)</button>
+          <button className="k-btn k-btn--primary" onClick={onCommit} disabled={commit.isLoading}>
+            {commit.isLoading? "Committing…" : "Commit Selected"}
+          </button>
+        </div>
+      </div>
+
+      <div className="overflow-auto">
+        <table className="min-w-full text-sm">
+          <thead className="text-text-muted">
+            <tr>
+              <th className="text-left py-2 w-16">Conf</th>
+              <th className="text-left py-2">Title</th>
+              <th className="text-left py-2">Area</th>
+              <th className="text-left py-2">BP</th>
+              <th className="text-left py-2">Priority</th>
+              <th className="text-left py-2">Type</th>
+              <th className="text-left py-2">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map(it=>{
+              const isApproved = approved[it.id] !== undefined;
+              const isRejected = !!rejected[it.id];
+              const patch = edited[it.id] || {};
+              return (
+                <tr key={it.id} className="border-t border-border align-top">
+                  <td className="py-2">{Math.round(it.confidence)}%</td>
+                  <td className="py-2">
+                    <input className="k-input w-[380px]" defaultValue={it.title}
+                      onChange={e=>markEdit(it.id,{title:e.target.value})}/>
+                    <details className="mt-1">
+                      <summary className="cursor-pointer text-text-muted">Gherkin</summary>
+                      <textarea className="k-input w-full" rows={5}
+                        defaultValue={it.gherkin}
+                        onChange={e=>markEdit(it.id,{gherkin:e.target.value})}/>
+                    </details>
+                    <details>
+                      <summary className="cursor-pointer text-text-muted">Steps</summary>
+                      <textarea className="k-input w-full" rows={4}
+                        defaultValue={(it.steps||[]).join("\n")}
+                        onChange={e=>markEdit(it.id,{steps:e.target.value.split("\n").map(s=>s.trim()).filter(Boolean)})}/>
+                    </details>
+                    <details>
+                      <summary className="cursor-pointer text-text-muted">Trace</summary>
+                      <ul className="list-disc pl-5 text-text-muted">
+                        {(it.trace||[]).map((t,i)=><li key={i}>{t}</li>)}
+                      </ul>
+                    </details>
+                  </td>
+                  <td className="py-2">
+                    <input className="k-input w-28" defaultValue={it.areaKey||""}
+                      onChange={e=>markEdit(it.id,{areaKey:e.target.value})}/>
+                  </td>
+                  <td className="py-2">
+                    <input className="k-input w-36" defaultValue={it.bpCode||""}
+                      onChange={e=>markEdit(it.id,{bpCode:e.target.value})}/>
+                  </td>
+                  <td className="py-2">
+                    <select className="k-input" defaultValue={it.priority}
+                      onChange={e=>markEdit(it.id,{priority:e.target.value as any})}>
+                      <option>P0</option><option>P1</option><option>P2</option><option>P3</option>
+                    </select>
+                  </td>
+                  <td className="py-2">
+                    <select className="k-input" defaultValue={it.type}
+                      onChange={e=>markEdit(it.id,{type:e.target.value as any})}>
+                      <option>happy</option><option>edge</option><option>negative</option><option>regression</option>
+                    </select>
+                  </td>
+                  <td className="py-2">
+                    <div className="flex gap-2">
+                      <button className={`k-btn ${isApproved?'k-btn--primary':''}`} onClick={()=>approve(it.id, patch)}>Approve</button>
+                      <button className={`k-btn ${isRejected?'k-btn--primary':''}`} onClick={()=>reject(it.id)}>Reject</button>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+            {items.length===0 && <tr><td colSpan={7} className="py-6 text-center text-text-muted">No staged tests.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+
+Wire it on the transcript review page:
+
+// ui/pages/TranscriptReview.tsx
+import TestsReviewPanel from "@/components/review/TestsReviewPanel";
+{/* … in layout … */}
+<TestsReviewPanel projectId={projectId} />
+
+4) LLM extraction – JSON schema (for your worker)
+
+Use this with ChatGPT tool/function calling so everything lands machine-safe:
+
+{
+  "type":"object",
+  "properties":{
+    "tests":{
+      "type":"array",
+      "items":{
+        "type":"object",
+        "properties":{
+          "title":{"type":"string"},
+          "gherkin":{"type":"string"},
+          "steps":{"type":"array","items":{"type":"string"}},
+          "areaKey":{"type":"string"},
+          "bpCode":{"type":"string"},
+          "priority":{"type":"string","enum":["P0","P1","P2","P3"]},
+          "type":{"type":"string","enum":["happy","edge","negative","regression"]},
+          "ownerHint":{"type":"string"},
+          "tags":{"type":"array","items":{"type":"string"}},
+          "trace":{"type":"array","items":{"type":"string"}},
+          "confidence":{"type":"number","minimum":0,"maximum":1},
+          "dedupeKey":{"type":"string"}
+        },
+        "required":["title","steps","gherkin","confidence","dedupeKey"]
+      }
+    }
+  },
+  "required":["tests"]
+}
+
+
+Worker note: store confidence as int(confidence*100) when inserting into staging_tests.
+
+5) Seed two test candidates (so UI isn’t empty)
+
+In your seeder after transcript insert:
+
+await tx.insert(stagingTests).values([
+  {
+    id: crypto.randomUUID(), projectId, transcriptId,
+    dedupeKey: "HCM-HIRE-EMAIL-REQ",
+    title: "Hire: Work email must be created before provisioning",
+    gherkin: "Given a new hire...\nWhen HR submits Hire BP\nThen email account exists\nAnd provisioning proceeds",
+    steps: ["Create pre-hire", "Start Hire BP", "Verify email in WD", "Verify provisioning ticket"],
+    areaKey: "HCM", bpCode: "HIRE_EMPLOYEE", priority: "P1", type: "happy",
+    ownerHint: "HR Ops", tags: ["hire","provisioning"],
+    trace: ["…we must ensure email exists before provisioning starts…"],
+    confidence: 88
+  },
+  {
+    id: crypto.randomUUID(), projectId, transcriptId,
+    dedupeKey: "FIN-JOURNAL-NEG-NO-APPROVER",
+    title: "Journal cannot post without approver",
+    gherkin: "Given a journal without approver\nWhen user attempts to post\nThen error is shown",
+    steps: ["Create journal", "Remove approver", "Attempt post", "Expect error"],
+    areaKey: "FIN", bpCode: "POST_JOURNAL", priority: "P0", type: "negative",
+    ownerHint: "Finance", tags: ["controls","sod"],
+    trace: ["…posting requires approver in all cases…"],
+    confidence: 92
+  }
+]);
+
+6) What you get
+
+Any convo about process/capability/change becomes a test candidate automatically.
+
+PM reviews line-by-line, approves/edits/rejects, commits to Tests Library with version history.
+
+Fully auditable: test → transcript quotes (trace), version diffs, who approved.

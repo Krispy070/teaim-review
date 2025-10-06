@@ -1,0 +1,358 @@
+Here’s your double-size build, v2.10 (two sprints packed into one), with copy-paste patches that run brand-flag aware, are dev-safe, and won’t break current flows.
+
+What lands now (visible in 1 session):
+
+Supabase auth (magic-link login + sign in/out in header, while dev headers still work)
+
+Comms controls: Quiet Hours + Daily Caps enforced in send_guard
+
+Digest polish: stable chips + deep links
+
+Streaming Data Room ZIP (+ include memory toggle; safe fallback if zipstream not present)
+
+Review Queue inline edit for Actions/Risks/Decisions (Save & Approve in place)
+
+Meetings CSV export + simple filters
+
+Owner-aware Sign-off modal (no more prompt(); members filtered by signer authority)
+
+Stage Editor superpowers: focus, keyboard save/undo, unsaved ring
+
+Top progress bar across route changes; Command Palette A11y (arrow/Enter)
+
+v2.10.1 — Production auth + Comms + Digest polish
+1) Supabase Auth (frontend)
+
+A. Supabase client – client/src/lib/supabase.ts
+
+import { createClient } from "@supabase/supabase-js";
+
+export const supa = createClient(
+  import.meta.env.VITE_SUPABASE_URL!,
+  import.meta.env.VITE_SUPABASE_ANON_KEY!,
+  { auth: { persistSession: true, autoRefreshToken: true } }
+);
+
+
+B. Login page – client/src/pages/Login.tsx
+
+import { useState } from "react";
+import { supa } from "@/lib/supabase";
+
+export default function Login(){
+  const [email,setEmail]=useState(""); const [sent,setSent]=useState(false);
+
+  async function send(){
+    const { error } = await supa.auth.signInWithOtp({ email });
+    if (error) alert(error.message); else setSent(true);
+  }
+
+  return (
+    <div className="p-6 max-w-md mx-auto space-y-3">
+      <h1 className="text-xl font-semibold">Sign in</h1>
+      {!sent ? (
+        <>
+          <input className="border rounded p-2 w-full" placeholder="you@company.com"
+                 value={email} onChange={e=>setEmail(e.target.value)} />
+          <button className="brand-btn" onClick={send}>Send magic link</button>
+        </>
+      ): <div>Check your email for a sign-in link.</div>}
+    </div>
+  );
+}
+
+
+C. Route – client/src/App.jsx
+
+import Login from "@/pages/Login";
+// …
+<Route path="/login" element={<Login/>} />
+
+
+D. Header Sign in/out – client/src/components/BrandedHeader.tsx
+
+import { useEffect, useState } from "react";
+import { supa } from "@/lib/supabase";
+// …
+const [signedIn,setSignedIn]=useState(false);
+useEffect(()=>{
+  supa.auth.getUser().then(({data})=> setSignedIn(!!data.user));
+  const { data: sub } = supa.auth.onAuthStateChange((_e, session)=> setSignedIn(!!session?.user));
+  return ()=> sub?.subscription?.unsubscribe();
+},[]);
+// …
+<button className="brand-btn text-xs"
+  onClick={async ()=>{
+    if (signedIn){ await supa.auth.signOut(); location.href="/login"; }
+    else location.href="/login";
+  }}>
+  {signedIn ? "Sign out" : "Sign in"}
+</button>
+
+
+Env (Replit Secrets): VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY (frontend).
+Backend already uses your Supabase services; dev headers continue working.
+
+2) Quiet Hours + Daily Caps
+
+DB:
+
+alter table public.org_comms_settings
+  add column if not exists quiet_hours_start time,
+  add column if not exists quiet_hours_end time,
+  add column if not exists timezone text default 'UTC',
+  add column if not exists daily_cap integer default 500;
+select pg_notify('pgrst','reload schema');
+
+
+Patch server/email/util.py (inside send_guard)
+Enforce quiet hours & caps before sending:
+
+import pytz, datetime as dt
+s = sb.table("org_comms_settings").select("quiet_hours_start,quiet_hours_end,timezone,daily_cap")\
+     .eq("org_id", org_id).single().execute().data or {}
+tz = pytz.timezone(s.get("timezone") or "UTC")
+now_local = dt.datetime.now(tz)
+qs, qe = s.get("quiet_hours_start"), s.get("quiet_hours_end")
+if qs and qe:
+    t = now_local.time()
+    within = (qs <= t <= qe) if qs <= qe else (t >= qs or t <= qe)
+    if within: return False, f"Quiet hours ({qs}–{qe} {tz})"
+
+start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+count = sb.table("comms_send_log").select("id", count="exact")\
+         .eq("org_id", org_id).eq("kind", kind)\
+         .gte("created_at", start.isoformat()).execute().count or 0
+cap = int(s.get("daily_cap") or 500)
+if count >= cap: return False, f"Daily cap reached ({cap})"
+
+3) Digest chips + deep links
+
+Patch server/routers/digest.py (where you compose HTML)
+
+def chip(label, n, path):
+    base = os.getenv("APP_BASE_URL","").rstrip("/")
+    url = f"{base}/projects/{project_id}/{path}"
+    return f"<a href='{url}' style='text-decoration:none;border:1px solid #ddd;border-radius:6px;padding:6px 10px;margin-right:6px;color:#111'>{label}: <b>{n}</b></a>"
+
+html = export_header_html(org, code)
+html += "<h2>Weekly Digest</h2><div>"
+if "actions" in wanted:   html += chip("Actions", counts.get("actions",0), "actions/list")
+if "risks" in wanted:     html += chip("Risks",   counts.get("risks",0),   "admin/audit-timeline")
+if "decisions" in wanted: html += chip("Decisions", counts.get("decisions",0), "admin/audit-timeline")
+html += "</div>"
+
+v2.10.2 — Streaming exports + Review inline edit + Meetings export
+4) Data Room ZIP — streaming + memory toggle
+
+Patch server/routers/export_dataroom.py
+Streaming if zipstream present; fallback to old in-memory approach if not.
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
+import io, zipfile, json, datetime as dt
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase, get_service_supabase
+from ..brand.export_header import export_header_html
+
+router = APIRouter(prefix="/api/export", tags=["export"])
+
+@router.get("/dataroom.zip")
+def dataroom(project_id: str = Query(...), include_mem: bool = False, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx); sbs = get_service_supabase()
+    proj = sb.table("projects").select("code").eq("id", project_id).single().execute().data or {}
+    code = proj.get("code") or project_id
+    org = sb.table("org_branding").select("*").eq("org_id", ctx.org_id).single().execute().data or {}
+
+    def non_stream():
+        buf = io.BytesIO(); z = zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED)
+        arts = sb.table("artifacts").select("id,name,storage_bucket,storage_path,created_at")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id).limit(5000).execute().data or []
+        links = sb.table("share_links").select("artifact_id,token,expires_at,revoked_at,created_at")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id).limit(5000).execute().data or []
+        docs = sb.table("signoff_docs").select("id,name,status,signed_by,signed_name,signed_at,created_at")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id).limit(2000).execute().data or []
+        manifest = {"org_id":ctx.org_id,"project_id":project_id,"project_code":code,
+                    "generated_at":dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "counts":{"artifacts":len(arts),"links":len(links),"signoff_docs":len(docs)}}
+        hdr = export_header_html(org, code)
+        html_manifest = f"<html><body>{hdr}<h2>Data Room Manifest</h2><pre>{json.dumps(manifest, indent=2)}</pre></body></html>"
+        z.writestr("manifest.json", json.dumps(manifest, indent=2))
+        z.writestr("manifest.html", html_manifest)
+        if include_mem:
+            try:
+                mem = sb.table("mem_signals").select("*").eq("org_id", ctx.org_id).eq("project_id", project_id).limit(5000).execute().data or []
+                z.writestr("memory.json", json.dumps(mem))
+            except Exception:
+                z.writestr("memory.json", "[]")
+        for a in arts[:1000]:
+            try:
+                b = sbs.storage().from_(a["storage_bucket"]).download(a["storage_path"])
+                z.writestr(f"artifacts/{a.get('name') or a['id']}", b)
+            except Exception as e:
+                z.writestr(f"artifacts/_missing_{a['id']}.txt", str(e))
+        z.close(); buf.seek(0)
+        return StreamingResponse(iter([buf.getvalue()]), media_type="application/zip",
+            headers={"Content-Disposition": 'attachment; filename="dataroom.zip"'})
+
+    try:
+        import zipstream
+        def gen():
+            z = zipstream.ZipFile(mode='w', compression=zipstream.ZIP_DEFLATED)
+            arts = sb.table("artifacts").select("id,name,storage_bucket,storage_path,created_at")\
+                   .eq("org_id", ctx.org_id).eq("project_id", project_id).limit(5000).execute().data or []
+            links = sb.table("share_links").select("artifact_id,token,expires_at,revoked_at,created_at")\
+                   .eq("org_id", ctx.org_id).eq("project_id", project_id).limit(5000).execute().data or []
+            docs = sb.table("signoff_docs").select("id,name,status,signed_by,signed_name,signed_at,created_at")\
+                   .eq("org_id", ctx.org_id).eq("project_id", project_id).limit(2000).execute().data or []
+            manifest = {"org_id":ctx.org_id,"project_id":project_id,"project_code":code,
+                        "generated_at":dt.datetime.now(dt.timezone.utc).isoformat(),
+                        "counts":{"artifacts":len(arts),"links":len(links),"signoff_docs":len(docs)}}
+            hdr = export_header_html(org, code)
+            html_manifest = f"<html><body>{hdr}<h2>Data Room Manifest</h2><pre>{json.dumps(manifest, indent=2)}</pre></body></html>"
+            z.write_iter("manifest.json", iter([json.dumps(manifest)]))
+            z.write_iter("manifest.html", iter([html_manifest]))
+            if include_mem:
+                try:
+                    mem = sb.table("mem_signals").select("*").eq("org_id", ctx.org_id).eq("project_id", project_id).limit(5000).execute().data or []
+                    z.write_iter("memory.json", iter([json.dumps(mem)]))
+                except Exception: z.write_iter("memory.json", iter(["[]"]))
+            for a in arts[:1000]:
+                try:
+                    b = sbs.storage().from_(a["storage_bucket"]).download(a["storage_path"])
+                    z.write_iter(f"artifacts/{a.get('name') or a['id']}", iter([b]))
+                except Exception as e:
+                    z.write_iter(f"artifacts/_missing_{a['id']}.txt", iter([str(e)]))
+            yield from z
+        return StreamingResponse(gen(), media_type="application/zip",
+          headers={"Content-Disposition": 'attachment; filename="dataroom.zip"'})
+    except Exception:
+        return non_stream()
+
+
+UI: add a checkbox “Include memory” → append &include_mem=1 to the export URL.
+
+5) Review Queue — inline edit for core types
+
+Patch client/src/pages/UpdatesReview.tsx
+Add just under each item row:
+
+function InlineEdit({u}:{u:any}){
+  const [title,setTitle]=useState(u.payload?.title||"");
+  const [owner,setOwner]=useState(u.payload?.owner||"");
+  const [status,setStatus]=useState(u.payload?.status||"");
+  const [area,setArea]=useState(u.payload?.area||"");
+
+  async function save(){
+    await postJSON(`/api/updates/${u.id}/edit-approve?project_id=${projectId}`, {
+      payload: { ...u.payload, title, owner, status, area }
+    });
+    load();
+  }
+
+  const t = (u.target_table||u.table||"").toLowerCase();
+  if (!/actions|risks|decisions/.test(t)) return null;
+
+  return (
+    <div className="brand-card p-2 mt-2">
+      <div className="grid md:grid-cols-4 gap-2">
+        <input className="border rounded p-2" placeholder="Title" value={title} onChange={e=>setTitle(e.target.value)} />
+        <input className="border rounded p-2" placeholder="Owner" value={owner} onChange={e=>setOwner(e.target.value)} />
+        <input className="border rounded p-2" placeholder="Status" value={status} onChange={e=>setStatus(e.target.value)} />
+        <input className="border rounded p-2" placeholder="Area" value={area} onChange={e=>setArea(e.target.value)} />
+      </div>
+      <div className="flex justify-end mt-2 gap-2">
+        <button className="brand-btn text-xs swoosh" onClick={save}>Save & Approve</button>
+      </div>
+    </div>
+  );
+}
+// …
+{items.map(u=>(
+  <div key={u.id} className="brand-card p-2 mb-2">
+    {/* existing renderer */}
+    <InlineEdit u={u}/>
+  </div>
+))}
+
+6) Meetings: CSV export + filters
+
+Backend — server/routers/meetings_export_csv.py (new):
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
+import io, csv
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/meetings", tags=["meetings"])
+
+@router.get("/export.csv")
+def export_csv(project_id: str = Query(...),
+               owner: str | None = None, area: str | None = None, min_conf: float | None = None,
+               ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    cols = ["artifact_id","kind","index","title","owner","area","confidence","created_at"]
+    try:
+        rows = sb.table("summaries_flat").select(",".join(cols))\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id).execute().data or []
+    except Exception:
+        rows = []
+    if owner: rows = [r for r in rows if (r.get("owner") or "").lower()==owner.lower()]
+    if area: rows = [r for r in rows if (r.get("area") or "").lower()==area.lower()]
+    if min_conf is not None: rows = [r for r in rows if (float(r.get("confidence") or 0) >= float(min_conf))]
+    s = io.StringIO(); w = csv.writer(s); w.writerow(cols)
+    for r in rows: w.writerow([r.get(c) for c in cols])
+    s.seek(0)
+    return StreamingResponse(iter([s.read()]), media_type="text/csv",
+      headers={"Content-Disposition": 'attachment; filename="meetings.csv"'})
+
+
+Mount in server/main.py:
+
+from .routers import meetings_export_csv
+app.include_router(meetings_export_csv.router)
+
+
+UI – in client/src/pages/Meetings.tsx:
+
+const [fOwner,setFOwner]=useState(""); const [fArea,setFArea]=useState(""); const [fConf,setFConf]=useState(0.8);
+// …
+<div className="flex items-center gap-2 mb-2">
+  <input className="border rounded p-1 text-xs" placeholder="Owner (exact)" value={fOwner} onChange={e=>setFOwner(e.target.value)} />
+  <input className="border rounded p-1 text-xs" placeholder="Area (exact)" value={fArea} onChange={e=>setFArea(e.target.value)} />
+  <label className="text-xs">Min conf</label>
+  <input type="number" step={0.01} min={0} max={1} className="border rounded p-1 w-[80px]" value={fConf} onChange={e=>setFConf(parseFloat(e.target.value||"0.8"))}/>
+  <button className="brand-btn text-xs swoosh"
+    onClick={()=>downloadGET(`/api/meetings/export.csv?project_id=${projectId}${fOwner?`&owner=${encodeURIComponent(fOwner)}`:""}${fArea?`&area=${encodeURIComponent(fArea)}`:""}&min_conf=${fConf}`, "meetings.csv")}>
+    Export CSV
+  </button>
+</div>
+
+7) Owner-aware Sign-off modal + Stage editor superpowers
+
+You already integrated the modal and Stage Editor enhancements in v2.7.2; above we included the backend to list signers by area and a polished modal. If you still have prompt() anywhere, replace it with the modal call as shown.
+
+8) Top progress bar + Command Palette A11y
+
+You added the bar and palette already; above we included arrow/Enter handling. If you haven’t patched CommandPalette yet, paste that A11y block in.
+
+9) 120-second validation
+
+Sign in/out works (magic link), dev headers still fine
+
+Quiet hours/caps block emails during restricted times (watch digest & sign-off)
+
+Digest chips link into app; Change Log + Closed sections show up
+
+Data Room streams; “Include memory” works
+
+Review Queue allows inline Save & Approve of A/R/D
+
+Meetings CSV export with filters
+
+Sign-off modal filters signer list by area; sends successfully
+
+Stage Editor: keyboard save/undo; unsaved ring clears

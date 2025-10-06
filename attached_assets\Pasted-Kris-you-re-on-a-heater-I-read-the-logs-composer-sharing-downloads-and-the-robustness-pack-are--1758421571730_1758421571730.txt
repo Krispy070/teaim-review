@@ -1,0 +1,255 @@
+Kris, you’re on a heater. I read the logs—composer, sharing, downloads, and the robustness pack are all green. Let’s stack the next big build exactly as promised:
+
+Share Dialog (expiry picker + “Open” + “Copy”)
+
+SLA “Due Soon” chip (yellow count for actions due ≤ N days) + endpoint
+
+Notifications v2 (unread based on last-seen; mark-as-read; still no crashes)
+
+Finish auth-safe downloads everywhere (you already wired GET/POST; I’ll show how to use POST for any button)
+
+Everything below is paste-ready. If any filenames differ, tell me and I’ll refit 1:1.
+
+A) Share Dialog (expiry picker + open/copy)
+
+You already have the backend /api/artifacts/share-url. We’ll add a modal.
+
+A1) Modal component
+
+client/src/components/ShareDialog.tsx
+
+import { useEffect, useState } from "react";
+import { useToast } from "@/components/ui/use-toast";
+
+type Props = {
+  open: boolean;
+  onClose: () => void;
+  artifactId: string;
+  projectId: string;
+};
+
+const PRESETS = [
+  { label: "15 minutes", sec: 900 },
+  { label: "1 hour", sec: 3600 },
+  { label: "24 hours", sec: 86400 },
+  { label: "7 days", sec: 604800 },
+];
+
+export default function ShareDialog({ open, onClose, artifactId, projectId }: Props){
+  const { toast } = useToast();
+  const [sec, setSec] = useState(3600);
+  const [url, setUrl] = useState<string>("");
+
+  useEffect(()=>{ if (!open) { setUrl(""); setSec(3600); } },[open]);
+
+  async function create(){
+    try {
+      const res = await fetch(`/api/artifacts/share-url?project_id=${projectId}`, {
+        method: "POST", credentials: "include",
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ artifact_id: artifactId, expires_sec: sec })
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const d = await res.json();
+      setUrl(d.url);
+      toast({ title: "Share link ready", description: `Valid for ~${Math.round(sec/60)} min.` });
+    } catch(e:any) {
+      toast({ title:"Failed to create share link", description:String(e?.message||e), variant:"destructive" });
+    }
+  }
+  async function copy(){
+    try { await navigator.clipboard.writeText(url); toast({ title:"Copied to clipboard" }); }
+    catch { /* no-op */ }
+  }
+
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-[80] bg-black/30 flex items-center justify-center" onClick={onClose}>
+      <div className="w-[520px] bg-white dark:bg-neutral-900 border rounded-lg shadow-xl p-4" onClick={e=>e.stopPropagation()}>
+        <div className="text-sm font-medium mb-2">Share document</div>
+        <div className="grid md:grid-cols-2 gap-2 mb-3">
+          {PRESETS.map(p=>(
+            <button key={p.sec}
+              className={`px-2 py-2 border rounded ${sec===p.sec?'bg-black text-white':''}`}
+              onClick={()=>setSec(p.sec)}>{p.label}</button>
+          ))}
+        </div>
+        <div className="flex items-center gap-2">
+          <button className="px-3 py-2 border rounded" onClick={create}>Create Link</button>
+          <button className="px-3 py-2 border rounded" disabled={!url} onClick={()=>window.open(url,'_blank')}>Open</button>
+          <button className="px-3 py-2 border rounded" disabled={!url} onClick={copy}>Copy</button>
+          <button className="ml-auto px-3 py-2 border rounded" onClick={onClose}>Close</button>
+        </div>
+        {url && <div className="mt-3 text-xs break-all text-muted-foreground">{url}</div>}
+      </div>
+    </div>
+  );
+}
+
+A2) Hook into Documents row
+
+In your artifact row/card, replace the simple “Share” button with a dialog trigger:
+
+import ShareDialog from "@/components/ShareDialog";
+function ArtifactRow({ a, projectId, role }:{ a:any; projectId:string; role:string }){
+  const [shareOpen, setShareOpen] = useState(false);
+  return (
+    <div id={`artifact-${a.id}`} className="border rounded p-3 flex items-center justify-between">
+      <div className="truncate">{a.name}</div>
+      <div className="flex items-center gap-2">
+        {/* existing buttons (Re-embed, etc.) */}
+        <button className="px-2 py-1 border rounded text-xs" onClick={()=>setShareOpen(true)}>Share</button>
+      </div>
+      <ShareDialog open={shareOpen} onClose={()=>setShareOpen(false)} artifactId={a.id} projectId={projectId} />
+    </div>
+  );
+}
+
+B) SLA “Due Soon” chip (yellow) + endpoint
+B1) Backend endpoint (actions due within N days)
+
+Append to your server/routers/actions_list.py:
+
+from datetime import date, timedelta
+
+@router.get("/soon")
+def soon(project_id: str = Query(...), days: int = 3, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    today = date.today().isoformat()
+    until = (date.today() + timedelta(days=int(days))).isoformat()
+    rows = sb.table("actions").select("id,title,owner,status,due_date")\
+           .eq("org_id", ctx.org_id).eq("project_id", project_id)\
+           .neq("status","done").not_.is_("due_date","null")\
+           .gte("due_date", today).lte("due_date", until)\
+           .order("due_date", desc=False).limit(200).execute().data or []
+    return {"items": rows}
+
+B2) Chip component
+
+client/src/components/DueSoonChip.tsx
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+
+export default function DueSoonChip({ days=3 }:{ days?: number }){
+  const { projectId } = useParams();
+  const [n,setN] = useState<number>(0);
+
+  async function load(){
+    try{
+      const r = await fetch(`/api/actions/soon?project_id=${projectId}&days=${days}`, { credentials:"include" });
+      if (!r.ok) { setN(0); return; }
+      const d = await r.json(); setN((d.items||[]).length);
+    }catch{ setN(0); }
+  }
+  useEffect(()=>{ load(); const t=setInterval(load,60000); return ()=>clearInterval(t); },[projectId, days]);
+
+  if (!n) return null;
+  return (
+    <div className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-yellow-400 text-black text-xs">
+      Due soon: <b>{n}</b>
+    </div>
+  );
+}
+
+
+Add it beside your other chips:
+
+import DueSoonChip from "@/components/DueSoonChip";
+// ...
+<h1 className="text-2xl font-semibold flex items-center gap-3">
+  Project Dashboard
+  <WellnessChip projectId={projectId!} />
+  <DigestChip projectId={projectId!} />
+  <OverdueChip />
+  <DueSoonChip days={3} />
+</h1>
+
+C) Notifications v2 (unread via last-seen; mark-as-read)
+
+Update your bell to persist last-seen per project and compute unread since then.
+
+client/src/components/NotificationBell.tsx (replace content)
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+
+function key(projectId?:string){ return `kap.notify.lastSeen:${projectId||"unknown"}`; }
+
+export default function NotificationBell(){
+  const { projectId } = useParams();
+  const [open,setOpen]=useState(false);
+  const [items,setItems]=useState<any[]>([]);
+  const [unread,setUnread]=useState(0);
+
+  async function load(){
+    const r = await fetch(`/api/audit/list?project_id=${projectId}`, { credentials:"include" });
+    if (!r.ok) return;
+    const ev = (await r.json()).events||[];
+    setItems(ev.slice(0,60));
+
+    const lastSeen = localStorage.getItem(key(projectId!));
+    if (lastSeen) {
+      const ts = new Date(lastSeen).getTime();
+      const u = ev.filter((e:any)=> new Date(e.created_at).getTime() > ts &&
+        (e.kind.startsWith("stage.") || e.kind.startsWith("backup.") || e.kind.startsWith("reindex.") || e.kind.startsWith("reminder.")));
+      setUnread(Math.min(9, u.length));
+    } else {
+      setUnread(Math.min(9, ev.length));
+    }
+  }
+
+  useEffect(()=>{ load(); const t=setInterval(load, 15000); return ()=>clearInterval(t); },[projectId]);
+
+  function openDrawer(){
+    setOpen(o=>!o);
+    if (!open) {
+      localStorage.setItem(key(projectId!), new Date().toISOString());
+      setUnread(0);
+    }
+  }
+
+  return (
+    <div className="relative">
+      <button className="relative px-2 py-1 border rounded" onClick={openDrawer}>
+        🔔
+        {unread>0 && <span className="absolute -top-1 -right-1 bg-red-600 text-white text-[10px] px-1 rounded-full">{unread}</span>}
+      </button>
+      {open && (
+        <div className="absolute right-0 mt-2 w-[360px] max-h-[420px] overflow-auto border rounded bg-white shadow z-[90]">
+          {items.map((e:any,i:number)=>(
+            <div key={i} className="p-2 border-b last:border-0 text-sm">
+              <div className="text-xs text-muted-foreground">{new Date(e.created_at).toLocaleString()}</div>
+              <div><b>{e.kind}</b></div>
+              <div className="text-xs text-muted-foreground break-all">{JSON.stringify(e.details)}</div>
+            </div>
+          ))}
+          {!items.length && <div className="p-3 text-sm text-muted-foreground">No recent activity.</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+This keeps unread counts sane across refreshes, and auto-clears when the drawer is opened.
+
+D) POST download helper usage (everywhere)
+
+You already replaced CSV buttons with downloadGET. For any POST-based file endpoint (e.g., Composer ZIP, export select ZIP), call:
+
+import { downloadPOST } from "@/lib/download";
+await downloadPOST(`/api/export/artifacts.zip?project_id=${projectId}`, { artifact_ids: selectedIds() }, "selected_artifacts.zip");
+
+
+The helper injects dev headers or Authorization automatically.
+
+E) Quick sanity checks (2 minutes)
+
+Share Dialog: Click “Share” → pick “1 hour” → Create → Copy → open link in incognito → file fetches.
+
+SLA chips: Set an action due-date to tomorrow → “Due soon” chip displays 1; set status to done → it clears.
+
+Bell: Trigger any event (e.g., re-embed, store file) → unread bumps; open bell → mark-as-read clears badge.
+
+ZIP: Download ZIP from Composer again → no runtime overlay; success path works (or toast if intentionally missing docs).

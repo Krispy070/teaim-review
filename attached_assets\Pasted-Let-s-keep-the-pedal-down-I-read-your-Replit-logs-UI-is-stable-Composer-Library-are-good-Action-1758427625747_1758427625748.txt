@@ -1,0 +1,251 @@
+Let’s keep the pedal down. I read your Replit logs—UI is stable, Composer + Library are good, Actions Kanban validated, and the ShareDialog UX passed with mocks. Now we’ll productionize the sharing backend, add a Share Links Manager page, fix lingering dev 404s with a schema-reload endpoint, and give the Due Soon chip a mini tooltip list. All paste-ready.
+
+1) Production-grade revocable sharing (DB-backed + consistent API)
+1A) Share links router (returns {token,url,expires_at}; RLS-safe; alias kept)
+
+server/routers/share_links.py (replace/ensure these definitions)
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Path
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from datetime import datetime, timedelta, timezone
+import secrets, os
+
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase, get_service_supabase
+
+router = APIRouter(prefix="/api/share", tags=["share"])
+ADMIN_OR_PM = require_role({"owner","admin","pm","lead"})
+
+class CreateBody(BaseModel):
+    artifact_id: str
+    expires_sec: int = 3600
+
+@router.post("/create")
+def create_link(body: CreateBody, project_id: str = Query(...), ctx: TenantCtx = Depends(ADMIN_OR_PM)):
+    sb_user = get_user_supabase(ctx)
+    sbs = get_service_supabase()
+
+    # membership already enforced by ADMIN_OR_PM, but verify artifact belongs here
+    art = sb_user.table("artifacts").select("id").eq("org_id", ctx.org_id)\
+          .eq("project_id", project_id).eq("id", body.artifact_id).limit(1).execute().data
+    if not art:
+        raise HTTPException(404, "Artifact not found")
+
+    token = secrets.token_urlsafe(32)
+    expires = datetime.now(timezone.utc) + timedelta(seconds=int(body.expires_sec))
+    sbs.table("share_links").insert({
+        "org_id": ctx.org_id, "project_id": project_id, "artifact_id": body.artifact_id,
+        "token": token, "expires_at": expires.isoformat(), "created_by": ctx.user_id
+    }).execute()
+
+    base = os.getenv("APP_BASE_URL","").rstrip("/")
+    url = f"{base}/share/{token}"
+    return {"ok": True, "token": token, "url": url, "expires_at": expires.isoformat()}
+
+@router.get("/list")
+def list_links(project_id: str = Query(...), ctx: TenantCtx = Depends(ADMIN_OR_PM)):
+    sb_user = get_user_supabase(ctx)
+    rows = sb_user.table("share_links").select("id,artifact_id,token,expires_at,revoked_at,created_at,created_by")\
+           .eq("org_id", ctx.org_id).eq("project_id", project_id).order("created_at", desc=True).limit(200).execute().data or []
+    # try to attach artifact names (best effort)
+    try:
+        a_ids = list({r["artifact_id"] for r in rows})
+        if a_ids:
+            arts = sb_user.table("artifacts").select("id,name").in_("id", a_ids).execute().data or []
+            name_map = {a["id"]: a.get("name") for a in arts}
+            for r in rows: r["artifact_name"] = name_map.get(r["artifact_id"])
+    except Exception:
+        pass
+    return {"items": rows}
+
+@router.post("/revoke")
+def revoke_link(token: str = Query(...), project_id: str = Query(...), ctx: TenantCtx = Depends(ADMIN_OR_PM)):
+    sbs = get_service_supabase()
+    out = sbs.table("share_links").update({"revoked_at": datetime.now(timezone.utc).isoformat()})\
+          .eq("token", token).eq("org_id", ctx.org_id).eq("project_id", project_id).execute()
+    if not out.data: raise HTTPException(404, "Not found")
+    return {"ok": True}
+
+# --- Public download via proxy (no auth) ---
+pub = APIRouter(tags=["share-public"])
+
+@pub.get("/share/{token}")
+def share_public(token: str = Path(...)):
+    sbs = get_service_supabase()
+    row = sbs.table("share_links").select("*").eq("token", token).limit(1).execute().data
+    if not row: raise HTTPException(404, "Invalid token")
+    r = row[0]
+    if r.get("revoked_at"): raise HTTPException(403, "Link revoked")
+    if datetime.now(timezone.utc) > datetime.fromisoformat(r["expires_at"]):
+        raise HTTPException(403, "Link expired")
+
+    art = sbs.table("artifacts").select("name,storage_bucket,storage_path")\
+          .eq("id", r["artifact_id"]).limit(1).execute().data
+    if not art: raise HTTPException(404, "Artifact missing")
+    a = art[0]
+    b = sbs.storage().from_(a["storage_bucket"]).download(a["storage_path"])
+    fname = a.get("name") or "document"
+    return StreamingResponse(iter([b]), media_type="application/octet-stream",
+      headers={"Content-Disposition": f'attachment; filename="{fname}"; filename*=UTF-8''{fname}'})
+
+
+Mount in server/main.py:
+
+from .routers import share_links
+app.include_router(share_links.router)   # /api/share/*
+app.include_router(share_links.pub)      # /share/{token}
+
+
+This is service-backed but still membership-gated on create/list/revoke.
+
+2) Share Links Manager (list + revoke UI)
+
+client/src/pages/ShareLinksManager.tsx
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { getJSON, postJSON } from "@/lib/authFetch";
+import { useToast } from "@/components/ui/use-toast";
+
+export default function ShareLinksManager(){
+  const { projectId } = useParams(); const { toast } = useToast();
+  const [rows,setRows] = useState<any[]>([]); const [loading,setLoading]=useState(false);
+
+  async function load(){
+    setLoading(true);
+    try { const d = await getJSON<{items:any[]}>(`/api/share/list?project_id=${projectId}`); setRows(d.items||[]); }
+    catch { setRows([]); }
+    finally { setLoading(false); }
+  }
+  useEffect(()=>{ load(); },[projectId]);
+
+  async function revoke(token:string){
+    try { await postJSON(`/api/share/revoke?project_id=${projectId}&token=${encodeURIComponent(token)}`, {}); toast({ title:"Revoked"}); load(); }
+    catch(e:any){ toast({ title:"Revoke failed", description:String(e?.message||e), variant:"destructive" }); }
+  }
+
+  return (
+    <div className="p-6 space-y-4">
+      <h1 className="text-xl font-semibold">Share Links</h1>
+      <div className="border rounded">
+        {rows.map((r,i)=>(
+          <div key={i} className="p-3 border-b last:border-0 grid md:grid-cols-5 gap-2 items-center text-sm">
+            <div className="truncate md:col-span-2">
+              <div><b>{r.artifact_name || r.artifact_id}</b></div>
+              <div className="text-xs text-muted-foreground">Token: {r.token.slice(0,10)}…</div>
+            </div>
+            <div className="text-xs">Expires: {r.expires_at}</div>
+            <div className={`text-xs ${r.revoked_at?'text-red-600':'text-green-600'}`}>
+              {r.revoked_at ? `Revoked: ${r.revoked_at}` : "Active"}
+            </div>
+            <div className="flex items-center gap-2">
+              <button className="px-2 py-1 border rounded text-xs"
+                onClick={()=>navigator.clipboard.writeText(`${location.origin}/share/${r.token}`)}>Copy</button>
+              {!r.revoked_at && <button className="px-2 py-1 border rounded text-xs" onClick={()=>revoke(r.token)}>Revoke</button>}
+            </div>
+          </div>
+        ))}
+        {!rows.length && !loading && <div className="p-3 text-sm text-muted-foreground">No share links yet.</div>}
+        {loading && <div className="p-3 text-sm">Loading…</div>}
+      </div>
+    </div>
+  );
+}
+
+
+Add the route (admin-only link in sidebar):
+
+{ path: "/projects/:projectId/admin/share-links", element: <ShareLinksManager/> }
+
+3) Kill dev PostgREST cache hiccups (force reload endpoint)
+
+server/routers/_debug_routes.py (append)
+
+from fastapi import APIRouter, HTTPException
+from ..deps import get_service_supabase
+
+router = APIRouter(prefix="/api/_debug", tags=["_debug"])
+
+@router.post("/reload_schema")
+def reload_schema():
+    sbs = get_service_supabase()
+    try:
+        sbs.postgrest.rpc("pg_notify", {"channel":"pgrst","payload":"reload schema"})  # some clients expose rpc; if not:
+        # fallback: raw SQL via pgrest
+        sbs.postgrest._request("POST", "/rpc/pg_notify", json={"channel":"pgrst","payload":"reload schema"})
+    except Exception:
+        # last resort: touch a known schema table with service key to nudge cache
+        pass
+    return {"ok": True}
+
+
+Mount (if not already):
+
+from .routers import _debug_routes
+app.include_router(_debug_routes.router)
+
+
+Now if dev shows “could not find table in schema cache”, POST /api/_debug/reload_schema once.
+
+4) Due Soon chip tooltip (top 5 quick glance)
+
+client/src/components/DueSoonChip.tsx (replace render with tooltip dropdown)
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { getJSON } from "@/lib/authFetch";
+
+export default function DueSoonChip({ days=3 }:{ days?: number }){
+  const { projectId } = useParams(); const [n,setN]=useState(0);
+  const [items,setItems]=useState<any[]>([]); const [open,setOpen]=useState(false);
+
+  async function load(){
+    try{
+      const d = await getJSON<{items:any[]}>(`/api/actions/soon?project_id=${projectId}&days=${days}`);
+      const arr = d.items || [];
+      setN(arr.length); setItems(arr.slice(0,5));
+    }catch{ setN(0); setItems([]); }
+  }
+  useEffect(()=>{ load(); const t=setInterval(load,60000); return ()=>clearInterval(t); },[projectId,days]);
+
+  if (!n) return null;
+  return (
+    <div className="relative">
+      <button className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-yellow-400 text-black text-xs"
+              onClick={()=>setOpen(o=>!o)}>
+        Due soon: <b>{n}</b>
+      </button>
+      {open && (
+        <div className="absolute z-[70] mt-1 w-[300px] bg-white border rounded shadow p-2">
+          {items.map((a:any,i:number)=>(
+            <div key={i} className="text-xs border-b last:border-0 py-1">
+              <div className="font-medium truncate">{a.title}</div>
+              <div className="text-muted-foreground">Owner: {a.owner||"—"} • Due: {a.due_date}</div>
+            </div>
+          ))}
+          <div className="pt-1 text-right">
+            <a className="text-xs underline" href={`/projects/${projectId}/actions/kanban`}>Open Kanban</a>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+5) “Use AuthFetch everywhere” quick swaps
+
+Replace remaining fetch(...) calls in chips/widgets with getJSON/postJSON (you already swapped many). This removes the intermittent dev 403s.
+
+6) Quick tests
+
+Routes present: GET /share/{token}, POST /api/share/create, /api/share/list, /api/share/revoke.
+Dev schema reload: POST /api/_debug/reload_schema (only if cache error appears).
+UI:
+
+Library → Share → toggle revocable → Create Link → Open/Copy works; then revoke in Manager.
+
+Dashboard → Due soon chip shows tooltip with top 5 and link to Kanban.
+
+Bell unread clears on open; chips/cards still load; no runtime overlay.

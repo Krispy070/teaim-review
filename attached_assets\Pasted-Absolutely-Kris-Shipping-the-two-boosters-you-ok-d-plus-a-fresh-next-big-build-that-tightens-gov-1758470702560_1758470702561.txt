@@ -1,0 +1,294 @@
+Absolutely, Kris. Shipping the two boosters you ok’d plus a fresh “next big build” that tightens governance and speeds ops.
+
+✅ Two quick boosters
+1) “Revoke all links” for a single artifact
+
+Backend — add an endpoint:
+
+server/routers/share_links.py (append)
+
+@router.post("/revoke_all_for_artifact")
+def revoke_all_for_artifact(artifact_id: str = Query(...),
+                            project_id: str = Query(...),
+                            ctx: TenantCtx = Depends(ADMIN_OR_PM)):
+    sbs = get_service_supabase()
+    # Only revoke active (not already revoked)
+    out = sbs.table("share_links").update({"revoked_at": datetime.now(timezone.utc).isoformat()})\
+        .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("artifact_id", artifact_id)\
+        .is_("revoked_at", "null").execute()
+    return {"ok": True, "revoked": len(out.data or [])}
+
+
+Library UI — add a button on each artifact row (admin/pm/lead/owner only):
+
+import { postJSON } from "@/lib/authFetch";
+import { useToast } from "@/components/ui/use-toast";
+
+<button className="px-2 py-1 border rounded text-xs"
+  onClick={async ()=>{
+    if (!confirm("Revoke ALL active links for this document?")) return;
+    try {
+      const d = await postJSON(`/api/share/revoke_all_for_artifact?project_id=${projectId}&artifact_id=${a.id}`, {});
+      toast({ title:"Links revoked", description:`${d.revoked} link(s)` });
+    } catch(e:any){ toast({ title:"Revoke failed", description:String(e?.message||e), variant:"destructive" }); }
+  }}>
+  Revoke All Links
+</button>
+
+2) CSV export for Share Links
+
+Backend — streaming CSV:
+
+server/routers/share_links_export.py
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
+import io, csv
+from ..tenant import TenantCtx
+from ..guards import require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/share", tags=["share"])
+ADMIN_OR_PM = require_role({"owner","admin","pm","lead"})
+
+@router.get("/export.csv")
+def export_csv(project_id: str = Query(...), ctx: TenantCtx = Depends(ADMIN_OR_PM)):
+    sb = get_user_supabase(ctx)
+    rows = sb.table("share_links").select("artifact_id,token,expires_at,revoked_at,created_at,created_by")\
+           .eq("org_id", ctx.org_id).eq("project_id", project_id).order("created_at", desc=True).execute().data or []
+
+    # attach artifact name if available
+    try:
+        a_ids = list({r["artifact_id"] for r in rows})
+        arts = sb.table("artifacts").select("id,name").in_("id", a_ids).execute().data or []
+        name_map = {a["id"]: a.get("name") for a in arts}
+        for r in rows: r["artifact_name"] = name_map.get(r["artifact_id"])
+    except Exception: ...
+
+    buf = io.StringIO(); w = csv.writer(buf)
+    w.writerow(["artifact_id","artifact_name","token","url","expires_at","revoked_at","created_at","created_by"])
+    for r in rows:
+        url = f"{(os.getenv('APP_BASE_URL','').rstrip('/'))}/share/{r['token']}"
+        w.writerow([r.get("artifact_id"), r.get("artifact_name") or "",
+                    r.get("token"), url, r.get("expires_at"), r.get("revoked_at"),
+                    r.get("created_at"), r.get("created_by")])
+    buf.seek(0)
+    return StreamingResponse(iter([buf.read()]), media_type="text/csv",
+      headers={"Content-Disposition": 'attachment; filename="share_links.csv"'} )
+
+
+Mount:
+
+from .routers import share_links_export
+app.include_router(share_links_export.router)
+
+
+Manager UI — Add an Export button:
+
+import { downloadGET } from "@/lib/download";
+<button className="px-3 py-2 border rounded" onClick={() =>
+  downloadGET(`/api/share/export.csv?project_id=${projectId}`, "share_links.csv")
+}>
+  Export CSV
+</button>
+
+🚀 Next Big Build
+
+Governance + ops polish: Audit Timeline (with CSV), Bulk Tagging (add/remove on selected docs), and Project Settings → Sharing Policy (disable public sharing + default expiry). All dev-safe with AuthFetch.
+
+A) Audit Timeline + CSV
+
+Backend — CSV export (filters kind/actor/date):
+
+server/routers/audit_export.py
+
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
+import io, csv
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/audit", tags=["audit"])
+
+@router.get("/export.csv")
+def export_audit(project_id: str = Query(...),
+                 kind: str | None = None,
+                 actor_id: str | None = None,
+                 after: str | None = None,
+                 before: str | None = None,
+                 ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    q = sb.table("audit_events").select("created_at,kind,actor_id,details")\
+         .eq("org_id", ctx.org_id).eq("project_id", project_id)
+    if kind: q = q.eq("kind", kind)
+    if actor_id: q = q.eq("actor_id", actor_id)
+    if after: q = q.gte("created_at", after)
+    if before: q = q.lte("created_at", before)
+    rows = q.order("created_at", desc=True).limit(5000).execute().data or []
+
+    buf = io.StringIO(); w = csv.writer(buf)
+    w.writerow(["created_at","kind","actor_id","details"])
+    for r in rows:
+        w.writerow([r.get("created_at"), r.get("kind"), r.get("actor_id"), (r.get("details") or "")])
+    buf.seek(0)
+    return StreamingResponse(iter([buf.read()]), media_type="text/csv",
+      headers={"Content-Disposition": 'attachment; filename="audit_timeline.csv"'} )
+
+
+Mount:
+
+from .routers import audit_export
+app.include_router(audit_export.router)
+
+
+UI page — Timeline with filters + Export:
+
+client/src/pages/AuditTimeline.tsx
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { getJSON } from "@/lib/authFetch";
+import { downloadGET } from "@/lib/download";
+
+export default function AuditTimeline(){
+  const { projectId } = useParams();
+  const [items,setItems]=useState<any[]>([]);
+  const [kind,setKind]=useState(""); const [actor,setActor]=useState("");
+  const [after,setAfter]=useState(""); const [before,setBefore]=useState("");
+
+  async function load(){
+    const qs = new URLSearchParams({ project_id: projectId! });
+    if (kind) qs.set("kind", kind);
+    if (actor) qs.set("actor_id", actor);
+    if (after) qs.set("after", after);
+    if (before) qs.set("before", before);
+    const d = await getJSON<{events:any[]}>(`/api/audit/list?${qs.toString()}`);
+    setItems(d.events||[]);
+  }
+  useEffect(()=>{ load(); },[projectId]);
+
+  return (
+    <div className="p-6 space-y-3">
+      <h1 className="text-xl font-semibold">Audit Timeline</h1>
+      <div className="flex flex-wrap gap-2 items-end">
+        <input className="border rounded p-2" placeholder="kind (e.g., stage.approved)" value={kind} onChange={e=>setKind(e.target.value)} />
+        <input className="border rounded p-2" placeholder="actor_id" value={actor} onChange={e=>setActor(e.target.value)} />
+        <input type="datetime-local" className="border rounded p-2" value={after} onChange={e=>setAfter(e.target.value)} />
+        <input type="datetime-local" className="border rounded p-2" value={before} onChange={e=>setBefore(e.target.value)} />
+        <button className="px-3 py-2 border rounded" onClick={load}>Apply</button>
+        <button className="px-3 py-2 border rounded" onClick={()=>{
+          const qs = new URLSearchParams({ project_id: projectId!, kind, actor_id: actor, after, before });
+          downloadGET(`/api/audit/export.csv?${qs.toString()}`, "audit_timeline.csv");
+        }}>Export CSV</button>
+      </div>
+      <div className="border rounded">
+        {items.map((e,i)=>(
+          <div key={i} className="p-2 border-b last:border-0 text-sm">
+            <div className="text-xs text-muted-foreground">{new Date(e.created_at).toLocaleString()}</div>
+            <div><b>{e.kind}</b> — {e.actor_id || "system"}</div>
+            <div className="text-xs text-muted-foreground break-all">{JSON.stringify(e.details)}</div>
+          </div>
+        ))}
+        {!items.length && <div className="p-3 text-sm text-muted-foreground">No events.</div>}
+      </div>
+    </div>
+  );
+}
+
+
+Add route:
+
+{ path: "/projects/:projectId/admin/audit-timeline", element: <AuditTimeline/> }
+
+B) Bulk Tagging (add/remove tag on selected docs)
+
+UI — on Documents/Library toolbar:
+
+import { postJSON } from "@/lib/authFetch";
+const [bulkTag,setBulkTag]=useState("");
+async function bulkAdd(){
+  const ids = selectedIds(); if (!ids.length || !bulkTag.trim()) return;
+  await Promise.all(ids.map(id => postJSON(`/api/artifacts/${id}/tags/add?project_id=${projectId}`, { name: bulkTag.trim() })));
+  toast({ title:"Tag added", description:`${bulkTag} to ${ids.length} item(s)` });
+  reloadDocs();
+}
+async function bulkRemove(){
+  const ids = selectedIds(); if (!ids.length || !bulkTag.trim()) return;
+  await Promise.all(ids.map(id => postJSON(`/api/artifacts/${id}/tags/remove?project_id=${projectId}`, { name: bulkTag.trim() })));
+  toast({ title:"Tag removed", description:`${bulkTag} from ${ids.length} item(s)` });
+  reloadDocs();
+}
+
+<div className="flex gap-2 items-center">
+  <input className="border rounded p-2" placeholder="tag…" value={bulkTag} onChange={e=>setBulkTag(e.target.value)} />
+  <button className="px-3 py-2 border rounded" onClick={bulkAdd}>Add Tag to Selected</button>
+  <button className="px-3 py-2 border rounded" onClick={bulkRemove}>Remove Tag</button>
+</div>
+
+
+(Backend tag routes already implemented earlier.)
+
+C) Project Settings → Sharing Policy
+
+SQL
+
+alter table public.org_comms_settings
+  add column if not exists sharing_enabled boolean not null default true,
+  add column if not exists default_share_expires_sec int not null default 3600;
+select pg_notify('pgrst','reload schema');
+
+
+Backend — small guard in share create:
+
+server/routers/share_links.py (inside create_link)
+
+# sharing policy
+pol = sb_user.table("org_comms_settings").select("sharing_enabled,default_share_expires_sec")\
+      .eq("org_id", ctx.org_id).single().execute().data or {}
+if not pol.get("sharing_enabled", True):
+    raise HTTPException(403, "Public sharing is disabled by policy")
+if not body.expires_sec:
+    body.expires_sec = int(pol.get("default_share_expires_sec", 3600))
+
+
+AdminComms — add toggles:
+
+<label className="text-sm flex items-center gap-2">
+  <input type="checkbox" checked={!!s.sharing_enabled} onChange={e=>setS({...s, sharing_enabled: e.target.checked})}/>
+  Enable public sharing (revocable links)
+</label>
+<label className="text-sm">Default share expiry (sec)
+  <input type="number" className="border rounded p-2 w-full" value={s.default_share_expires_sec||3600}
+         onChange={e=>setS({...s, default_share_expires_sec: parseInt(e.target.value||"3600")})}/>
+</label>
+
+
+ShareDialog — default expiry:
+
+const [sec, setSec] = useState(() => Number(localStorage.getItem("kap.defaultShareSec")||3600));
+useEffect(()=>{ /* optional: fetch /comms/settings to prefill and cache in localStorage */ },[]);
+
+D) Wire routes (just to be sure)
+
+server/main.py
+
+# Share links routers already included
+app.include_router(share_links.router)
+app.include_router(share_links.pub)
+app.include_router(share_links_export.router)
+app.include_router(audit_export.router)
+
+E) 2-minute validation
+
+Library → Manage Share Links shows entries; Export CSV downloads.
+
+Row menu → Revoke All Links clears links for that doc.
+
+Audit Timeline → filter + Export CSV works.
+
+Documents → select a few → Add/Remove Tag works.
+
+Admin Comms → disable sharing → ShareDialog “Create Link” returns 403 (policy), re-enable → works.
+
+Integrations → “Check Now” flips color when a URL in notes is reachable/unreachable.

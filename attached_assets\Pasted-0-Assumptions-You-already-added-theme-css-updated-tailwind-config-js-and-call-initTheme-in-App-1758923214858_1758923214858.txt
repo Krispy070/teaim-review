@@ -1,0 +1,370 @@
+0) Assumptions
+
+You already added theme.css, updated tailwind.config.js, and call initTheme() in App.tsx.
+
+Using lucide-react for icons (npm i lucide-react).
+
+1) Shell: AppFrame (Header + Sidebar + Content)
+// src/components/layout/AppFrame.tsx
+import { ReactNode } from "react";
+import { Bell, Menu, Sun, Moon } from "lucide-react";
+import { setTheme } from "../../theme";
+
+export function AppFrame({ sidebar, children }: { sidebar: ReactNode; children: ReactNode }) {
+  return (
+    <div className="min-h-screen bg-bg text-fg flex">
+      {/* Sidebar */}
+      <aside className="hidden md:flex w-64 shrink-0 flex-col border-r border-border bg-panel">
+        {sidebar}
+      </aside>
+
+      {/* Mobile top bar */}
+      <div className="md:hidden fixed inset-x-0 top-0 z-40 border-b border-border bg-panel">
+        <div className="h-14 px-4 flex items-center justify-between">
+          <button className="p-2 rounded border border-border">
+            <Menu className="h-5 w-5" />
+          </button>
+          <div className="font-semibold">TEAIM</div>
+          <div className="flex items-center gap-2">
+            <button onClick={() => setTheme('light')} className="p-2 rounded border border-border"><Sun className="h-4 w-4"/></button>
+            <button onClick={() => setTheme('dark')}  className="p-2 rounded border border-border"><Moon className="h-4 w-4"/></button>
+          </div>
+        </div>
+      </div>
+
+      {/* Main */}
+      <main className="flex-1 min-w-0 md:ml-0">
+        <Header />
+        <div className="p-6">{children}</div>
+      </main>
+    </div>
+  );
+}
+
+function Header() {
+  return (
+    <header className="sticky top-0 z-30 border-b border-border bg-panel/95 backdrop-blur">
+      <div className="h-16 px-6 flex items-center justify-between">
+        <div className="text-lg font-semibold">Project Dashboard</div>
+        <div className="flex items-center gap-3">
+          <ThemeSwitch />
+          <button className="relative p-2 rounded-xl border border-border hover:bg-panelc">
+            <Bell className="h-5 w-5"/>
+            <span className="absolute -top-1 -right-1 h-2.5 w-2.5 bg-primary rounded-full"></span>
+          </button>
+          <div className="h-8 w-8 rounded-full bg-panelc border border-border" />
+        </div>
+      </div>
+    </header>
+  );
+}
+
+function ThemeSwitch() {
+  return (
+    <div className="flex border border-border rounded-xl overflow-hidden">
+      <button onClick={() => setTheme('light')} className="px-3 py-1 text-sm hover:bg-panelc">Light</button>
+      <button onClick={() => setTheme('dark')}  className="px-3 py-1 text-sm hover:bg-panelc">Dark</button>
+    </div>
+  );
+}
+
+2) Sidebar (grouped, enterprise clean)
+// src/components/layout/Sidebar.tsx
+import { LayoutDashboard, Timeline, Workflow, FileText, CheckSquare, LineChart, ShieldCheck, Briefcase, HeartPulse } from "lucide-react";
+
+export function Sidebar() {
+  return (
+    <nav className="p-3">
+      <Brand />
+      <Section title="Planning" items={[
+        {icon: <LayoutDashboard/>, label: "Dashboard"},
+        {icon: <Timeline/>,        label: "Timeline"},
+        {icon: <Workflow/>,        label: "Workstreams"},
+      ]}/>
+      <Section title="Execution" items={[
+        {icon: <CheckSquare/>,     label: "Actions"},
+        {icon: <ShieldCheck/>,     label: "Stage Sign-Off"},
+        {icon: <FileText/>,        label: "Documents"},
+      ]}/>
+      <Section title="Insights" items={[
+        {icon: <LineChart/>,       label: "Data & Reporting"},
+        {icon: <HeartPulse/>,      label: "Team Wellness"},
+        {icon: <Briefcase/>,       label: "Financials"},
+      ]}/>
+    </nav>
+  );
+}
+
+function Brand() {
+  return (
+    <div className="px-2 py-3 mb-1">
+      <div className="text-xl font-bold tracking-tight">
+        TE<span className="text-brand-orange">AI</span>M
+      </div>
+      <div className="text-xs text-muted">Project Management Operating System</div>
+    </div>
+  );
+}
+
+function Section({title, items}:{title:string; items:{icon:JSX.Element; label:string}[]}) {
+  return (
+    <div className="mt-4">
+      <div className="px-2 text-[11px] uppercase tracking-wider text-muted">{title}</div>
+      <ul className="mt-1">
+        {items.map((it)=>(
+          <li key={it.label}>
+            <a href="#" className="
+              flex items-center gap-3 px-2.5 py-2 rounded-lg
+              text-sm text-fg hover:bg-panelc border border-transparent hover:border-border
+            ">
+              <span className="h-4 w-4 text-muted">{it.icon}</span>
+              <span>{it.label}</span>
+            </a>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+3) Reusable UI Primitives
+// src/components/ui/Button.tsx
+export function Button({children, className="", ...props}: any) {
+  return (
+    <button
+      className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl
+                  bg-primary text-primary-fg hover:bg-primary-hover
+                  border border-border shadow-sm focus:outline-none focus:shadow-focus ${className}`}
+      {...props}
+    >
+      {children}
+    </button>
+  );
+}
+
+// src/components/ui/Card.tsx
+export function Card({title, actions, children}:{title?:string; actions?:React.ReactNode; children:React.ReactNode}) {
+  return (
+    <div className="rounded-2xl bg-panel border border-border overflow-hidden">
+      {(title || actions) && (
+        <div className="px-4 py-3 flex items-center justify-between border-b border-border">
+          <div className="font-medium">{title}</div>
+          <div className="flex items-center gap-2">{actions}</div>
+        </div>
+      )}
+      <div className="p-4">{children}</div>
+    </div>
+  );
+}
+
+// src/components/ui/Kpi.tsx
+export function Kpi({label, value, tone='neutral'}:{
+  label:string; value:string|number; tone?:'neutral'|'success'|'warning'|'error'
+}) {
+  const toneCls = {
+    neutral: 'bg-panelc text-fg',
+    success: 'bg-success/15 text-success',
+    warning: 'bg-warning/15 text-warning',
+    error:   'bg-error/15   text-error',
+  }[tone];
+  return (
+    <div className={`rounded-xl border border-border px-4 py-3 ${toneCls}`}>
+      <div className="text-xs text-muted">{label}</div>
+      <div className="text-2xl font-semibold">{value}</div>
+    </div>
+  );
+}
+
+4) Dashboard (hero KPIs + actions)
+// src/pages/Dashboard.tsx
+import { AppFrame } from "../components/layout/AppFrame";
+import { Sidebar } from "../components/layout/Sidebar";
+import { Card } from "../components/ui/Card";
+import { Kpi } from "../components/ui/Kpi";
+import { Button } from "../components/ui/Button";
+import { Download, Share2 } from "lucide-react";
+import { TimelineBar } from "./components/TimelineBar";
+import { WellnessCard } from "./components/WellnessCard";
+
+export default function DashboardPage() {
+  return (
+    <AppFrame sidebar={<Sidebar/>}>
+      {/* KPIs */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+        <Kpi label="Risks Open" value="3" tone="error"/>
+        <Kpi label="Actions Overdue" value="7" tone="warning"/>
+        <Kpi label="Sign-offs Pending" value="2" tone="neutral"/>
+        <Kpi label="Team Wellness" value="Good" tone="success"/>
+      </div>
+
+      {/* Program Timeline */}
+      <Card
+        title="Program Timeline"
+        actions={
+          <div className="flex gap-2">
+            <Button className="bg-panel text-fg hover:bg-panelc">Week</Button>
+            <Button className="bg-panel text-fg hover:bg-panelc">Month</Button>
+            <Button className="bg-panel text-fg hover:bg-panelc">Quarter</Button>
+            <Button><Download className="h-4 w-4"/> Export</Button>
+            <Button className="bg-panel text-fg hover:bg-panelc"><Share2 className="h-4 w-4"/> Share</Button>
+          </div>
+        }
+      >
+        <div className="space-y-4">
+          <TimelineBar label="Discovery"     color="var(--brand-yellow)" progress={100}/>
+          <TimelineBar label="Design"        color="var(--brand-orange)" progress={80}/>
+          <TimelineBar label="Configuration" color="var(--brand-orange)" progress={55}/>
+          <TimelineBar label="Testing & Deploy" color="var(--panelc)" progress={20}/>
+        </div>
+      </Card>
+
+      {/* Wellness + Actions */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mt-6">
+        <WellnessCard className="lg:col-span-1"/>
+        <Card title="Overdue Actions" >
+          <ul className="space-y-3">
+            {["Map payroll cost centers","Finalize security roles","Approve HCM data loads"].map((t,i)=>(
+              <li key={i} className="flex items-center justify-between rounded-lg bg-panelc px-3 py-2">
+                <span>{t}</span>
+                <span className="text-xs rounded-full bg-error/15 text-error px-2 py-0.5 border border-border">Overdue</span>
+              </li>
+            ))}
+          </ul>
+        </Card>
+        <Card title="AI Suggestions">
+          <ul className="space-y-3">
+            <li className="rounded-lg border border-border px-3 py-2">
+              <div className="text-sm">Draft email to owners of 7 overdue actions?</div>
+              <div className="mt-2 flex gap-2">
+                <Button>Accept</Button>
+                <Button className="bg-panel text-fg hover:bg-panelc">Tweak</Button>
+              </div>
+            </li>
+          </ul>
+        </Card>
+      </div>
+    </AppFrame>
+  );
+}
+
+5) Timeline Bar (brand orange/yellow with arc hint)
+// src/pages/components/TimelineBar.tsx
+export function TimelineBar({label, progress, color}:{label:string; progress:number; color?:string}) {
+  return (
+    <div className="grid grid-cols-5 items-center gap-4">
+      <div className="col-span-1 text-sm text-muted">{label}</div>
+      <div className="col-span-4">
+        <div className="h-2 w-full rounded-full bg-panelc border border-border">
+          <div
+            className="h-2 rounded-full transition-all"
+            style={{ width: `${progress}%`, background: color || 'var(--primary)' }}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+6) Wellness Card (sparkline stub + status)
+// src/pages/components/WellnessCard.tsx
+import { Card } from "../../components/ui/Card";
+
+export function WellnessCard({className=""}:{className?:string}) {
+  const trend = [70,72,68,75,78,80]; // mock
+  return (
+    <Card title="Team Wellness" >
+      <div className="flex items-end justify-between">
+        <div>
+          <div className="text-4xl font-semibold text-success">Good</div>
+          <div className="text-sm text-muted mt-1">↑ improving this week</div>
+        </div>
+        <Sparkline data={trend}/>
+      </div>
+      <div className="mt-4 flex gap-2">
+        {["😊","😐","😟"].map(e=>(
+          <button key={e} className="px-3 py-1 rounded-lg border border-border bg-panel hover:bg-panelc">{e}</button>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+function Sparkline({data}:{data:number[]}) {
+  // Simple CSS sparkline – replace with chart lib later
+  const max = Math.max(...data);
+  const pts = data.map((v,i)=>`${(i/(data.length-1))*100},${100 - (v/max)*100}`).join(' ');
+  return (
+    <svg viewBox="0 0 100 100" className="h-16 w-32">
+      <polyline fill="none" stroke="var(--success)" strokeWidth="3" points={pts}/>
+    </svg>
+  );
+}
+
+7) Empty State (branded, replaces scary warnings)
+// src/components/ui/EmptyState.tsx
+export function EmptyState({title, hint, cta}:{title:string; hint?:string; cta?:React.ReactNode}) {
+  return (
+    <div className="rounded-2xl border border-dashed border-border bg-panel p-8 text-center">
+      <div className="text-lg font-medium">{title}</div>
+      {hint && <div className="mt-1 text-muted">{hint}</div>}
+      {cta && <div className="mt-4">{cta}</div>}
+    </div>
+  );
+}
+
+
+Use like:
+
+<EmptyState
+  title="No dashboard data yet"
+  hint="Upload your first document to unlock insights"
+  cta={<Button>Upload Document</Button>}
+/>
+
+8) Tag/Pill (for statuses, owners)
+// src/components/ui/Pill.tsx
+export function Pill({tone='neutral', children}:{tone?:'neutral'|'success'|'warning'|'error'|'info'; children:React.ReactNode;}) {
+  const map = {
+    neutral: 'bg-panelc text-fg',
+    success: 'bg-success/15 text-success',
+    warning: 'bg-warning/15 text-warning',
+    error:   'bg-error/15 text-error',
+    info:    'bg-accent/15 text-accent',
+  } as const;
+  return <span className={`text-xs px-2 py-0.5 rounded-full border border-border ${map[tone]}`}>{children}</span>;
+}
+
+9) Notifications Drawer (actionable)
+// src/components/notifications/Drawer.tsx
+import { Button } from "../ui/Button";
+export function NotificationsDrawer() {
+  const items = [
+    {title:"3 risks escalated", tone:"error"},
+    {title:"7 actions overdue", tone:"warning"},
+    {title:"Stage 2 sign-off ready", tone:"success"},
+  ];
+  return (
+    <div className="w-96 h-full bg-panel border-l border-border p-4">
+      <div className="text-lg font-semibold mb-3">Notifications</div>
+      <ul className="space-y-3">
+        {items.map((n,i)=>(
+          <li key={i} className="rounded-xl border border-border p-3 bg-panelc">
+            <div className="font-medium">{n.title}</div>
+            <div className="mt-2">
+              <Button className="mr-2">Open</Button>
+              <Button className="bg-panel text-fg hover:bg-panelc">Dismiss</Button>
+            </div>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+How to plug in fast
+
+Add these files.
+
+In your router, set <DashboardPage/> as a route.
+
+Swap your old components incrementally—this kit is theme-aware and matches the new brand immediately.

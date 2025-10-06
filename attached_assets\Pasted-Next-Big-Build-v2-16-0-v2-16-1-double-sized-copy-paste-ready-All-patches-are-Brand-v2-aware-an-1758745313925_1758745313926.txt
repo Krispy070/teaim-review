@@ -1,0 +1,275 @@
+Next Big Build v2.16.0 + v2.16.1 (double-sized, copy-paste ready)
+
+All patches are Brand v2–aware and dev-safe (if a table/column is missing, new endpoints return a safe empty result—no crashes).
+
+v2.16.0 — Workstreams tabs, Owner digest “stuck > N days”, nightly CR auto-archive
+1) Backend — Risks/Decisions/Workbooks by area (dev-safe)
+
+server/routers/risks_by_area.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/risks", tags=["risks"])
+
+@router.get("/by_area")
+def by_area(project_id: str = Query(...), area: str = Query(...),
+            status: str | None = "open", ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        q = sb.table("risks").select("id,title,owner,area,status,created_at")\
+             .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("area", area)
+        if status: q = q.eq("status", status)
+        rows = q.order("created_at", desc=True).limit(200).execute().data or []
+        return {"items": rows}
+    except Exception:
+        return {"items": []}
+
+
+server/routers/decisions_by_area.py (new)
+
+from fastapi import APIRouter, Depends, Query
+from ..tenant import TenantCtx
+from ..guards import member_ctx
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/decisions", tags=["decisions"])
+
+@router.get("/by_area")
+def by_area(project_id: str = Query(...), area: str = Query(...),
+            ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        rows = sb.table("decisions").select("id,title,decided_by,area,status,created_at")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("area", area)\
+               .order("created_at", desc=True).limit(200).execute().data or []
+        return {"items": rows}
+    except Exception:
+        return {"items": []}
+
+
+Workbooks by area (append in server/routers/workbooks.py)
+
+@router.get("/by_area")
+def by_area(project_id: str = Query(...), area: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        rows = sb.table("workbooks").select("id,name,area,asof_date,due_date,iterations_planned,iterations_done,status")\
+               .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("area", area)\
+               .order("due_date", asc=True).limit(200).execute().data or []
+        return {"items": rows}
+    except Exception:
+        return {"items": []}
+
+
+Mount in server/main.py:
+
+from .routers import risks_by_area, decisions_by_area
+app.include_router(risks_by_area.router)
+app.include_router(decisions_by_area.router)
+# workbooks router already mounted earlier
+
+2) Frontend — Workstream Area tabs (Open / Risks / Decisions / Workbooks)
+
+Patch client/src/pages/WorkstreamArea.tsx (add a tab bar + loaders)
+
+const [tab,setTab]=useState<"open"|"risks"|"decisions"|"workbooks">("open");
+const [risks,setRisks]=useState<any[]>([]);
+const [decs,setDecs]=useState<any[]>([]);
+const [wbs,setWbs]=useState<any[]>([]);
+
+useEffect(()=>{ (async()=>{ 
+  if(tab==="risks"){ const d=await getJSON(`/api/risks/by_area?project_id=${projectId}&area=${encodeURIComponent(area)}&status=open`); setRisks(d.items||[]); }
+  if(tab==="decisions"){ const d=await getJSON(`/api/decisions/by_area?project_id=${projectId}&area=${encodeURIComponent(area)}`); setDecs(d.items||[]); }
+  if(tab==="workbooks"){ const d=await getJSON(`/api/workbooks/by_area?project_id=${projectId}&area=${encodeURIComponent(area)}`); setWbs(d.items||[]); }
+})(); },[tab, projectId, area]);
+
+{/* Tab bar */}
+<div className="flex items-center gap-2 mb-2">
+  {["open","risks","decisions","workbooks"].map(t=>(
+    <button key={t} className={`brand-btn text-xs ${tab===t?'pulse-once':''}`} onClick={()=>setTab(t as any)}>
+      {t[0].toUpperCase()+t.slice(1)}
+    </button>
+  ))}
+</div>
+
+{/* Tab content */}
+{tab==="open" && /* your existing Open Items table (with quick edit) */}
+
+{tab==="risks" && (
+  <div className="border rounded overflow-auto">
+    <table className="w-full text-xs"><thead><tr><th className="text-left p-1">Title</th><th className="text-left p-1">Owner</th><th className="text-left p-1">Created</th></tr></thead>
+    <tbody>{risks.map(r=>(<tr key={r.id}><td className="p-1">{r.title||r.id}</td><td className="p-1">{r.owner||"—"}</td><td className="p-1">{r.created_at?new Date(r.created_at).toLocaleString():"—"}</td></tr>))}
+    {!risks.length && <tr><td className="p-2 text-muted-foreground" colSpan={3}>No risks.</td></tr>}</tbody></table>
+  </div>
+)}
+
+{tab==="decisions" && (
+  <div className="border rounded overflow-auto">
+    <table className="w-full text-xs"><thead><tr><th className="text-left p-1">Title</th><th className="text-left p-1">By</th><th className="text-left p-1">Created</th></tr></thead>
+    <tbody>{decs.map(d=>(<tr key={d.id}><td className="p-1">{d.title||d.id}</td><td className="p-1">{d.decided_by||"—"}</td><td className="p-1">{d.created_at?new Date(d.created_at).toLocaleString():"—"}</td></tr>))}
+    {!decs.length && <tr><td className="p-2 text-muted-foreground" colSpan={3}>No decisions.</td></tr>}</tbody></table>
+  </div>
+)}
+
+{tab==="workbooks" && (
+  <div className="border rounded overflow-auto">
+    <table className="w-full text-xs"><thead><tr><th className="text-left p-1">Name</th><th className="text-left p-1">As-of</th><th className="text-left p-1">Due</th><th className="text-left p-1">Runs</th><th className="text-left p-1">Status</th></tr></thead>
+    <tbody>{wbs.map(w=>(<tr key={w.id}><td className="p-1">{w.name}</td><td className="p-1">{w.asof_date||"—"}</td><td className="p-1">{w.due_date||"—"}</td><td className="p-1">{w.iterations_done||0}/{w.iterations_planned||0}</td><td className="p-1">{w.status||"—"}</td></tr>))}
+    {!wbs.length && <tr><td className="p-2 text-muted-foreground" colSpan={5}>No workbooks.</td></tr>}</tbody></table>
+  </div>
+)}
+
+
+Mark-seen on area entry already clears the red dot—no change needed.
+
+3) Backend — Owner digest: stuck > N days
+
+Patch server/routers/owner_digest.py (replace digest_send body)
+
+@router.post("/daily")
+def daily(project_id: str = Query(...), stuck_days:int=5,
+          ctx: TenantCtx = Depends(require_role({"owner","admin","pm"}))):
+    sb = get_user_supabase(ctx); sent=0
+    try:
+        crs = sb.table("changes").select("id,title,area,priority,status,due_date,assignee,created_at")\
+              .eq("org_id",ctx.org_id).eq("project_id",project_id).execute().data or []
+        open_cr = [c for c in crs if (c.get("status") or "").lower() not in ("deployed","closed")]
+        owners = sb.table("area_admins").select("area,user_id").eq("org_id",ctx.org_id).eq("project_id",project_id).execute().data or []
+        area_to_owners = {}; [area_to_owners.setdefault(r["area"], set()).add(r["user_id"]) for r in owners]
+        profiles = sb.table("users_profile").select("user_id,email").execute().data or []
+        uid_to_email = {p["user_id"]: p.get("email") for p in profiles if p.get("user_id")}
+        recips=set()
+        for c in open_cr:
+            if c.get("assignee"): recips.add(c["assignee"])
+            for uid in area_to_owners.get(c.get("area") or "", []):
+                em = uid_to_email.get(uid); 
+                if em: recips.add(em)
+        from ..email.util import mailgun_send_html, send_guard
+        base = os.getenv("APP_BASE_URL","").rstrip("/")
+        for em in recips:
+            ok,_ = send_guard(sb, ctx.org_id, project_id, "owner_digest", em)
+            if not ok: continue
+            body = "<h3>Open CRs</h3><ul>"
+            mine = [c for c in open_cr if (c.get("assignee")==em or em in uid_to_email.values() and c.get("area") in area_to_owners)]
+            if not mine: body += "<li>None</li>"
+            else:
+                for c in mine[:50]:
+                    age = "n/a"
+                    try:
+                        created = datetime.fromisoformat((c.get("created_at") or "").replace("Z","+00:00")).date()
+                        age = (datetime.now(timezone.utc).date() - created).days
+                    except Exception: ...
+                    stuck = (isinstance(age,int) and age>stuck_days)
+                    flag = " ⏳" if stuck else ""
+                    link = f"{base}/projects/{project_id}/changes/list"
+                    body += f"<li>{c.get('title')} — {c.get('area')} • P:{c.get('priority')} • age {age}d{flag} • <a href='{link}'>open</a></li>"
+            body += "</ul>"
+            try: mailgun_send_html([em], f"[TEAIM] Daily CR Digest (stuck>{stuck_days}d flagged)", body); sent+=1
+            except Exception: ...
+        return {"ok": True, "sent": sent}
+    except Exception:
+        return {"ok": False, "sent": sent}
+
+4) Scheduler — nightly auto-archive closed CRs (>30 days)
+
+server/scheduler.py (append)
+
+async def auto_archive_closed_crs_nightly():
+    sbs = get_service_supabase()
+    while True:
+        try:
+            try:
+                rows = sbs.table("changes").select("id,org_id,project_id,status,updated_at")\
+                       .eq("status","closed").limit(5000).execute().data or []
+            except Exception:
+                rows=[]
+            import datetime as dt
+            now = dt.datetime.now(dt.timezone.utc)
+            for r in rows:
+                try:
+                    up = r.get("updated_at") or r.get("created_at")
+                    if not up: continue
+                    dtup = dt.datetime.fromisoformat(up.replace("Z","+00:00"))
+                    if (now - dtup).days >= 30:
+                        # set status archived if column exists; otherwise leave
+                        try:
+                            sbs.table("changes").update({"status":"archived"})\
+                               .eq("org_id",r["org_id"]).eq("project_id",r["project_id"]).eq("id",r["id"]).execute()
+                        except Exception: ...
+                except Exception: ...
+        except Exception: ...
+        await asyncio.sleep(24*60*60)
+
+
+Register in server/main.py:
+
+from .scheduler import auto_archive_closed_crs_nightly
+@app.on_event("startup")
+async def _start_5():
+    asyncio.create_task(auto_archive_closed_crs_nightly())
+
+v2.16.1 — Releases inline notes + Ops queue retries/backoff + printable polish
+5) Releases — inline Notes preview & print
+
+Patch client/src/pages/Releases.tsx (add modal preview)
+
+const [notesOpen,setNotesOpen]=useState<string>("");
+{notesOpen && (
+  <div className="fixed inset-0 bg-black/40 z-[200]" onClick={()=>setNotesOpen("")}>
+    <div className="mx-auto mt-[6vh] w-[880px] max-w-[97%] bg-white dark:bg-neutral-900 rounded shadow-xl border" onClick={e=>e.stopPropagation()}>
+      <div className="p-2 border-b text-sm font-medium">Release Notes</div>
+      <iframe className="w-full h-[70vh] bg-white" srcDoc={`<iframe src="/api/releases/notes.html?project_id=${projectId}&id=${notesOpen}" width="100%" height="100%"></iframe>`}/>
+      <div className="p-2 border-t flex justify-end"><button className="brand-btn text-xs" onClick={()=>window.print()}>Print</button></div>
+    </div>
+  </div>
+)}
+// In ReleaseCard
+<button className="brand-btn text-[11px]" onClick={()=>setNotesOpen(rel.id)}>Notes</button>
+
+
+Print CSS was added earlier; this renders clean for PDF.
+
+6) Ops — Queue retries/backoff (attempts, next_try, last_error)
+
+DB note: if your comms_queue doesn’t have attempts:int, next_try:timestamp, last_error:text, this code will just skip updates (dev-safe).
+
+server/scheduler.py (extend process_comms_queue() header selection & error handling)
+
+# when selecting due items:
+try:
+    qs = sbs.table("comms_queue").select("id,org_id,project_id,kind,to_token,to_email,details,attempts,next_try")\
+         .lte("not_before", now).or_(f"next_try.is.null,next_try.lte.{now}")\
+         .is_("sent_at","null").limit(50).execute().data or []
+except Exception:
+    qs = []
+
+# wrap each send with try/except; on failure, backoff:
+except Exception as e:
+    try:
+        att = (q.get("attempts") or 0) + 1
+        import datetime as dt
+        delay = min(24*60, (2**min(att,5))*15)  # minutes
+        nxt = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=delay)).isoformat()
+        sbs.table("comms_queue").update({"attempts": att, "next_try": nxt, "last_error": str(e)[:500]})\
+           .eq("id", q["id"]).execute()
+    except Exception: ...
+    continue
+
+
+Ops queue card (add attempt info):
+
+// fetch queue pending with attempts/next_try (create a tiny endpoint if needed; or piggyback scheduler_health if you prefer)
+// For brevity, show last_error and attempts in an overflow list.
+
+2-Minute Validation
+
+Workstreams Area: tabbed sub-sections (Open/Risks/Decisions/Workbooks) keep users in one place
+
+Owner digest flags stuck > N days CRs; nightly auto-archive closed >30d
+
+Releases: inline Notes preview with one-click Print to PDF; ICS already live
+
+Ops: queue retries/backoff with attempts/next_try/last_error tracked

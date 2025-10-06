@@ -1,0 +1,459 @@
+Next Big Build v2.5 that makes TEAIM feel like your customer’s app, and plants the seeds to make the dashboard smarter over time.
+
+This push delivers, copy-paste style:
+
+Branding / Logos (customer + vendor) — DB + API + Admin UI + header component
+
+Logo usage across: top header, sign-off pages, sign-off emails, weekly digest emails
+
+Method Learner (seed) — DB + API to capture stage outcomes; auto-records on sign-off; tiny insights page
+
+Route aliases + dev-safe fallbacks (so it works even if /api is stripped)
+
+0) DB — org branding + method learner
+
+Run in Supabase SQL:
+
+-- Branding (org-scoped, optional project override later)
+create table if not exists public.org_branding (
+  org_id uuid primary key,
+  customer_name text,
+  customer_logo_bucket text,
+  customer_logo_path text,
+  vendor_name text,                 -- e.g., "Workday", "SAP", "Oracle"
+  vendor_logo_bucket text,
+  vendor_logo_path text,
+  theme_color text default '#111111',
+  header_text text,
+  updated_at timestamptz not null default now()
+);
+alter table public.org_branding enable row level security;
+
+create policy "branding_read_member" on public.org_branding
+for select using (org_id = public.current_org());
+create policy "branding_admin_upsert" on public.org_branding
+for insert with check (org_id = public.current_org() and public.has_role(org_id, null, array['owner','admin']));
+create policy "branding_admin_update" on public.org_branding
+for update using (org_id = public.current_org() and public.has_role(org_id, null, array['owner','admin']))
+with check (org_id = public.current_org());
+
+-- Method learner: minimal signal store
+create table if not exists public.method_metrics (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid not null,
+  project_id uuid not null,
+  kind text not null,        -- e.g., "stage.signed", "review.applied"
+  stage_id uuid,
+  stage_title text,
+  stage_area text,
+  value numeric,             -- generic numeric (e.g., days)
+  meta jsonb,
+  created_at timestamptz not null default now()
+);
+alter table public.method_metrics enable row level security;
+
+create policy "metrics_select_member" on public.method_metrics
+for select using (org_id = public.current_org() and public.is_member(org_id, project_id));
+
+create policy "metrics_insert_pm" on public.method_metrics
+for insert with check (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm']));
+
+select pg_notify('pgrst','reload schema');
+
+1) Backend — Branding API + uploads
+1A) Router
+
+server/routers/branding.py
+
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from ..tenant import TenantCtx
+from ..guards import require_role, member_ctx
+from ..deps import get_user_supabase, get_service_supabase
+import os, datetime as dt
+
+router = APIRouter(prefix="/api/branding", tags=["branding"])
+ADMIN = require_role({"owner","admin"})
+
+@router.get("/settings")
+def get_settings(ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    r = sb.table("org_branding").select("*").eq("org_id", ctx.org_id).single().execute()
+    return r.data or {"org_id": ctx.org_id, "theme_color":"#111111"}
+
+@router.post("/settings")
+def set_settings(body: dict, ctx: TenantCtx = Depends(ADMIN)):
+    sb = get_user_supabase(ctx)
+    body = dict(body or {})
+    body["org_id"] = ctx.org_id
+    body["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    sb.table("org_branding").upsert(body, on_conflict="org_id").execute()
+    return {"ok": True}
+
+def _upload_logo(file: UploadFile, prefix: str, ctx: TenantCtx):
+    sbs = get_service_supabase()
+    bucket = os.getenv("BRANDING_BUCKET","artifacts")
+    key = f"org/{ctx.org_id}/branding/{prefix}__{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d_%H%M%S')}__{file.filename}"
+    sbs.storage().from_(bucket).upload(key, file.file.read(), {"content-type": file.content_type or "image/png", "upsert": True})
+    return bucket, key
+
+@router.post("/upload_customer")
+def upload_customer_logo(file: UploadFile = File(...), ctx: TenantCtx = Depends(ADMIN)):
+    bucket, key = _upload_logo(file, "customer", ctx)
+    sb = get_user_supabase(ctx)
+    sb.table("org_branding").upsert({
+        "org_id": ctx.org_id, "customer_logo_bucket": bucket, "customer_logo_path": key,
+        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat()
+    }, on_conflict="org_id").execute()
+    return {"ok": True, "bucket": bucket, "path": key}
+
+@router.post("/upload_vendor")
+def upload_vendor_logo(file: UploadFile = File(...), ctx: TenantCtx = Depends(ADMIN)):
+    bucket, key = _upload_logo(file, "vendor", ctx)
+    sb = get_user_supabase(ctx)
+    sb.table("org_branding").upsert({
+        "org_id": ctx.org_id, "vendor_logo_bucket": bucket, "vendor_logo_path": key,
+        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat()
+    }, on_conflict="org_id").execute()
+    return {"ok": True, "bucket": bucket, "path": key}
+
+
+Mount in server/main.py:
+
+from .routers import branding
+app.include_router(branding.router)
+
+
+Alias (if proxy strips /api):
+
+from fastapi import APIRouter
+branding_alias = APIRouter(prefix="/branding", tags=["branding"])
+for r in branding.router.routes:
+    branding_alias.add_api_route(r.path.replace("/api/branding","") or "/", r.endpoint, methods=r.methods)
+app.include_router(branding_alias)
+
+2) Frontend — Branding Admin UI + header component
+2A) Branding page
+
+client/src/pages/BrandingSettings.tsx
+
+import { useEffect, useState } from "react";
+import PageHeaderHint from "@/components/PageHeaderHint";
+
+export default function BrandingSettings(){
+  const [s,setS]=useState<any>(null);
+  const [busy,setBusy]=useState(false);
+
+  async function load(){
+    const r = await fetch(`/api/branding/settings`, { credentials:"include" });
+    if (r.ok) setS(await r.json());
+  }
+  useEffect(()=>{ load(); },[]);
+
+  async function save(){
+    setBusy(true);
+    await fetch(`/api/branding/settings`, { method:"POST", credentials:"include", headers:{'Content-Type':'application/json'}, body: JSON.stringify(s) });
+    setBusy(false); alert("Saved");
+  }
+  async function upload(which:"customer"|"vendor", file: File){
+    const fd = new FormData(); fd.append("file", file);
+    const r = await fetch(`/api/branding/upload_${which}`, { method:"POST", credentials:"include", body: fd as any });
+    if (r.ok){ await load(); }
+  }
+
+  if (!s) return <div className="p-6">Loading…</div>;
+  return (
+    <div className="p-6 space-y-3">
+      <PageHeaderHint id="branding" title="Branding" intro="Add customer & vendor logos and theme color." bullets={["Shown in header, sign-off pages, and digest emails"]}/>
+      <div className="grid md:grid-cols-2 gap-3">
+        <div className="border rounded p-3 space-y-2">
+          <div className="text-sm font-medium">Customer</div>
+          <input className="border rounded p-2 w-full" placeholder="Customer Name" value={s.customer_name||""} onChange={e=>setS({...s, customer_name:e.target.value})}/>
+          <input type="file" accept="image/*" onChange={e=> e.target.files && upload("customer", e.target.files[0])}/>
+          <div className="text-xs text-muted-foreground">{s.customer_logo_path || "No logo uploaded"}</div>
+        </div>
+        <div className="border rounded p-3 space-y-2">
+          <div className="text-sm font-medium">Vendor</div>
+          <input className="border rounded p-2 w-full" placeholder="Vendor Name (e.g., Workday)" value={s.vendor_name||""} onChange={e=>setS({...s, vendor_name:e.target.value})}/>
+          <input type="file" accept="image/*" onChange={e=> e.target.files && upload("vendor", e.target.files[0])}/>
+          <div className="text-xs text-muted-foreground">{s.vendor_logo_path || "No logo uploaded"}</div>
+        </div>
+      </div>
+      <div className="border rounded p-3 space-y-2">
+        <div className="text-sm font-medium">Theme</div>
+        <input className="border rounded p-2 w-[140px]" placeholder="#111111" value={s.theme_color||"#111111"} onChange={e=>setS({...s, theme_color:e.target.value})}/>
+        <input className="border rounded p-2 w-full" placeholder="Header Text (optional)" value={s.header_text||""} onChange={e=>setS({...s, header_text:e.target.value})}/>
+      </div>
+      <button className="px-3 py-2 border rounded" disabled={busy} onClick={save}>{busy?"Saving…":"Save"}</button>
+    </div>
+  );
+}
+
+
+Route (admin-only):
+
+{ path: "/admin/branding", element: <BrandingSettings/> }
+
+2B) Header renderer component
+
+client/src/components/BrandedHeader.tsx
+
+import { useEffect, useState } from "react";
+
+export default function BrandedHeader(){
+  const [b,setB]=useState<any>(null);
+  useEffect(()=>{ (async()=>{ try{ const r=await fetch(`/api/branding/settings`, { credentials:"include" }); if(r.ok) setB(await r.json()); }catch{} })(); },[]);
+  if (!b) return null;
+
+  const color = b.theme_color || "#111111";
+  const cust = b.customer_logo_path ? `/storage/${b.customer_logo_path}` : null; // If you expose storage via proxy, else use signed URLs
+  const vend = b.vendor_logo_path ? `/storage/${b.vendor_logo_path}` : null;
+
+  return (
+    <div className="w-full border-b" style={{borderColor:color}}>
+      <div className="flex items-center justify-between p-2">
+        <div className="flex items-center gap-2">
+          {cust && <img src={cust} alt="customer" className="h-6" />}
+          {b.customer_name && <div className="text-sm font-medium">{b.customer_name}</div>}
+        </div>
+        {b.header_text && <div className="text-xs text-muted-foreground">{b.header_text}</div>}
+        <div className="flex items-center gap-2">
+          {vend && <img src={vend} alt="vendor" className="h-6" />}
+          <div className="text-sm font-semibold" style={{color}}>TEAIM</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+Add it once in your authed layout (above the main content), or replace the existing top bar branding block:
+
+import BrandedHeader from "@/components/BrandedHeader";
+// ...
+<BrandedHeader />
+
+
+(If you don’t serve /storage/... publicly, you can add a tiny image proxy endpoint later; for now this is fine in dev or use a signed URL via storage client.)
+
+3) Use logos in sign-off HTML & public sign page
+3A) Generator: include logos in HTML
+
+Patch server/routers/signoff_docs_gen.py (or where your HTML builder lives):
+
+def _branding_header(sb, org_id: str):
+    try:
+        b = sb.table("org_branding").select("*").eq("org_id", org_id).single().execute().data
+    except Exception:
+        b = None
+    if not b: return ""
+    # naive public path; in prod, create signed URLs or expose proxy
+    cust = b.get("customer_logo_path"); vend = b.get("vendor_logo_path")
+    cust_img = f"/storage/{cust}" if cust else None
+    vend_img = f"/storage/{vend}" if vend else None
+    color = b.get("theme_color") or "#111111"
+    text = b.get("header_text") or ""
+    h = '<div style="display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid {0};padding:6px 0">'.format(color)
+    left = (f'<img src="{cust_img}" alt="customer" style="height:24px"/>' if cust_img else '') + (f' <span style="font-weight:600;">{b.get("customer_name","")}</span>' if b.get("customer_name") else '')
+    right = (f'<img src="{vend_img}" alt="vendor" style="height:24px"/>' if vend_img else '') + ' <span style="font-weight:700;color:{0}">TEAIM</span>'.format(color)
+    mid = f'<span style="font-size:12px;color:#666">{text}</span>' if text else ''
+    return h + f'<div>{left}</div><div>{mid}</div><div>{right}</div></div>'
+
+# In your generate_from_prompt or document build:
+html = _branding_header(sb, ctx.org_id) + _html(body.title, body, code)
+
+3B) Public token sign page: header
+
+Patch server/routers/signoff_docs.py:
+
+from .signoff_docs_gen import _branding_header  # reuse
+
+@pub.get("/signoff/doc/{token}", response_class=HTMLResponse)
+def open_doc(token: str):
+    # ... fetch row & doc ...
+    bheader = _branding_header(sbs, d["org_id"])  # use service client with org_id from doc
+    html = d.get("html") or f"<p>Download: {d.get('storage_path')}</p>"
+    return HTMLResponse(f"<html><body style='font-family:sans-serif;max-width:880px;margin:auto'>{bheader}{html}<hr/>..."
+                        f"</body></html>")
+
+4) Digest email header with logos
+
+Patch your digest send helper (where you build html):
+
+def _digest_header(sb, org_id: str):
+    try:
+        b = sb.table("org_branding").select("*").eq("org_id", org_id).single().execute().data
+    except Exception: b = None
+    if not b: return ""
+    color = b.get("theme_color") or "#111111"
+    cust = b.get("customer_logo_path"); vend = b.get("vendor_logo_path")
+    cust_img = f"/storage/{cust}" if cust else None
+    vend_img = f"/storage/{vend}" if vend else None
+    left = f'<img src="{cust_img}" alt="customer" style="height:20px"/>' if cust_img else (b.get("customer_name") or "")
+    right = (f'<img src="{vend_img}" alt="vendor" style="height:20px"/>' if vend_img else '') + f' <span style="font-weight:700;color:{color}">TEAIM</span>'
+    return f'<div style="display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid {color};padding:6px 0"><div>{left}</div><div>{right}</div></div>'
+
+# When composing digest HTML per user:
+html = _digest_header(sb, ctx.org_id) + _digest_html_filtered(code, counts, wanted)
+
+5) Method Learner — capture & simple insights
+5A) Router to record and read metrics
+
+server/routers/method_metrics.py
+
+from fastapi import APIRouter, Depends, Query
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase, get_service_supabase
+from datetime import datetime, timezone
+
+router = APIRouter(prefix="/api/method", tags=["method"])
+
+@router.post("/record_stage_signed")
+def record_stage_signed(stage_id: str, project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sbs = get_service_supabase()
+    # try to compute duration if stage has dates
+    st = sbs.table("project_stages").select("title,area,start_date,end_date,created_at")\
+         .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", stage_id).single().execute().data
+    dur = None
+    if st and st.get("start_date") and st.get("end_date"):
+        try:
+            sd = datetime.fromisoformat(st["start_date"]); ed = datetime.fromisoformat(st["end_date"])
+            dur = (ed - sd).days
+        except: pass
+    sbs.table("method_metrics").insert({
+        "org_id": ctx.org_id, "project_id": project_id,
+        "kind":"stage.signed", "stage_id": stage_id,
+        "stage_title": st and st.get("title"), "stage_area": st and st.get("area"),
+        "value": dur, "meta": {"computed":"signed"}
+    }).execute()
+    return {"ok": True}
+
+@router.get("/insights")
+def insights(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    # simple aggregates
+    rows = sb.table("method_metrics").select("stage_title,stage_area,value,created_at")\
+            .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("kind","stage.signed")\
+            .order("created_at", desc=True).limit(500).execute().data or []
+    # compute median by stage_title (client can also do it)
+    by = {}
+    for r in rows:
+        key = (r.get("stage_title") or "Stage", r.get("stage_area") or "")
+        by.setdefault(key, []).append(r.get("value"))
+    med = []
+    for (title, area), vals in by.items():
+        vs = [v for v in vals if isinstance(v,(int,float))]
+        if vs:
+            vs.sort(); n=len(vs); m = (vs[n//2] if n%2==1 else (vs[n//2-1]+vs[n//2])/2)
+            med.append({"title": title, "area": area, "median_days": m})
+    return {"recent": rows[:10], "medians": med[:20]}
+
+
+Mount in server/main.py:
+
+from .routers import method_metrics
+app.include_router(method_metrics.router)
+
+5B) Hook into sign-off success to record metric
+
+Patch server/routers/signoff_docs.py (after success in token_sign):
+
+# record
+try:
+    sbs.table("method_metrics").insert({
+      "org_id": d["org_id"], "project_id": d["project_id"],
+      "kind": "stage.signed", "stage_id": None,
+      "stage_title": None, "stage_area": None, "value": None,
+      "meta": {"doc_id": row["doc_id"], "event":"signoff.doc.signed"}
+    }).execute()
+except Exception: ...
+
+
+(If you know the stage_id when sending the doc, you can store it in the doc and insert it here to compute better durations. For now we log the event.)
+
+5C) Insights UI
+
+client/src/pages/MethodInsights.tsx
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import PageHeaderHint from "@/components/PageHeaderHint";
+
+export default function MethodInsights(){
+  const { projectId } = useParams();
+  const [d,setD]=useState<any>(null);
+  async function load(){
+    const r = await fetch(`/api/method/insights?project_id=${projectId}`, { credentials:"include" });
+    if (r.ok) setD(await r.json());
+  }
+  useEffect(()=>{ load(); },[projectId]);
+
+  return (
+    <div className="p-6 space-y-3">
+      <PageHeaderHint id="method" title="Method Insights" intro="Early signals to refine the methodology and dashboard." bullets={[
+        "Captures stage sign events and simple durations", "Shows recent events and medians by stage/area"
+      ]}/>
+      {!d ? <div>Loading…</div> :
+        <div className="grid md:grid-cols-2 gap-3">
+          <div className="border rounded p-3">
+            <div className="text-sm font-medium mb-1">Recent</div>
+            <div className="space-y-1 text-sm">
+              {(d.recent||[]).map((r:any,i:number)=>(
+                <div key={i} className="flex justify-between">
+                  <span>{r.stage_title || "(doc sign)"} {r.stage_area? `• ${r.stage_area}`:""}</span>
+                  <span className="text-xs text-muted-foreground">{r.value ?? "—"} d</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="border rounded p-3">
+            <div className="text-sm font-medium mb-1">Medians</div>
+            <div className="space-y-1 text-sm">
+              {(d.medians||[]).map((m:any,i:number)=>(
+                <div key={i} className="flex justify-between">
+                  <span>{m.title} {m.area?`• ${m.area}`:""}</span>
+                  <span className="text-xs text-muted-foreground">{m.median_days} d</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      }
+    </div>
+  );
+}
+
+
+Route:
+
+{ path: "/projects/:projectId/admin/method", element: <MethodInsights/> }
+
+6) Storage note (dev vs prod)
+
+In dev we used /storage/<path> for images. In prod you can either:
+
+expose a proxy /api/storage/{bucket}/{path...} that signs and streams images, or
+
+generate signed URLs server-side and return absolute links in branding/settings.
+
+For now, dev is fine.
+
+7) Mount checklist (once)
+from .routers import branding, method_metrics
+app.include_router(branding.router)
+app.include_router(method_metrics.router)
+# aliases if needed...
+branding_alias = APIRouter(prefix="/branding")
+for r in branding.router.routes:
+    branding_alias.add_api_route(r.path.replace("/api/branding","") or "/", r.endpoint, methods=r.methods)
+app.include_router(branding_alias)
+
+8) 2-minute validation
+
+Branding: upload customer + vendor logos, set color → header shows both logos and TEAIM; Composer & sign-off token page show header; digest email shows header.
+
+Method Learner: sign a doc → method_metrics receives a row; Insights shows event; medians compute when dates exist.
+
+Slack/Teams deep links: event cards have “Open in TEAIM”; link navigates correctly.
+
+No auth regressions: dev headers and route aliases keep working.

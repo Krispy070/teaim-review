@@ -1,0 +1,539 @@
+Love it. Let’s make TEAIM feel “alive” even before data flows, and wire the Team page so access, visibility, and workflows actually originate there.
+
+Below is a single, coherent build you can paste in. It includes:
+
+PageHeaderHint component + headers on all major pages (clear “what appears here” text with dismiss)
+
+Team Access Controls (DB, APIs, UI) to set: visibility, sign-off authority (per area or whole project), and update preferences
+
+Stage Sign-off authority enforcement (per-area) without breaking existing admin/signer flows
+
+Subscriptions extended (actions/risks/decisions/reminders) so the Team page truly drives comms
+
+I’ve kept everything dev-safe (uses your AuthFetch) and aligned with your proxy behavior.
+
+1) Universal headers — PageHeaderHint
+1A) Component
+
+client/src/components/PageHeaderHint.tsx
+
+import { useEffect, useState } from "react";
+
+type Props = {
+  id: string;                    // unique per page, e.g. "dashboard"
+  title: string;                 // H1
+  intro?: string;                // brief sentence
+  bullets?: string[];            // what will appear here
+};
+
+export default function PageHeaderHint({ id, title, intro, bullets }: Props){
+  const key = `kap.hint.dismissed:${id}`;
+  const [hide, setHide] = useState<boolean>(false);
+  useEffect(()=>{ setHide(localStorage.getItem(key)==="1"); }, [key]);
+  if (hide) return (
+    <div className="flex items-center justify-between mb-3">
+      <h1 className="text-2xl font-semibold">{title}</h1>
+      <button className="text-xs underline" onClick={()=>{localStorage.removeItem(key); setHide(false);}}>Show hint</button>
+    </div>
+  );
+  return (
+    <div className="mb-3">
+      <div className="flex items-start justify-between">
+        <h1 className="text-2xl font-semibold">{title}</h1>
+        <button className="text-xs underline" onClick={()=>{localStorage.setItem(key,"1"); setHide(true);}}>Dismiss</button>
+      </div>
+      <div className="mt-1 border rounded p-3 bg-neutral-50 dark:bg-neutral-900/40">
+        {intro && <div className="text-sm mb-1">{intro}</div>}
+        {bullets && bullets.length>0 && (
+          <ul className="list-disc pl-5 text-sm text-muted-foreground">
+            {bullets.map((b,i)=><li key={i}>{b}</li>)}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
+1B) Drop on pages (examples)
+
+Use the same pattern on each page; here are good defaults:
+
+Dashboard
+
+<PageHeaderHint
+  id="dashboard"
+  title="Project Dashboard"
+  intro="This page summarizes project health and activity."
+  bullets={[
+    "KPIs: Documents, Actions, Risks, Decisions, Stages in review",
+    "Chips: Wellness, Digest schedule, Overdue / Due soon",
+    "Widgets: Restore activity, Overdue actions, Analytics burn-up",
+  ]}
+/>
+
+
+Documents / Library
+
+<PageHeaderHint
+  id="documents"
+  title="Documents"
+  intro="Manage and share project documents."
+  bullets={[
+    "Artifacts list with quick search / sort",
+    "Tags & bulk tagging; multi-select ZIP; Send to Sign-Off",
+    "Per-artifact: Re-embed, Share (revocable link), Revoke All Links",
+  ]}
+/>
+
+
+Meeting Summaries
+
+<PageHeaderHint
+  id="meetings"
+  title="Meeting Summaries"
+  intro="Transcripts and auto-summaries extracted from uploaded/email artifacts."
+  bullets={[
+    "Summary with extracted counts (Actions, Risks, Decisions)",
+    "Filters and CSV export",
+    "Links back to source artifacts",
+  ]}
+/>
+
+
+Sign-Off Composer
+
+<PageHeaderHint
+  id="signoff-composer"
+  title="Compose Sign-Off Package"
+  intro="Bundle documents and decisions for customer approval."
+  bullets={[
+    "Select artifacts; include Actions/Risks/Decisions; email with token link",
+    "Download ZIP for offline review",
+    "Stage area targeting (for sign-off authority) when provided",
+  ]}
+/>
+
+
+Actions Kanban
+
+<PageHeaderHint
+  id="actions-kanban"
+  title="Actions"
+  intro="Track action items and owners."
+  bullets={[
+    "Drag between Todo / In Progress / Done",
+    "Owner quick-assign + filter; due-date + reminders",
+    "CSV export",
+  ]}
+/>
+
+
+Integrations
+
+<PageHeaderHint
+  id="integrations"
+  title="Integrations"
+  intro="Operational view of project integrations."
+  bullets={[
+    "Name, transport, schedule, status color, owner",
+    "“Check Now” to ping HTTP URLs in notes (dev demo)",
+    "Last checked timestamp",
+  ]}
+/>
+
+
+Wellness
+
+<PageHeaderHint
+  id="wellness"
+  title="Team Wellness"
+  intro="Lightweight check-ins to surface risk early."
+  bullets={[
+    "Team submits 1–5 scores; 7-day trend",
+    "Admin-only notes visibility",
+  ]}
+/>
+
+
+Audit Timeline
+
+<PageHeaderHint
+  id="audit-timeline"
+  title="Audit Timeline"
+  intro="Recent activity and system events."
+  bullets={[
+    "Filter by kind/actor/time",
+    "CSV export",
+  ]}
+/>
+
+
+Share Links Manager
+
+<PageHeaderHint
+  id="share-links"
+  title="Share Links"
+  intro="List and revoke public document links."
+  bullets={[
+    "Create in the Library → Share dialog",
+    "Revoke single token or Revoke All for an artifact",
+    "CSV export (token, expiry, revoked, created)",
+  ]}
+/>
+
+
+Admin → Communications
+
+<PageHeaderHint
+  id="admin-comms"
+  title="Comms Settings"
+  intro="Org-level communications and digest settings."
+  bullets={[
+    "Timezone, quiet hours, send caps",
+    "Weekly / monthly digests; DRY-RUN routing",
+    "‘Due soon’ SLA threshold and public sharing policy",
+  ]}
+/>
+
+
+(Repeat the same pattern for Testing, Training, Logistics, Data & Reporting with short bullets.)
+
+2) Team page drives access, visibility, and workflows
+
+We’ll extend your team management with an Access layer that configures:
+
+Visibility: areas they can see (or “all”)
+
+Sign-off authority: per area or entire project
+
+Updates: actions/risks/decisions/reminders (in addition to weekly/monthly digests)
+
+2A) SQL — access + stage area
+
+Run in Supabase SQL:
+
+-- Access table (per member, per project)
+create table if not exists public.project_member_access (
+  org_id uuid not null,
+  project_id uuid not null,
+  user_id uuid not null,
+  can_view_all boolean not null default true,
+  visibility_areas text[] default '{}',       -- e.g., ['HCM','Payroll']
+  can_sign_all boolean not null default false,
+  sign_areas text[] default '{}',             -- per-area sign authority
+  notify_actions boolean not null default true,
+  notify_risks boolean not null default true,
+  notify_decisions boolean not null default true,
+  notify_reminders boolean not null default true,
+  updated_at timestamptz not null default now(),
+  primary key (org_id, project_id, user_id)
+);
+
+alter table public.project_member_access enable row level security;
+
+create policy "pma_select_member" on public.project_member_access
+for select using (org_id = public.current_org() and public.is_member(org_id, project_id));
+
+create policy "pma_upsert_pmplus" on public.project_member_access
+for insert with check (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm','lead']));
+create policy "pma_update_pmplus" on public.project_member_access
+for update using (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm','lead']))
+with check (org_id = public.current_org());
+
+-- Stage optional area (used for sign-off authority)
+alter table public.project_stages
+  add column if not exists area text;   -- e.g., 'HCM', 'Payroll', etc.
+
+create index if not exists idx_stages_area on public.project_stages(project_id, area);
+
+-- Team Subscriptions: extend with fine-grained toggles (if not already)
+alter table public.team_subscriptions
+  add column if not exists notify_actions boolean not null default true,
+  add column if not exists notify_risks boolean not null default true,
+  add column if not exists notify_decisions boolean not null default true,
+  add column if not exists notify_reminders boolean not null default true;
+
+select pg_notify('pgrst','reload schema');
+
+2B) Backend — Access APIs
+
+server/routers/team_access.py
+
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
+from typing import List, Optional
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase
+
+router = APIRouter(prefix="/api/team/access", tags=["team-access"])
+PM_PLUS = require_role({"owner","admin","pm","lead"})
+
+class AccessUpsert(BaseModel):
+    user_id: str
+    can_view_all: bool = True
+    visibility_areas: List[str] = []
+    can_sign_all: bool = False
+    sign_areas: List[str] = []
+    notify_actions: bool = True
+    notify_risks: bool = True
+    notify_decisions: bool = True
+    notify_reminders: bool = True
+
+@router.get("/list")
+def list_access(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    # join with project_members for display
+    ms = sb.table("project_members").select("user_id,role").eq("org_id", ctx.org_id).eq("project_id", project_id).execute().data or []
+    acc = sb.table("project_member_access").select("*").eq("org_id", ctx.org_id).eq("project_id", project_id).execute().data or []
+    A = {a["user_id"]: a for a in acc}
+    items = []
+    for m in ms:
+        a = A.get(m["user_id"], {})
+        items.append({
+          "user_id": m["user_id"], "role": m["role"],
+          "can_view_all": a.get("can_view_all", True),
+          "visibility_areas": a.get("visibility_areas", []),
+          "can_sign_all": a.get("can_sign_all", False),
+          "sign_areas": a.get("sign_areas", []),
+          "notify_actions": a.get("notify_actions", True),
+          "notify_risks": a.get("notify_risks", True),
+          "notify_decisions": a.get("notify_decisions", True),
+          "notify_reminders": a.get("notify_reminders", True),
+        })
+    return {"items": items}
+
+@router.post("/upsert")
+def upsert_access(body: AccessUpsert, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx)
+    rec = body.dict()
+    rec.update({"org_id": ctx.org_id, "project_id": project_id})
+    # upsert
+    sb.table("project_member_access").upsert(rec, on_conflict="org_id,project_id,user_id").execute()
+    return {"ok": True}
+
+
+Mount:
+
+from .routers import team_access
+app.include_router(team_access.router)
+
+2C) Sign-off authority for areas
+
+Add a helper and enforce in the decision route.
+server/routers/signoff_auth.py
+
+from ..deps import get_user_supabase
+
+def has_sign_authority(sb, org_id: str, project_id: str, user_id: str, area: str | None):
+    if not area or area.strip()=="":
+        # global signer per access or can_sign_all set
+        acc = sb.table("project_member_access").select("can_sign_all,sign_areas").eq("org_id", org_id)\
+              .eq("project_id", project_id).eq("user_id", user_id).limit(1).execute().data
+        if not acc: return False
+        a = acc[0]
+        return bool(a.get("can_sign_all") or (a.get("sign_areas") and len(a["sign_areas"])>0))
+    # area-specific
+    acc = sb.table("project_member_access").select("can_sign_all,sign_areas").eq("org_id", org_id)\
+          .eq("project_id", project_id).eq("user_id", user_id).limit(1).execute().data
+    if not acc: return False
+    a = acc[0]
+    if a.get("can_sign_all"): return True
+    return area in (a.get("sign_areas") or [])
+
+
+Use in sign-off decision (without breaking admin/owner):
+
+In your decision route (e.g., server/routers/stages.py or signoff_external.py), replace the old signer dependency with:
+
+from .signoff_auth import has_sign_authority
+from ..guards import member_ctx   # keep membership
+from ..deps import get_user_supabase
+
+@router.post("/decision")
+def stage_decision(body: StageDecision, project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+
+    # admins/owners always allowed
+    if ctx.role in {"owner","admin"}:
+        pass
+    else:
+        # fetch stage + area
+        st = sb.table("project_stages").select("id,area").eq("org_id", ctx.org_id).eq("project_id", project_id)\
+             .eq("id", body.stage_id).single().execute().data
+        if not st: raise HTTPException(404, "Stage not found")
+        if not has_sign_authority(sb, ctx.org_id, project_id, ctx.user_id, st.get("area")):
+            raise HTTPException(403, "Not authorized to sign off this stage")
+    # ... existing status update + audit ...
+
+
+When creating a stage (Composer or manual), let PM set area (text input or select) to enable per-area authority.
+
+3) Team Access UI — one page that drives it
+
+client/src/pages/TeamAccess.tsx
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { getJSON, postJSON } from "@/lib/authFetch";
+
+type Row = {
+  user_id:string; role:string;
+  can_view_all:boolean; visibility_areas:string[];
+  can_sign_all:boolean; sign_areas:string[];
+  notify_actions:boolean; notify_risks:boolean; notify_decisions:boolean; notify_reminders:boolean;
+};
+
+export default function TeamAccess(){
+  const { projectId } = useParams();
+  const [rows,setRows]=useState<Row[]>([]);
+  const [areasStr,setAreasStr]=useState<string>("HCM,Payroll,Time,Financials,Integrations,Reporting,Security,Data");
+
+  async function load(){
+    const d = await getJSON<{items:Row[]}>(`/api/team/access/list?project_id=${projectId}`);
+    setRows(d.items||[]);
+  }
+  useEffect(()=>{ load(); },[projectId]);
+
+  function save(i:number, patch: Partial<Row>){
+    const r = { ...rows[i], ...patch };
+    postJSON(`/api/team/access/upsert?project_id=${projectId}`, {
+      user_id: r.user_id,
+      can_view_all: r.can_view_all,
+      visibility_areas: r.visibility_areas,
+      can_sign_all: r.can_sign_all,
+      sign_areas: r.sign_areas,
+      notify_actions: r.notify_actions,
+      notify_risks: r.notify_risks,
+      notify_decisions: r.notify_decisions,
+      notify_reminders: r.notify_reminders,
+    }).then(load);
+  }
+
+  const allAreas = areasStr.split(",").map(s=>s.trim()).filter(Boolean);
+
+  return (
+    <div className="p-6 space-y-4">
+      <h1 className="text-xl font-semibold">Team Access & Workflows</h1>
+
+      <div className="border rounded p-3">
+        <div className="text-sm text-muted-foreground mb-2">Functional Areas (comma-separated)</div>
+        <input className="border rounded p-2 w-full" value={areasStr} onChange={e=>setAreasStr(e.target.value)} />
+        <div className="text-xs text-muted-foreground mt-1">Used for visibility and sign-off authority.</div>
+      </div>
+
+      <div className="border rounded">
+        {rows.map((r,i)=>(
+          <div key={r.user_id} className="p-3 border-b last:border-0 space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="font-medium">{r.user_id.slice(0,8)}… <span className="text-xs text-muted-foreground">({r.role})</span></div>
+            </div>
+
+            {/* Visibility */}
+            <div className="grid md:grid-cols-2 gap-2">
+              <div className="border rounded p-2">
+                <div className="text-sm font-medium mb-1">Visibility</div>
+                <label className="text-sm flex items-center gap-2 mb-1">
+                  <input type="checkbox" checked={r.can_view_all} onChange={e=>save(i, { can_view_all: e.target.checked })}/>
+                  Can view all areas
+                </label>
+                {!r.can_view_all && (
+                  <div className="flex flex-wrap gap-2">
+                    {allAreas.map(a=>{
+                      const on = r.visibility_areas.includes(a);
+                      return (
+                        <button key={a} className={`px-2 py-1 border rounded text-xs ${on?'bg-black text-white':''}`}
+                                onClick={()=>{
+                                  const set = new Set(r.visibility_areas);
+                                  on ? set.delete(a) : set.add(a);
+                                  save(i, { visibility_areas: Array.from(set) });
+                                }}>
+                          {a}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* Sign-off */}
+              <div className="border rounded p-2">
+                <div className="text-sm font-medium mb-1">Sign-off Authority</div>
+                <label className="text-sm flex items-center gap-2 mb-1">
+                  <input type="checkbox" checked={r.can_sign_all} onChange={e=>save(i, { can_sign_all: e.target.checked })}/>
+                  Can sign off for the entire project
+                </label>
+                {!r.can_sign_all && (
+                  <div className="flex flex-wrap gap-2">
+                    {allAreas.map(a=>{
+                      const on = r.sign_areas.includes(a);
+                      return (
+                        <button key={a} className={`px-2 py-1 border rounded text-xs ${on?'bg-black text-white':''}`}
+                                onClick={()=>{
+                                  const set = new Set(r.sign_areas);
+                                  on ? set.delete(a) : set.add(a);
+                                  save(i, { sign_areas: Array.from(set) });
+                                }}>
+                          {a}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Updates / notifications */}
+            <div className="border rounded p-2">
+              <div className="text-sm font-medium mb-1">Updates</div>
+              <div className="grid md:grid-cols-4 gap-2 text-sm">
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={r.notify_actions} onChange={e=>save(i,{notify_actions:e.target.checked})}/> Actions
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={r.notify_risks} onChange={e=>save(i,{notify_risks:e.target.checked})}/> Risks
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={r.notify_decisions} onChange={e=>save(i,{notify_decisions:e.target.checked})}/> Decisions
+                </label>
+                <label className="flex items-center gap-2">
+                  <input type="checkbox" checked={r.notify_reminders} onChange={e=>save(i,{notify_reminders:e.target.checked})}/> Reminders
+                </label>
+              </div>
+              <div className="text-xs text-muted-foreground mt-1">
+                Weekly/monthly digests are managed on the Subscriptions page; reminders use these toggles.
+              </div>
+            </div>
+          </div>
+        ))}
+        {!rows.length && <div className="p-3 text-sm text-muted-foreground">No team members found.</div>}
+      </div>
+    </div>
+  );
+}
+
+
+Add route + sidebar link (under Team/Admin):
+
+{ path: "/projects/:projectId/admin/team-access", element: <TeamAccess/> }
+
+
+You can keep AdminSubscriptions for weekly/monthly and use TeamAccess for granular notifications + authority.
+
+4) Tie updates to digests & reminders
+
+Digests (/api/digest/send-weekly): we already filter by team_subscriptions. If you added the new booleans there, you can leave weekly/monthly as-is; keep granular toggles for day-to-day comms.
+
+Reminders tick: before emailing, check team_subscriptions.notify_reminders or project_member_access.notify_reminders for intended recipients (owner/role). You can keep the existing simple DIGEST_TEST_EMAIL in dev; in prod, resolve recipients from subscriptions.
+
+5) Quick tests (2–3 min)
+
+Headers: visit Dashboard, Documents, Meetings, Sign-Off Composer → see headers; dismiss/restore works.
+
+Team Access: toggle can_sign_all off; add one area to sign_areas; set stage area to that value; non-admin signer succeeds; others get 403.
+
+Visibility (app-level): set can_view_all=false and pick a few areas; verify your list/filter functions honor it (e.g., hide documents tagged with other areas—easy to add later).
+
+Updates: set notify_reminders=false; overdue reminder shouldn’t email that user (dev logs only).
+
+Share: “Revoke All Links” works; Share Links CSV downloads; Manager lists links.

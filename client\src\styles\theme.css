@@ -1,0 +1,114 @@
+/* TEAIM Theme – Dark Enterprise (v2.0) */
+:root {
+  /* Core surface & text */
+  --ui-surface: 11 11% 6%;          /* #0B0B10 - page chrome */
+  --ui-text: 234 23% 93%;           /* #E8E9F1 */
+  --ui-text-strong: 0 0% 100%;      /* #FFFFFF */
+  --ui-text-muted: 230 14% 71%;     /* #A9ACB8 */
+  --ui-border: 226 23% 18%;         /* #2B2E3A */
+  --ui-hover: 0 0% 100% / 0.04;     /* rgba(255,255,255,0.04) */
+  --ui-neutral-700: 226 18% 26%;    /* #3A3D4A */
+
+  /* Brand palette (new purple/teal scheme) */
+  --brand-primary: 262 100% 62%;    /* #7A4BFF - primary accent */
+  --brand-accent: 174 100% 57%;     /* #25FFD2 - neon accent */
+  --brand-warn: 33 100% 55%;        /* #FFB020 */
+  --brand-orange: 20 91% 56%;       /* Keep for TEAIM logo */
+
+  /* SEMANTIC - Dark mode defaults */
+  --bg: var(--ui-surface);
+  --fg: var(--ui-text);
+  --muted: var(--ui-text-muted);
+  --panel: 226 23% 10%;             /* Slightly lighter than surface */
+  --panel-contrast: 226 23% 13%;    /* For contrast elements */
+  --panelc: var(--panel-contrast);  /* Alias for consistency */
+  --border: var(--ui-border);
+
+  /* ACTIONS */
+  --primary: var(--brand-primary);  /* Purple primary */
+  --primary-fg: var(--ui-text-strong);
+  --primary-hover: 262 100% 68%;    /* Lighter purple on hover */
+  --accent: var(--brand-accent);    /* Teal accent */
+  --accent-fg: 11 11% 6%;           /* Dark text on light accent */
+
+  /* STATUS */
+  --success: 145 76% 42%;           /* Green for dark mode */
+  --warning: var(--brand-warn);     /* Orange warning */
+  --error: 4 75% 53%;               /* Red for dark mode */
+
+  /* TEAIM SPECIFIC (updated for new scheme) */
+  --teaim-primary: var(--brand-primary);    /* Purple */
+  --teaim-secondary: var(--brand-accent);   /* Teal */
+  --teaim-accent: var(--brand-warn);        /* Orange accent */
+
+  /* Environment pills */
+  --env-dev-bg: 215 100% 60% / 0.18;       /* Blue with alpha */
+  --env-dev-text: 215 100% 85%;            /* #A8CEFF */
+  --env-dev-border: 215 75% 42%;           /* #2A6DBA */
+
+  --env-stage-bg: 33 100% 50% / 0.18;      /* Orange with alpha */
+  --env-stage-text: 33 100% 75%;           /* #FFD48A */
+  --env-stage-border: 33 100% 31%;         /* #9C6A00 */
+
+  --env-prod-bg: 165 100% 39% / 0.18;      /* Green with alpha */
+  --env-prod-text: 165 74% 78%;            /* #95F3D2 */
+  --env-prod-border: 165 89% 25%;          /* #0E7E59 */
+
+  /* SHADOWS/FOCUS */
+  --focus: var(--brand-primary);    /* Purple focus */
+}
+
+[data-theme="light"] {
+  /* Light mode variant (for future use) */
+  --ui-surface: 0 0% 98%;           /* Light surface */
+  --ui-text: 226 23% 12%;           /* Dark text */
+  --ui-text-strong: 0 0% 0%;        /* Black */
+  --ui-text-muted: 226 14% 45%;     /* Muted text */
+  --ui-border: 226 14% 88%;         /* Light border */
+  --ui-hover: 0 0% 0% / 0.04;       /* Black hover */
+
+  --bg: var(--ui-surface);
+  --fg: var(--ui-text);
+  --muted: var(--ui-text-muted);
+  --panel: 0 0% 100%;               /* White panel */
+  --panel-contrast: 0 0% 96%;       /* Light gray contrast */
+  --border: var(--ui-border);
+
+  /* Brand colors remain consistent */
+  --primary: var(--brand-primary);
+  --accent: var(--brand-accent);
+  
+  /* Adjust status colors for light mode */
+  --success: 145 63% 49%;
+  --warning: 33 98% 51%;
+  --error: 4 90% 58%;
+}
+
+/* Utility tokens derived from vars */
+:root, [data-theme="dark"] {
+  --ring: var(--focus);
+}
+
+/* Map Tailwind-style tokens to CSS variables for consistency */
+.bg-bg { background-color: hsl(var(--bg)); }
+.text-fg { color: hsl(var(--fg)); }
+.text-muted { color: hsl(var(--muted)); }
+.bg-panel { background-color: hsl(var(--panel)); }
+.bg-panelc { background-color: hsl(var(--panelc)); }
+.border-border { border-color: hsl(var(--border)); }
+.bg-primary { background-color: hsl(var(--primary)); }
+.text-primary-fg { color: hsl(var(--primary-fg)); }
+.hover\:bg-primary-hover:hover { background-color: hsl(var(--primary-hover)); }
+.bg-success { background-color: hsl(var(--success)); }
+.text-success { color: hsl(var(--success)); }
+.bg-warning { background-color: hsl(var(--warning)); }
+.text-warning { color: hsl(var(--warning)); }
+.bg-error { background-color: hsl(var(--error)); }
+.text-error { color: hsl(var(--error)); }
+.text-brand-orange { color: hsl(var(--brand-orange)); }
+
+/* Optional: default body styles */
+html, body { 
+  background: hsl(var(--bg)); 
+  color: hsl(var(--fg)); 
+}

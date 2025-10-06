@@ -1,0 +1,285 @@
+Legend. Since you want this locked and slick:
+
+Auto-detect & chain re-ingest after storing (no prompts), and
+
+Progress toasts instead of alerts—clean UX with real feedback.
+
+And because you said “next part of the build,” I’m also dropping a Project QA Seeder (one-click: loads our small test corpus into a project) so you can repeatedly validate end-to-end.
+
+Below are paste-ready patches only—no ceremony.
+
+A) AdminBackups UI — one-click chain + toasts
+
+Uses shadcn’s useToast. If you don’t already render <Toaster/> at app root, see the tiny note at the end.
+
+client/src/pages/AdminBackups.tsx (replace the three handlers and button block)
+
+// add at top
+import { apiPost } from "@/lib/api";
+import { useToast } from "@/components/ui/use-toast";
+import { Loader2 } from "lucide-react"; // optional spinner if available
+
+// inside component
+const { toast } = useToast();
+const [busyKey, setBusyKey] = useState<string | null>(null);
+
+// replaces storeFile -> now chains store → re-ingest automatically
+async function storeFile(name: string) {
+  if (!sel) return;
+  try {
+    setBusyKey(name);
+    toast({ title: "Storing…", description: name });
+    const d = await apiPost<{ ok: boolean; stored_key: string }>(
+      "/backups/store-file",
+      undefined,
+      { project_id: projectId!, backup_key: sel.key, artifact_name: name }
+    );
+    toast({ title: "Stored", description: d.stored_key });
+
+    // auto chain to re-ingest (no prompt)
+    toast({ title: "Re-ingesting…", description: name });
+    await apiPost("/backups/reingest-stored", undefined, {
+      project_id: projectId!,
+      stored_key: d.stored_key,
+    });
+    toast({ title: "Re-ingest started", description: "Check Dashboard → Restore Activity & recent artifacts." });
+  } catch (e: any) {
+    toast({ title: "Store/Re-ingest failed", description: String(e?.message || e), variant: "destructive" });
+  } finally {
+    setBusyKey(null);
+  }
+}
+
+// keep download but switch to auth-safe fetch if you prefer
+async function downloadFile(name: string) {
+  if (!sel) return;
+  try {
+    setBusyKey(name);
+    const u = `/api/backups/get-file?project_id=${projectId}&backup_key=${encodeURIComponent(sel.key)}&artifact_name=${encodeURIComponent(name)}`;
+    const res = await fetch(u, { credentials: "include" });
+    if (!res.ok) throw new Error(await res.text());
+    const blob = await res.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name.split("/").pop() || "file";
+    document.body.appendChild(a); a.click(); URL.revokeObjectURL(a.href); a.remove();
+    toast({ title: "Downloaded", description: name });
+  } catch (e: any) {
+    toast({ title: "Download failed", description: String(e?.message || e), variant: "destructive" });
+  } finally {
+    setBusyKey(null);
+  }
+}
+
+// one-click store + re-ingest (server does both)
+async function storeAndReingest(name: string) {
+  if (!sel) return;
+  try {
+    setBusyKey(name);
+    toast({ title: "Store + Re-ingest", description: name });
+    const d = await apiPost<{ ok: boolean; stored_key: string }>(
+      "/backups/store-and-reingest",
+      undefined,
+      { project_id: projectId!, backup_key: sel.key, artifact_name: name }
+    );
+    toast({ title: "Queued", description: `Stored ${d.stored_key}, re-ingest started.` });
+  } catch (e: any) {
+    toast({ title: "Store + Re-ingest failed", description: String(e?.message || e), variant: "destructive" });
+  } finally {
+    setBusyKey(null);
+  }
+}
+
+
+Button block (where you render actions per entry):
+
+<div className="flex items-center gap-2">
+  <button disabled={busyKey===e.name} className="px-2 py-1 border rounded text-sm flex items-center gap-1" onClick={()=>downloadFile(e.name)}>
+    {busyKey===e.name ? <Loader2 className="h-3 w-3 animate-spin" /> : null} Download
+  </button>
+  <button disabled={busyKey===e.name} className="px-2 py-1 border rounded text-sm flex items-center gap-1" onClick={()=>storeFile(e.name)}>
+    {busyKey===e.name ? <Loader2 className="h-3 w-3 animate-spin" /> : null} Store→Re-ingest
+  </button>
+  <button disabled={busyKey===e.name} className="px-2 py-1 border rounded text-sm flex items-center gap-1" onClick={()=>storeAndReingest(e.name)}>
+    {busyKey===e.name ? <Loader2 className="h-3 w-3 animate-spin" /> : null} Store + Re-ingest
+  </button>
+</div>
+
+
+If you don’t already have the shadcn toast primitives, add <Toaster /> once near the root layout.
+
+// e.g., client/src/App.jsx (inside your top-level layout component)
+import { Toaster } from "@/components/ui/toaster";
+// ...
+<>
+  {/* existing layout */}
+  <Toaster />
+</>
+
+B) Backend — tiny QoL: return stored_key consistently
+
+(If you used my earlier endpoints, you’re already returning stored_key. If not, be sure both endpoints do:)
+
+server/routers/backups.py (confirm these returns)
+
+# in /store-file
+return {"ok": True, "stored_key": key}
+
+# in /store-and-reingest
+return {"ok": True, "stored_key": stored_key, "reingested": r}
+
+C) “Next part of the build” — Project QA Seeder (one-click, loads a small test corpus)
+
+This lets you repopulate a project with a known doc set in seconds—great for demos and regression.
+
+C1) API
+
+server/routers/dev_seed.py
+
+from fastapi import APIRouter, Depends, Query, HTTPException
+from ..tenant import TenantCtx
+from ..guards import require_role
+import os, io, requests
+
+router = APIRouter(prefix="/api/dev", tags=["dev"])
+ADMIN_OR_OWNER = require_role({"owner","admin"})
+
+SIMPLE_DOCS = [
+  ("00_SOW_v1_ACME-HCM-001.txt", """Project: ACME-HCM-001 | Customer: Acme Health
+Scope: Workday HCM, Payroll, Time, Financials
+Workstreams: HCM; Payroll; Time; Financials; Integrations; Reporting; Cutover; Security; Data
+Integrations: ADP_FundTransfer (SFTP 01:00 UTC); Okta_SSO (OIDC); BankOfNow PositivePay (SFTP hourly)
+Milestones:
+- Discovery: 2025-09-22 → 2025-10-10
+- Build P1: 2025-10-13 → 2025-12-05
+- Test: 2025-12-08 → 2026-01-16
+- Cutover: 2026-01-30 → 2026-02-03
+Decisions:
+- Workday is source of truth for worker master.
+Risks:
+- High: Legacy HRIS data quality unknown.
+Actions:
+- Sam to obtain SFTP key requirements by 2025-09-26.
+- Priya to profile HR data by 2025-09-24.
+"""),
+  ("01_Change_Order_1_ACME-HCM-001.txt", """Change Order CO-001 (2025-09-24)
+Add ACA reporting; shift Cutover +1 week (to 2026-02-06 → 2026-02-10).
+Decision: Include ACA reporting in Phase 1.
+Action: Finance lead update baseline schedule by 2025-09-25.
+Risk: Low — Reporting team bandwidth slip of 1 week.
+"""),
+  ("03_Kickoff_Transcript_2025-09-23.txt", """Dana: Goal is first payroll Feb 2026.
+Kris: Lock scope, confirm milestones.
+Sam: Need SFTP keys & test folder for BankOfNow.
+Priya: Data profiling ~3 days after exports.
+Summary:
+Decision: Workday = source-of-truth for worker data (reaffirmed).
+Risk (High): SFTP key process unclear at BankOfNow.
+Action: Sam to send SFTP key fingerprint by 2025-09-24.
+Action: Priya to request HR export by 2025-09-23 EOD.
+Integration: BankOfNow PositivePay test path /bn/ppay/test/
+"""),
+  ("05_Discovery_Signoff_Package_ACME-HCM-001.txt", """Stages:
+- Stage: Discovery | Start: 2025-09-22 | End: 2025-10-10
+- Stage: Build P1 | Start: 2025-10-13 | End: 2025-12-05
+- Stage: Test | Start: 2025-12-08 | End: 2026-01-16
+- Stage: Cutover | Start: 2026-01-30 | End: 2026-02-03
+Deliverables: Workstreams list, Integration inventory baseline, Data profiling report.
+Decision: Discovery complete pending BankOfNow key confirmation.
+"""),
+]
+
+def _auth_headers(ctx: TenantCtx):
+    if os.getenv("DEV_AUTH","0") == "1":
+        return {"X-Dev-User": ctx.user_id or "dev-user", "X-Dev-Org": ctx.org_id, "X-Dev-Role": ctx.role or "admin"}
+    tok = os.getenv("INTERNAL_API_BEARER")
+    return {"Authorization": f"Bearer {tok}"} if tok else {}
+
+@router.post("/seed-simple")
+def seed_simple(project_id: str = Query(...), ctx: TenantCtx = Depends(ADMIN_OR_OWNER)):
+    base = os.getenv("FASTAPI_URL", "http://127.0.0.1:5000")
+    url = f"{base}/api/ingest-sync?project_id={project_id}"
+    headers = _auth_headers(ctx)
+
+    ok = 0; results = []
+    for name, body in SIMPLE_DOCS:
+        files = {"file": (name, body.encode("utf-8"), "text/plain")}
+        r = requests.post(url, files=files, headers=headers, timeout=60)
+        results.append({ "name": name, "status": r.status_code })
+        if r.ok: ok += 1
+
+    return {"ok": True, "count": ok, "results": results}
+
+
+Mount it:
+
+# server/main.py
+from .routers import dev_seed
+app.include_router(dev_seed.router)
+
+C2) Simple “QA Tools” button (Admin)
+
+client/src/pages/ProjectQATools.tsx
+
+import { useParams } from "react-router-dom";
+import { apiPost } from "@/lib/api";
+import { useToast } from "@/components/ui/use-toast";
+import { useState } from "react";
+
+export default function ProjectQATools(){
+  const { projectId } = useParams();
+  const { toast } = useToast();
+  const [busy,setBusy] = useState(false);
+
+  async function seed(){
+    setBusy(true);
+    toast({ title: "Seeding sample docs…", description: "SOW + CO + Kickoff + Sign-off package" });
+    try {
+      const d = await apiPost("/dev/seed-simple", undefined, { project_id: projectId! });
+      toast({ title: "Seeded", description: `${d.count} docs ingested` });
+    } catch (e:any) {
+      toast({ title: "Seed failed", description: String(e?.message || e), variant: "destructive" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="p-6 space-y-4 max-w-xl">
+      <h1 className="text-xl font-semibold">QA Tools</h1>
+      <p className="text-sm text-muted-foreground">One-click demo data for end-to-end smoke tests.</p>
+      <button disabled={busy} className="px-3 py-2 rounded border" onClick={seed}>
+        {busy ? "Seeding…" : "Seed Sample Project Docs"}
+      </button>
+    </div>
+  );
+}
+
+
+Add route & link (admin-only):
+
+{ path: "/projects/:projectId/admin/qa", element: <ProjectQATools/> }
+
+Tiny note if you don’t have shadcn toasts yet
+
+Ensure these exist (common paths):
+
+@/components/ui/toaster (Toaster component)
+
+@/components/ui/use-toast (hook)
+
+<Toaster /> rendered once near the app root
+
+If not, I can paste those primitives next.
+
+Sanity checklist (2 minutes)
+
+Admin Backups:
+
+Click Store→Re-ingest → you should see toasts “Storing…”, then “Re-ingesting…”, then “Re-ingest started”.
+
+Dashboard Restore Activity shows both events within seconds.
+
+QA Tools:
+
+Seed Sample Project Docs → confirm Dashboard counts update; Meeting Summaries shows Kickoff; Timeline shows Discovery/Build/Test/Cutover; Stage Sign-Off can be requested on “Discovery”.

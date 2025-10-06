@@ -1,0 +1,316 @@
+A) Mailgun Email Dropbox (transcripts + docs)
+1) DNS & Mailgun setup
+
+Domain: e.g. mail.teaim.app
+
+Add Mailgun DNS records (SPF, DKIM, MX).
+
+Route: Forward → Webhook for address ingest@teaim.app to:
+
+POST https://<your-app>/api/email/mailgun
+
+
+Keep “Store and Notify” ON so Mailgun hosts attachments (we’ll fetch with signed URLs).
+
+2) Security & guardrails
+
+Verify signatures (HMAC) on every request
+
+Allowlist senders (client domains + partner domains)
+
+Require project code in subject: #proj:WD-ACME
+
+Idempotency with Message-Id (ignore duplicates)
+
+AV scan (optional Cloud AV)
+
+Type allowlist: pdf, docx, txt, eml, vtt, srt
+
+3) Endpoint (drop-in)
+
+/server/email_mailgun.py
+
+import os, hmac, hashlib, base64, requests
+from fastapi import APIRouter, Request
+from .db import get_conn, insert_artifact, insert_chunks, update_artifact_chunk_count, insert_summary
+from .parsing import extract_text
+from .chunking import chunk_text
+from .rag import embed_texts
+from .mem_agent import extract_memories
+from uuid import uuid4
+
+router = APIRouter()
+BUCKET = os.getenv("BUCKET", "project-artifacts")
+MAILGUN_SIGNING_KEY = os.getenv("MAILGUN_SIGNING_KEY", "")
+
+ALLOWLIST = set([d.strip().lower() for d in os.getenv("EMAIL_ALLOWLIST","").split(",") if d])
+
+def verify_mailgun(sig:str, ts:str, token:str)->bool:
+    mac = hmac.new(MAILGUN_SIGNING_KEY.encode("utf-8"), msg=f"{ts}{token}".encode("utf-8"), digestmod=hashlib.sha256)
+    return hmac.compare_digest(mac.hexdigest(), sig)
+
+def parse_proj(subject:str):
+    # e.g. "Standup #proj:WD-ACME"
+    import re
+    m = re.search(r"#proj:([A-Za-z0-9\-\_]+)", subject or "")
+    return m.group(1) if m else None
+
+def sanitize(name:str): return "".join(c for c in name or "" if c.isalnum() or c in "._- ") or "upload"
+
+def lookup_project_by_code(code:str):
+    # you can store {code -> org_id, project_id} in projects table (unique per org)
+    # use Supabase REST or psycopg; simplified stub:
+    from .supabase_client import sb
+    r = sb.table("projects").select("id,org_id,code").eq("code",code).limit(1).execute().data
+    if not r: return None, None
+    return r[0]["org_id"], r[0]["id"]
+
+def write_mem(conn, org_id, project_id, artifact_id, mem):
+    # minimal durable writes; you already have mem tables
+    pass
+
+@router.post("/email/mailgun")
+async def email_mailgun(req: Request):
+    # Mailgun is form-encoded
+    form = await req.form()
+    sig = form.get("signature")
+    ts  = form.get("timestamp")
+    token = form.get("token")
+    if not (sig and ts and token and verify_mailgun(sig, ts, token)):
+        return {"ok": False, "error": "bad signature"}
+
+    subject = form.get("subject","")
+    sender  = (form.get("sender") or "").lower()
+    if ALLOWLIST and not any(sender.endswith("@"+d) or sender.split("@")[-1]==d for d in ALLOWLIST):
+        return {"ok": False, "error": "sender not allowed"}
+
+    proj_code = parse_proj(subject)
+    if not proj_code:
+        return {"ok": False, "error": "missing #proj:TAG"}
+
+    org_id, project_id = lookup_project_by_code(proj_code)
+    if not project_id:
+        return {"ok": False, "error": "unknown project code"}
+
+    # Attachments: Mailgun posts attachment-N fields or gives storage URLs if “Store and notify”
+    # We’ll support both; prefer URLs if present
+    results = []
+    # (A) Stored URLs (Mailgun “storage”)
+    storage_urls = []
+    for i in range(1, 21):
+        u = form.get(f"attachment-{i}-url")
+        if u: storage_urls.append(u)
+
+    # (B) Direct file uploads in form (smaller messages)
+    attached_files = []
+    for key, up in form.multi_items():
+        if key.startswith("attachment") and hasattr(up, "filename"):
+            attached_files.append(up)
+
+    # Process stored URLs
+    for url in storage_urls:
+        r = requests.get(url, timeout=20)   # Mailgun signed URL
+        if r.status_code != 200: continue
+        filename = sanitize(url.split("/")[-1])
+        content_type = r.headers.get("Content-Type","application/octet-stream")
+        data = r.content
+        out = await _ingest_one(org_id, project_id, filename, content_type, data)
+        results.append(out)
+
+    # Process multipart attachments
+    for up in attached_files:
+        data = await up.read()
+        out = await _ingest_one(org_id, project_id, sanitize(up.filename), up.content_type, data)
+        results.append(out)
+
+    return {"ok": True, "project": proj_code, "count": len(results), "results": results}
+
+async def _ingest_one(org_id, project_id, filename, content_type, data:bytes):
+    from .supabase_client import sb
+    key = f"{project_id}/{uuid4().hex}_{filename}"
+    sb.storage.from_(BUCKET).upload(
+        path=key, file=data,
+        file_options={"content-type": content_type or "application/octet-stream"},
+        upsert=False
+    )
+
+    # durable DB writes via psycopg
+    with get_conn() as conn:
+        art_id = insert_artifact(conn, org_id, project_id, key, content_type, filename, "email")
+        text   = extract_text(filename, data, content_type)
+        chunks = chunk_text(text, 1200, 200)
+        embs   = embed_texts(chunks) if chunks else []
+        rows   = [{"chunk_index": i, "content": c, "embedding": e} for i,(c,e) in enumerate(zip(chunks, embs))]
+        if rows: insert_chunks(conn, org_id, project_id, art_id, rows)
+        update_artifact_chunk_count(conn, art_id, len(rows))
+        insert_summary(conn, org_id, project_id, art_id, text[:2000])
+
+        mem = extract_memories(text)  # decisions/risks/actions/semantic/procedural
+        write_mem(conn, org_id, project_id, art_id, mem)
+
+    # Push to dashboard classifiers (actions/risks/decisions/integrations)
+    try: route_update_from_text(org_id, project_id, art_id, text, mem)
+    except Exception: pass
+
+    return {"artifact_id": art_id, "path": key, "filename": filename}
+
+
+Mount it:
+
+# /server/main.py
+from .email_mailgun import router as email_router
+app.include_router(email_router, prefix="")
+
+4) Env vars
+
+MAILGUN_SIGNING_KEY
+
+EMAIL_ALLOWLIST=client.com,partner.com
+
+BUCKET=project-artifacts
+
+5) Dev test (no Mailgun needed)
+BASE="http://localhost:5000/api"
+ORG="d915376c-2bd7-4e79-b9c9-aab9d7fcb5a8"
+PROJ="dced0b98-87b4-46ff-b2a4-2cf8e627e8d2"
+
+cat > /tmp/wg.txt <<'TXT'
+Payroll WG – Minutes
+Decision: Use retro v2. Risk: SFTP cert expiry (High)
+Action: Sam to deliver cert by 2025-09-22. ADP → Workday; Workday → GL.
+TXT
+
+curl -s -X POST "$BASE/email/inbound-dev" \
+  -H "Content-Type: application/json" -d @- <<JSON
+{"subject":"WG minutes #proj:WD-ACME","from":"lead@client.com",
+ "attachments":[{"filename":"2025-09-18.txt","content_type":"text/plain","data_b64":"$(base64 -w0 /tmp/wg.txt)"}]}
+JSON
+
+B) 9-Step Onboarding & Follow-ups
+1) Tables (already outlined; ensure they exist)
+
+onboarding_steps (catalog)
+
+onboarding_instances (per project, status/due date/response)
+
+email_templates (subject/body)
+
+Seed steps 1–3 to start:
+
+insert into onboarding_steps(key,name,description,order_idx) values
+('metrics','Metrics for Success','Top 3 KPIs that define success',1)
+on conflict (key) do nothing;
+
+insert into onboarding_steps(key,name,description,order_idx) values
+('team','Team Roster','Names, roles, contacts, workstream owners',2)
+on conflict (key) do nothing;
+
+insert into onboarding_steps(key,name,description,order_idx) values
+('logistics','Logistics & Communications','Meeting cadence, links, channels',3)
+on conflict (key) do nothing;
+
+2) Endpoints (stubs)
+@app.post("/onboarding/start")
+def ob_start(org_id:str, project_id:str):
+    # create instances for first 3 steps with due dates
+    today = dt.date.today()
+    steps = ["metrics","team","logistics"]
+    for i,k in enumerate(steps):
+        sb.table("onboarding_instances").insert({
+            "org_id": org_id, "project_id": project_id,
+            "step_key": k, "status": "pending",
+            "due_date": str(today + dt.timedelta(days=(i*2)+2))
+        }).execute()
+    return {"ok": True, "count": len(steps)}
+
+@app.post("/onboarding/send")
+def ob_send(org_id:str, project_id:str, step_key:str, to_email:str):
+    # render template + Mailgun send
+    # subject/body from email_templates.key == step_key
+    # TODO: add signatured secure link for web form
+    return {"ok": True}
+
+@app.post("/onboarding/respond")
+def ob_respond(org_id:str, project_id:str, step_key:str, answers:dict):
+    # persist answers
+    sb.table("onboarding_instances").update({"status":"received","response_json":answers})\
+        .eq("org_id",org_id).eq("project_id",project_id).eq("step_key",step_key).execute()
+    # normalize into hub
+    if step_key=="metrics":
+        # store KPIs in a config table or mem_entries semantic
+        pass
+    elif step_key=="team":
+        # create roster owners / assign to workstreams
+        pass
+    elif step_key=="logistics":
+        # store cadence/links for Logistics card
+        pass
+    return {"ok": True}
+
+3) Email templates (three to start)
+
+metrics_request
+
+Subject: Aligning success metrics for {{project_code}}
+
+Hi {{first_name}},
+
+To keep {{project_code}} focused, please share your top 3 measures of success:
+1)
+2)
+3)
+
+Reply to this email or use this link:
+{{secure_link}}
+
+Thanks — TEAIM PMO
+
+
+team_request
+
+Subject: Team roster & roles for {{project_code}}
+
+Please confirm core team members, roles, contact info, and workstream ownership.
+Reply here or submit via {{secure_link}}
+
+
+logistics_request
+
+Subject: Meeting cadence & links for {{project_code}}
+
+Share preferred cadence (standups/steering), time zones, and links (Zoom/Teams/Drive).
+Reply here or submit via {{secure_link}}
+
+4) Scheduler & nudges
+
+Background job (APScheduler) checks onboarding_instances:
+
+if pending and no response 48h → send nudge
+
+96h → escalate (cc sponsor)
+
+Respect “Comms Cadence” once clients define it.
+
+C) How inbox data updates the app
+
+Summaries → decisions/risks/actions feed your KPIs, Red Flags, Pending
+
+Actions → show in Actions page; overdue drives dashboard warnings
+
+Integrations → detected “X → Y” become cards in Integrations & Tech
+
+Workstreams → keywords tag the right Functional Area card
+
+Onboarding responses → populate Dashboard header, Logistics, Team, Data & Reporting
+
+Everything you already built on the dashboard will auto-respond once rows exist.
+
+D) What I’ll ship next on your signal
+
+The exact Mailgun send code for /onboarding/send (with a provider-agnostic switch).
+
+A tiny review queue page (approve/edit AI-extracted items before publishing).
+
+A simple web form page for onboarding responses (secure token → POST to /onboarding/respond).
+
+If that plan sings, I’ll drop those stubs ready to paste.

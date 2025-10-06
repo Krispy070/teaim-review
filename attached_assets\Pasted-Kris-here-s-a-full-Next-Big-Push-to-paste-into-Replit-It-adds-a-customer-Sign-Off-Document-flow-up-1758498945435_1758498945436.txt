@@ -1,0 +1,414 @@
+Kris—here’s a full Next Big Push to paste into Replit. It adds a customer Sign-Off Document flow (upload or “Kap draft” generate → email token → public sign page), finishes Stage Areas, shows a pending-updates badge, adds a Schema-Reload button, and hardens routes/auth so dev won’t flake.
+
+I split this into small, drop-in files/patches.
+
+0) Critical bug fix (audit rows missing org_id)
+
+Where you insert sign-off audit events (in your signoff/stage decision routes), ensure org_id and project_id are present (service/user client both OK):
+
+sb.table("audit_events").insert({
+    "org_id": ctx.org_id,
+    "project_id": project_id,
+    "actor_id": ctx.user_id,              # may be None for external signer
+    "kind": f"stage.{body.decision}",
+    "details": {"stage_id": body.stage_id, "via": "external_token" if some_external else "pm", "notes": body.notes}
+}).execute()
+
+1) DB — Sign-Off Documents + Tokens
+
+Run in Supabase SQL:
+
+create table if not exists public.signoff_docs (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid not null,
+  project_id uuid not null,
+  stage_id uuid,
+  name text not null,
+  kind text not null default 'customer_ack',      -- e.g. customer_ack, sow_addendum
+  html text,                                      -- generated content (optional)
+  storage_bucket text,                            -- if uploaded file
+  storage_path text,
+  status text not null default 'draft',           -- draft | final | sent | signed
+  signed_by text,
+  signed_at timestamptz,
+  created_by text,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.signoff_doc_tokens (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid not null,
+  project_id uuid not null,
+  doc_id uuid not null,
+  token text not null unique,
+  signer_email text not null,
+  expires_at timestamptz not null,
+  used_at timestamptz
+);
+
+alter table public.signoff_docs enable row level security;
+alter table public.signoff_doc_tokens enable row level security;
+
+create policy "sod_select_member" on public.signoff_docs
+for select using (org_id = public.current_org() and public.is_member(org_id, project_id));
+create policy "sod_write_pm" on public.signoff_docs
+for insert with check (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm']));
+create policy "sod_update_pm" on public.signoff_docs
+for update using (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm']))
+with check (org_id = public.current_org());
+
+create policy "tok_select_member" on public.signoff_doc_tokens
+for select using (org_id = public.current_org() and public.is_member(org_id, project_id));
+create policy "tok_write_pm" on public.signoff_doc_tokens
+for insert with check (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm']));
+create policy "tok_update_pm" on public.signoff_doc_tokens
+for update using (org_id = public.current_org() and public.has_role(org_id, project_id, array['owner','admin','pm']))
+with check (org_id = public.current_org());
+
+create index if not exists idx_sod_proj on public.signoff_docs(project_id, status);
+create index if not exists idx_tok_doc on public.signoff_doc_tokens(doc_id);
+
+select pg_notify('pgrst','reload schema');
+
+2) Backend — Sign-Off Docs router
+
+Create: server/routers/signoff_docs.py
+
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
+from fastapi.responses import HTMLResponse, StreamingResponse
+from pydantic import BaseModel
+from datetime import datetime, timedelta, timezone
+import secrets, os
+
+from ..tenant import TenantCtx
+from ..guards import member_ctx, require_role
+from ..deps import get_user_supabase, get_service_supabase
+from ..email.util import mailgun_send_html, send_guard, log_send
+
+router = APIRouter(prefix="/api/signoff/docs", tags=["signoff-docs"])
+PM_PLUS = require_role({"owner","admin","pm"})
+
+# --------- Models ----------
+class GenerateBody(BaseModel):
+    name: str
+    stage_id: str | None = None
+    kind: str = "customer_ack"
+    intro: str | None = None
+    bullets: list[str] | None = None
+    acceptance_text: str | None = "I acknowledge and approve the above."
+    footer: str | None = "Signed electronically via TEAIM"
+
+class RequestSignBody(BaseModel):
+    doc_id: str
+    email_to: str
+    expires_hours: int = 120
+
+# --------- Helpers ----------
+def _now(): return datetime.now(timezone.utc).isoformat()
+
+def _simple_html(name: str, body: GenerateBody, proj_code: str):
+    bl = ""
+    if body.bullets: bl = "<ul>" + "".join([f"<li>{x}</li>" for x in body.bullets]) + "</ul>"
+    return f"""
+    <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:880px;margin:auto">
+      <h2>{name}</h2>
+      <div style="color:#555;">Project: {proj_code}</div>
+      <p>{(body.intro or '').strip()}</p>
+      {bl}
+      <p style="margin-top:16px">{body.acceptance_text or ""}</p>
+      <hr/>
+      <div style="color:#888;font-size:12px">{body.footer or ""}</div>
+    </div>
+    """
+
+# --------- Endpoints ----------
+@router.get("/list")
+def list_docs(project_id: str = Query(...), stage_id: str | None = None, ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    q = sb.table("signoff_docs").select("*").eq("org_id", ctx.org_id).eq("project_id", project_id)
+    if stage_id: q = q.eq("stage_id", stage_id)
+    out = q.order("created_at", desc=True).limit(200).execute().data or []
+    return {"items": out}
+
+@router.post("/upload")
+def upload_doc(project_id: str = Query(...), stage_id: str | None = None, file: UploadFile = File(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sbs = get_service_supabase()
+    # store under artifacts bucket (or create 'signoff' bucket)
+    bucket = os.getenv("SIGNOFF_BUCKET","artifacts")
+    key = f"org/{ctx.org_id}/project/{project_id}/signoff/{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}__{file.filename}"
+    b = file.file.read()
+    sbs.storage().from_(bucket).upload(key, b, {"content-type": file.content_type or "application/octet-stream", "upsert": True})
+    rec = sbs.table("signoff_docs").insert({
+        "org_id": ctx.org_id, "project_id": project_id, "stage_id": stage_id,
+        "name": file.filename, "kind":"customer_ack",
+        "storage_bucket": bucket, "storage_path": key, "status":"final", "created_by": ctx.user_id
+    }).execute().data[0]
+    return {"ok": True, "doc": rec}
+
+@router.post("/generate")
+def generate_doc(body: GenerateBody, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sb = get_user_supabase(ctx); sbs = get_service_supabase()
+    proj = sb.table("projects").select("code").eq("id", project_id).single().execute().data
+    code = (proj or {}).get("code") or project_id
+    html = _simple_html(body.name, body, code)
+    rec = sbs.table("signoff_docs").insert({
+        "org_id": ctx.org_id, "project_id": project_id, "stage_id": body.stage_id,
+        "name": body.name, "kind": body.kind, "html": html, "status":"draft", "created_by": ctx.user_id
+    }).execute().data[0]
+    return {"ok": True, "doc": rec}
+
+@router.post("/request-sign")
+def request_sign(body: RequestSignBody, project_id: str = Query(...), ctx: TenantCtx = Depends(PM_PLUS)):
+    sbs = get_service_supabase(); sb = get_user_supabase(ctx)
+    # fetch doc
+    docq = sbs.table("signoff_docs").select("*").eq("org_id", ctx.org_id).eq("project_id", project_id).eq("id", body.doc_id).limit(1).execute().data
+    if not docq: raise HTTPException(404, "Doc not found")
+    doc = docq[0]
+    # token
+    tok = secrets.token_urlsafe(32)
+    exp = datetime.now(timezone.utc) + timedelta(hours=int(body.expires_hours))
+    sbs.table("signoff_doc_tokens").insert({
+        "org_id": ctx.org_id, "project_id": project_id, "doc_id": body.doc_id,
+        "token": tok, "signer_email": body.email_to, "expires_at": exp.isoformat()
+    }).execute()
+    # mark sent
+    sbs.table("signoff_docs").update({"status":"sent"}).eq("id", body.doc_id).execute()
+    # email
+    base = os.getenv("APP_BASE_URL","").rstrip("/")
+    link = f"{base}/signoff/doc/{tok}"
+    ok, reason = send_guard(sb, ctx.org_id, project_id, "signoff", body.email_to)
+    if ok:
+        subj = f"Please review & sign: {doc['name']}"
+        html = f"<p>You have a document to sign for project {project_id}.</p><p><a href='{link}'>Open Document</a></p>"
+        mailgun_send_html(body.email_to, subj, html)
+        log_send(sb, ctx.org_id, project_id, "signoff", body.email_to)
+    # audit
+    try:
+        sbs.table("audit_events").insert({
+          "org_id": ctx.org_id, "project_id": project_id, "actor_id": ctx.user_id,
+          "kind": "signoff.doc.sent", "details": {"doc_id": body.doc_id, "email_to": body.email_to}
+        }).execute()
+    except Exception: ...
+    return {"ok": True, "token_link": link}
+
+# ---- PUBLIC token view/sign ----
+pub = APIRouter(tags=["signoff-public"])
+
+@pub.get("/signoff/doc/{token}", response_class=HTMLResponse)
+def open_doc(token: str):
+    sbs = get_service_supabase()
+    t = sbs.table("signoff_doc_tokens").select("*").eq("token", token).limit(1).execute().data
+    if not t: return HTMLResponse("<h3>Invalid token</h3>", status_code=404)
+    row = t[0]
+    if row.get("used_at"): return HTMLResponse("<h3>Already signed</h3>", status_code=400)
+    if datetime.now(timezone.utc) > datetime.fromisoformat(row["expires_at"]):
+        return HTMLResponse("<h3>Link expired</h3>", status_code=400)
+
+    doc = sbs.table("signoff_docs").select("*").eq("id", row["doc_id"]).limit(1).execute().data or []
+    if not doc: return HTMLResponse("<h3>Document not found</h3>", status_code=404)
+    d = doc[0]
+    # Prefer HTML content, fallback to storage file link
+    html = d.get("html") or f"<p>Download: {d.get('storage_path')}</p>"
+    # simple sign form
+    return HTMLResponse(f"""
+      <html><body style="font-family:sans-serif;max-width:880px;margin:auto">
+      {html}
+      <hr/>
+      <form method="POST" action="/api/signoff/docs/token-sign?token={token}">
+        <input type="submit" value="I acknowledge and sign"/>
+      </form>
+      </body></html>
+    """)
+
+@pub.post("/api/signoff/docs/token-sign")
+def token_sign(token: str):
+    sbs = get_service_supabase()
+    t = sbs.table("signoff_doc_tokens").select("*").eq("token", token).limit(1).execute().data
+    if not t: raise HTTPException(404, "Invalid token")
+    row = t[0]
+    if row.get("used_at"): raise HTTPException(400, "Already signed")
+    if datetime.now(timezone.utc) > datetime.fromisoformat(row["expires_at"]):
+        raise HTTPException(400, "Link expired")
+    # Update doc
+    sbs.table("signoff_docs").update({
+      "status":"signed", "signed_by": row["signer_email"], "signed_at": datetime.now(timezone.utc).isoformat()
+    }).eq("id", row["doc_id"]).execute()
+    sbs.table("signoff_doc_tokens").update({"used_at": datetime.now(timezone.utc).isoformat()})\
+      .eq("id", row["id"]).execute()
+    # Audit
+    d = sbs.table("signoff_docs").select("org_id,project_id").eq("id", row["doc_id"]).limit(1).execute().data[0]
+    sbs.table("audit_events").insert({
+      "org_id": d["org_id"], "project_id": d["project_id"], "actor_id": None,
+      "kind": "signoff.doc.signed", "details": {"doc_id": row["doc_id"], "email": row["signer_email"]}
+    }).execute()
+    return {"ok": True}
+
+
+Mount in server/main.py:
+
+from .routers import signoff_docs
+app.include_router(signoff_docs.router)   # /api/signoff/docs/*
+app.include_router(signoff_docs.pub)      # /signoff/doc/{token}
+
+
+Dev-safe: still uses service client for storage and inserts, membership guards on list/create.
+
+3) Sign-Off Docs page (PM UI)
+
+Create: client/src/pages/SignoffDocs.tsx
+
+import { useEffect, useState } from "react";
+import { useParams } from "react-router-dom";
+import { getJSON, postJSON } from "@/lib/authFetch";
+import PageHeaderHint from "@/components/PageHeaderHint";
+
+type Doc = { id:string; name:string; status:string; stage_id?:string; html?:string; storage_path?:string; signed_by?:string; signed_at?:string };
+
+export default function SignoffDocs(){
+  const { projectId } = useParams();
+  const [docs,setDocs]=useState<Doc[]>([]);
+  const [stageId,setStageId]=useState("");
+  const [genName,setGenName]=useState("Customer Acknowledgement");
+  const [intro,setIntro]=useState("Please review and approve the following:");
+  const [bullets,setBullets]=useState("Scope is finalized; Cutover window confirmed");
+  const [emailTo,setEmailTo]=useState("");
+
+  async function load(){ const d= await getJSON<{items:Doc[]}>(`/api/signoff/docs/list?project_id=${projectId}`); setDocs(d.items||[]); }
+  useEffect(()=>{ load(); },[projectId]);
+
+  async function generate(){
+    const body = {
+      name: genName, stage_id: stageId || null,
+      intro, bullets: bullets.split("|").map(s=>s.trim()).filter(Boolean),
+      acceptance_text: "I acknowledge and approve the above.", footer: "Signed electronically via TEAIM"
+    };
+    await postJSON(`/api/signoff/docs/generate?project_id=${projectId}`, body);
+    load();
+  }
+
+  async function send(docId:string){
+    await postJSON(`/api/signoff/docs/request-sign?project_id=${projectId}`, { doc_id: docId, email_to: emailTo || "" });
+    alert("Sent (or queued per quiet hours)");
+    load();
+  }
+
+  async function upload(e:any){
+    const f = e.target.files?.[0]; if(!f) return;
+    const fd = new FormData(); fd.append("file", f);
+    if(stageId) fd.append("stage_id", stageId);
+    const res = await fetch(`/api/signoff/docs/upload?project_id=${projectId}${stageId?`&stage_id=${stageId}`:""}`, { method:"POST", credentials:"include", body: fd as any });
+    if(!res.ok) alert(await res.text());
+    else load();
+  }
+
+  return (
+    <div className="p-6 space-y-4">
+      <PageHeaderHint
+        id="signoff-docs"
+        title="Sign-Off Documents"
+        intro="Upload a partner document for customer sign-off or draft one from PM input."
+        bullets={[
+          "Upload PDF/Doc or generate HTML draft (“Kap draft”)",
+          "Request signature via token email; public sign page records signature",
+          "Track status: draft, final, sent, signed"
+        ]}
+      />
+      <div className="border rounded p-3 space-y-2">
+        <div className="text-sm font-medium">Generate Draft</div>
+        <input className="border rounded p-2 w-full" placeholder="Title" value={genName} onChange={e=>setGenName(e.target.value)} />
+        <input className="border rounded p-2 w-full" placeholder="Stage ID (optional)" value={stageId} onChange={e=>setStageId(e.target.value)} />
+        <textarea className="border rounded p-2 w-full" placeholder="Intro" value={intro} onChange={e=>setIntro(e.target.value)} />
+        <input className="border rounded p-2 w-full" placeholder="Bullets (separate with |)" value={bullets} onChange={e=>setBullets(e.target.value)} />
+        <button className="px-3 py-2 border rounded" onClick={generate}>Generate Draft</button>
+      </div>
+
+      <div className="border rounded p-3 space-y-2">
+        <div className="text-sm font-medium">Upload Partner Document</div>
+        <input className="border rounded p-2 w-full" placeholder="Stage ID (optional)" value={stageId} onChange={e=>setStageId(e.target.value)} />
+        <input type="file" onChange={upload} />
+      </div>
+
+      <div className="border rounded p-3">
+        <div className="flex items-end gap-2 mb-2">
+          <input className="border rounded p-2 w-full" placeholder="Recipient email" value={emailTo} onChange={e=>setEmailTo(e.target.value)} />
+        </div>
+        <div className="grid md:grid-cols-2 gap-2">
+          {docs.map(d=>(
+            <div key={d.id} className="border rounded p-2">
+              <div className="text-sm font-medium">{d.name}</div>
+              <div className="text-xs text-muted-foreground">Status: {d.status} {d.signed_by?` • signed by ${d.signed_by}`:""}</div>
+              <div className="flex gap-2 mt-2">
+                <button className="px-2 py-1 border rounded text-xs" onClick={()=>send(d.id)} disabled={!emailTo}>Request Sign</button>
+                {d.status==="signed" && <a className="px-2 py-1 border rounded text-xs" target="_blank" rel="noreferrer" href={`/share/${d.id}`}>Open</a>}
+              </div>
+            </div>
+          ))}
+          {!docs.length && <div className="text-sm text-muted-foreground">No sign-off documents yet.</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+Route (and a link under Sign-Off menu):
+
+{ path: "/projects/:projectId/signoff/docs", element: <SignoffDocs/> }
+
+4) Stage Area in Composer (quick field)
+
+In client/src/pages/SignoffComposer.tsx, add one input and include stage_area in the body you POST to preview/send/zip:
+
+const [stageArea, setStageArea] = useState("");
+<input className="border rounded p-2 w-full" placeholder="Stage area (optional)" value={stageArea} onChange={e=>setStageArea(e.target.value)} />
+
+const body = {
+  stage_title: stageTitle,
+  stage_area: stageArea || undefined,
+  artifact_ids: arts.filter(a=>chk[a.id]).map(a=>a.id),
+  include_actions: actions, include_risks: risks, include_decisions: decisions,
+  message
+};
+
+
+On your backend, when creating/locating the stage, set area: body.stage_area.
+
+5) Pending Updates badge (reliable)
+
+(If you didn’t finish before:) in the sidebar link, render <UpdatesBadge projectId={projectId} /> (code earlier). Ensure /api/updates/count is mounted.
+
+6) Admin Health — Reload Schema button
+
+(If not yet patched) add the button snippet from the previous section to AdminHealthDashboard.jsx/tsx.
+
+7) Express proxy (keep /api intact)
+
+Double-check your proxy/index.js doesn’t pathRewrite away /api and forwards dev headers. (Snippet above.)
+
+8) Mount routers (final)
+
+In server/main.py make sure these exist once:
+
+from .routers import signoff_docs, stages_manage, updates_status, updates_rules
+app.include_router(signoff_docs.router)
+app.include_router(signoff_docs.pub)        # public
+app.include_router(stages_manage.router)
+app.include_router(updates_status.router)
+app.include_router(updates_rules.router)
+
+
+(And your existing: updates.router, _debug_routes.router, share_links(_export).router, audit_export.router, etc.)
+
+9) 2-minute test
+
+Reload schema → button returns OK.
+
+Stages page loads; set an Area; save.
+
+Sign-Off Docs: Generate draft → shows in list; Upload file → appears with final status.
+
+Request Sign → email link logged; public page loads; click I acknowledge and sign → doc status becomes signed; audit event signoff.doc.signed appears.
+
+Composer: Stage Area included; send still works.
+
+Sidebar badge increments if you enqueue pending updates.

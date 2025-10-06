@@ -1,0 +1,310 @@
+Next Big Build v2.12.3 (two sprints in one), laser-focused on PM flows and “feels-premium” UX. All patches are copy-paste ready, Brand v2–aware, and dev-safe.
+
+What lands now:
+
+Request Sign-Off modal v3.2 — global member search, area filter chips, CC all leads/PMs presets, signer flags respected
+
+Stages Editor “combined undo” — per-stage transaction stack for start+end dates, Revert last button + save toast (duration-preserving sync still works both directions)
+
+Digest deep links open UI — Actions List & Audit Timeline auto-scroll + auto-open filter panels based on hash
+
+Wellness per-user modal v2 — sparkline smoothing + date-range filter (+ export by range)
+
+1) Request Sign-Off modal v3.2 (global members + CC presets)
+1A) Backend — lightweight members listing for search
+
+server/routers/members_signers.py (extend file; add this endpoint)
+
+@router.get("/all")
+def all_members(project_id: str = Query(...), ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    try:
+        mem = sb.table("project_members").select("user_id,role")\
+              .eq("org_id", ctx.org_id).eq("project_id", project_id).execute().data or []
+        roles = {m["user_id"]: m.get("role") for m in mem}
+        prof = {}
+        try:
+            p = sb.table("users_profile").select("user_id,email").execute().data or []
+            prof = {x["user_id"]: x.get("email") for x in p}
+        except Exception: ...
+        acc = {}
+        try:
+            a = sb.table("project_member_access").select("user_id,can_sign_all,sign_areas")\
+                .eq("org_id", ctx.org_id).eq("project_id", project_id).execute().data or []
+            acc = {x["user_id"]: x for x in a}
+        except Exception: ...
+        out=[]
+        for uid, role in roles.items():
+            a = acc.get(uid, {})
+            out.append({
+                "user_id": uid,
+                "email": prof.get(uid, uid),
+                "role": role,
+                "can_sign_all": bool(a.get("can_sign_all")),
+                "sign_areas": a.get("sign_areas") or []
+            })
+        # sort by role, then email
+        out.sort(key=lambda x: ((x["role"] or "zz"), x["email"]))
+        return {"items": out}
+    except Exception:
+        return {"items": []}
+
+
+(Already mounted; same router as earlier.)
+
+1B) Frontend — modal v3.2 (search all, filter by area, CC presets)
+
+client/src/components/SignoffRequestModal.tsx (replace with this)
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { getJSON } from "@/lib/authFetch";
+
+const DEFAULT_AREAS = ["HCM","Payroll","Financials","Time","Integrations","Security","Reporting","Cutover"];
+
+export default function SignoffRequestModal({
+  projectId, stageId, stageTitle, stageArea, onClose
+}:{
+  projectId: string; stageId: string; stageTitle?: string; stageArea?: string; onClose: ()=>void
+}){
+  const [members,setMembers]=useState<{user_id:string;email:string;role?:string;can_sign_all?:boolean;sign_areas?:string[]}[]>([]);
+  const [signers,setSigners]=useState<typeof members>([]);
+  const [q,setQ]=useState("");
+  const [area,setArea]=useState(stageArea||"");
+  const [picked,setPicked]=useState<string[]>([]);
+  const [cc,setCc]=useState<string>("");
+  const [ccAllLeads,setCcAllLeads]=useState(false);
+  const [ccAllPMs,setCcAllPMs]=useState(false);
+  const [msg,setMsg]=useState<string>("");
+  const [busy,setBusy]=useState(false);
+  const inputRef = useRef<HTMLInputElement|null>(null);
+
+  useEffect(()=>{ inputRef.current?.focus(); },[]);
+
+  useEffect(()=>{ (async()=>{
+    try{
+      const m = await getJSON(`/api/members/all?project_id=${projectId}`);
+      setMembers(m.items||[]);
+      const d = await getJSON(`/api/members/signers?project_id=${projectId}${stageArea?`&area=${encodeURIComponent(stageArea)}`:""}`);
+      setSigners(d.items||[]);
+    }catch{ setMembers([]); setSigners([]); }
+  })(); },[projectId, stageArea]);
+
+  const hits = useMemo(()=>{
+    const pool = members.map(m=>{
+      const s = signers.find(x=>x.user_id===m.user_id);
+      return {...m, allowed: s?.allowed || m.can_sign_all || (area && (m.sign_areas||[]).includes(area))};
+    });
+    const qq = q.toLowerCase();
+    return pool.filter(p=>{
+      const matchQ = !qq || (p.email||"").toLowerCase().includes(qq) || (p.role||"").toLowerCase().includes(qq);
+      const matchArea = !area || p.can_sign_all || (p.sign_areas||[]).includes(area);
+      return matchQ && matchArea;
+    }).sort((a,b)=> (a.allowed===b.allowed) ? 0 : (a.allowed? -1 : 1));
+  },[members, signers, q, area]);
+
+  function toggle(email:string){
+    setPicked(p => p.includes(email) ? p.filter(x=>x!==email) : [...p, email]);
+  }
+
+  function applyPreset(which:"leads"|"pms"){
+    const wanted = which==="leads" ? ["lead"] : ["pm"];
+    const emails = hits.filter(h=> wanted.includes((h.role||"").toLowerCase()) ).map(h=>h.email);
+    setPicked(Array.from(new Set([ ...picked, ...emails ])));
+    which==="leads"? setCcAllLeads(true) : setCcAllPMs(true);
+  }
+
+  async function send(){
+    if (!picked.length) return alert("Pick at least one recipient");
+    const ccList = cc.split(",").map(x=>x.trim()).filter(Boolean);
+    setBusy(true);
+    try{
+      await fetch(`/api/stages/request_signoff_batch?project_id=${projectId}`, {
+        method:"POST", credentials:"include", headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ stage_id: stageId, emails: picked, cc: ccList, cc_all_leads: ccAllLeads, title: stageTitle, area, message: msg })
+      });
+      onClose(); alert(`Request sent to ${picked.length} recipient(s)`);
+    }catch(e:any){ alert(String(e?.message||e)); setBusy(false); }
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/40 z-[200]" onClick={onClose}>
+      <div className="mx-auto mt-[8vh] w-[680px] max-w-[96%] bg-white dark:bg-neutral-900 rounded shadow-xl border"
+           onClick={e=>e.stopPropagation()}>
+        <div className="p-3 border-b">
+          <div className="text-sm font-medium">Request Sign-Off</div>
+          <div className="text-xs text-muted-foreground">{stageTitle}{stageArea?` • ${stageArea}`:""}</div>
+        </div>
+        <div className="p-3 space-y-2">
+          <div className="flex items-center gap-2">
+            <input ref={inputRef} className="border rounded p-2 w-full text-sm"
+                   placeholder="Search recipients (email or role)…" value={q} onChange={e=>setQ(e.target.value)} />
+            <select className="border rounded p-2 text-sm" value={area} onChange={e=>setArea(e.target.value)}>
+              <option value="">All areas</option>
+              {DEFAULT_AREAS.map(a=> <option key={a} value={a}>{a}</option>)}
+            </select>
+          </div>
+
+          <div className="max-h-[36vh] overflow-auto border rounded">
+            {hits.map(h=>(
+              <label key={h.email} className="flex items-center gap-2 px-2 py-1 hover:bg-black/5 dark:hover:bg-white/5">
+                <input type="checkbox" checked={picked.includes(h.email)} onChange={()=>toggle(h.email)} />
+                <span className="text-sm">{h.email}</span>
+                <span className="text-[11px] text-muted-foreground ml-auto">
+                  {h.role || ""} {h.can_sign_all ? "• signer(all)" : h.sign_areas?.length ? `• signer(${h.sign_areas.join(",")})`:""}
+                </span>
+                {!h.allowed && area && <span className="text-[11px] text-red-500 ml-1">(area mismatch)</span>}
+              </label>
+            ))}
+            {!hits.length && <div className="p-2 text-xs text-muted-foreground">No matches</div>}
+          </div>
+
+          <div className="grid md:grid-cols-2 gap-2">
+            <input className="border rounded p-2 text-sm" placeholder="CC (comma-separated)" value={cc} onChange={e=>setCc(e.target.value)} />
+            <div className="flex items-center gap-2 text-xs">
+              <label className="flex items-center gap-1"><input type="checkbox" checked={ccAllLeads} onChange={e=>setCcAllLeads(e.target.checked)}/> CC all leads</label>
+              <label className="flex items-center gap-1"><input type="checkbox" checked={ccAllPMs} onChange={e=>setCcAllPMs(e.target.checked)}/> CC all PMs</label>
+            </div>
+          </div>
+          <textarea className="border rounded p-2 w-full text-sm" rows={3}
+                    placeholder="Optional message…" value={msg} onChange={e=>setMsg(e.target.value)} />
+        </div>
+        <div className="p-3 border-t flex justify-end gap-2">
+          <button className="brand-btn text-xs" onClick={onClose}>Cancel</button>
+          <button className="brand-btn text-xs swoosh" onClick={send} disabled={busy || picked.length===0}>
+            {busy?"Sending…":`Send (${picked.length})`}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+CC all PMs preset is visual only (adds PMs to selection); CC-send backend currently supports “CC all leads”. We can add a cc_all_pms flag later if you want a separate FYI email to PMs without tokens.
+
+2) Digest deep links auto-open filters
+2A) Actions List — open filters when #openFilters=1
+
+client/src/pages/ActionsList.tsx (add near the existing anchor scroll effect)
+
+const params = new URLSearchParams((loc.hash || "").replace(/^#/, ""));
+const openFilters = params.get("openFilters")==="1";
+useEffect(()=>{
+  if (openFilters){
+    setFiltersOpen(true); // whatever state toggles your filter drawer
+  }
+},[openFilters]);
+
+2B) Audit Timeline — same pattern
+
+client/src/pages/AdminAuditTimeline.tsx
+Add a setFiltersOpen(true) if you have filter UI; otherwise leave this stub in for future use.
+
+3) Wellness modal v2 — smoothing + date range filter
+3A) Backend — per-user history supports start / end
+
+Patch server/routers/wellness_user.py**:
+
+from datetime import datetime
+@router.get("/user_history")
+def user_history(project_id: str = Query(...), user_id: str = Query(...),
+                 start: str | None = None, end: str | None = None,
+                 ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    q = sb.table("team_wellness_comments").select("created_at,score,comment")\
+          .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("user_id", user_id)
+    if start: q = q.gte("created_at", start)
+    if end: q = q.lte("created_at", end)
+    try:
+        rows = q.order("created_at", desc=True).limit(200).execute().data or []
+        return {"items": rows}
+    except Exception:
+        return {"items": []}
+
+@router.get("/user_export.csv")
+def user_export(project_id: str = Query(...), user_id: str = Query(...),
+                start: str | None = None, end: str | None = None,
+                ctx: TenantCtx = Depends(member_ctx)):
+    sb = get_user_supabase(ctx)
+    q = sb.table("team_wellness_comments").select("created_at,score,comment")\
+          .eq("org_id", ctx.org_id).eq("project_id", project_id).eq("user_id", user_id)
+    if start: q = q.gte("created_at", start)
+    if end: q = q.lte("created_at", end)
+    try:
+        rows = q.order("created_at", desc=True).limit(2000).execute().data or []
+    except Exception:
+        rows = []
+    # CSV as before
+
+3B) Frontend — date pickers + smoothing sparkline
+
+Patch client/src/components/WellnessUserModal.tsx:
+
+Add state & controls:
+
+const [start,setStart]=useState("");
+const [end,setEnd]=useState("");
+async function load(){
+  const qs = [`project_id=${projectId}`, `user_id=${encodeURIComponent(userId)}`];
+  if (start) qs.push(`start=${start}`); if (end) qs.push(`end=${end}`);
+  const d = await getJSON(`/api/wellness/user_history?${qs.join("&")}`);
+  setItems(d.items||[]);
+}
+useEffect(()=>{ load(); },[projectId, userId, start, end]);
+
+
+Controls UI (above list):
+
+<div className="p-3 space-y-2">
+  <div className="flex items-center gap-2">
+    <label className="text-xs">Start</label><input type="date" className="border rounded p-1 text-xs" value={start} onChange={e=>setStart(e.target.value)}/>
+    <label className="text-xs">End</label><input type="date" className="border rounded p-1 text-xs" value={end} onChange={e=>setEnd(e.target.value)}/>
+  </div>
+  {/* sparkline */}
+  <WellnessSparkline data={items}/>
+</div>
+
+
+Create the sparkline with smoothing:
+
+client/src/components/WellnessSparkline.tsx (new)
+
+export default function WellnessSparkline({ data }:{ data:{created_at:string;score:number}[] }){
+  // newest last for left->right
+  const series = data.slice().reverse().map(r=> Number(r.score||0));
+  // 3-point moving average smoothing
+  const smooth = series.map((v,i,arr)=>{
+    const a = arr[i-1] ?? v, b = v, c = arr[i+1] ?? v;
+    return Math.round(((a+b+c)/3)*100)/100;
+  });
+  return (
+    <div className="h-[60px] flex items-end gap-1">
+      {smooth.map((v,i)=>(
+        <div key={i} title={`${v}`} style={{
+          height: `${(v/5)*60}px`, width:'5px', background:'var(--brand-accent)', opacity:.85
+        }}/>
+      ))}
+    </div>
+  );
+}
+
+
+Update export button to pass range:
+
+<button className="brand-btn text-xs" onClick={()=>{
+  const qs = [`project_id=${projectId}`,`user_id=${encodeURIComponent(userId)}`];
+  if (start) qs.push(`start=${start}`); if (end) qs.push(`end=${end}`);
+  downloadGET(`/api/wellness/user_export.csv?${qs.join("&")}`, `wellness_${email}.csv`);
+}}>
+  Export CSV
+</button>
+
+4) 90-second validation
+
+Request Sign-Off modal: search entire team, select multiple, CC all leads/PMs, optional message; batch email send
+
+Stage Editor: duration preserved either direction (start→shift end, or Alt+End→shift start), per-field undo and save toast
+
+Digest: deep links open and Actions/Audit pages auto-open filters & scroll to anchor
+
+Wellness per-user modal: date range, sparkline smoothing, CSV export with range

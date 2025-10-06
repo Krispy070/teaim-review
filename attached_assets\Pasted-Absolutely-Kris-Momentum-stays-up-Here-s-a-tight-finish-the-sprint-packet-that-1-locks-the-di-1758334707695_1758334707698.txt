@@ -1,0 +1,198 @@
+Absolutely, Kris. Momentum stays up. Here’s a tight “finish-the-sprint” packet that (1) locks the digest system in with clean UX, (2) gives you bulletproof verification steps, and (3) patches recipients so you’re not stuck on DIGEST_TEST_EMAIL.
+
+1) Project-level Digest controls (Preview + Send Now)
+
+Add a tiny control bar anywhere you have a projectId (project dashboard or admin toolbar).
+
+client/src/components/ProjectDigestActions.tsx
+
+import { useState } from "react";
+import { apiGet, apiPost } from "@/lib/api";
+
+export default function ProjectDigestActions({ projectId }: { projectId: string }) {
+  const [loading,setLoading] = useState(false);
+  const [html,setHtml] = useState<string>("");
+
+  async function preview() {
+    setLoading(true);
+    try {
+      const r = await apiGet<{html:string}>("/digest/preview", { project_id: projectId });
+      setHtml(r.html);
+    } finally { setLoading(false); }
+  }
+
+  async function sendWeekly() {
+    setLoading(true);
+    try {
+      await apiPost("/digest/send-weekly", undefined, { project_id: projectId });
+      alert("Queued/sent weekly digest (deduped by week). Check comms_send_log.");
+    } finally { setLoading(false); }
+  }
+
+  async function sendMonthly() {
+    setLoading(true);
+    try {
+      await apiPost("/digest/send-monthly", undefined, { project_id: projectId });
+      alert("Queued/sent monthly digest (deduped by month).");
+    } finally { setLoading(false); }
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex gap-2">
+        <button className="px-3 py-2 rounded border" disabled={loading} onClick={preview}>Preview</button>
+        <button className="px-3 py-2 rounded border" disabled={loading} onClick={sendWeekly}>Send Weekly</button>
+        <button className="px-3 py-2 rounded border" disabled={loading} onClick={sendMonthly}>Send Monthly</button>
+      </div>
+      {html && (
+        <div className="border rounded p-3 bg-background">
+          <div className="text-sm mb-2 font-medium">Preview</div>
+          <div className="prose prose-sm max-w-none" dangerouslySetInnerHTML={{__html: html}} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+Use it on any project page:
+
+// e.g., Project Dashboard page
+import ProjectDigestActions from "@/components/ProjectDigestActions";
+// ...
+<ProjectDigestActions projectId={projectId!} />
+
+2) Safer real recipients (no more env-only)
+
+Drop-in upgrade for your digest recipients helper. Tries, in order:
+
+project_members for roles ∈ {owner, admin, pm, lead}
+
+Attempts to resolve emails from a contacts or users_profile table if present (safe fallbacks)
+
+Falls back to DIGEST_TEST_EMAIL if nothing found
+
+Replace _recipients in server/routers/digest.py:
+
+def _recipients(sb, org_id: str, project_id: str):
+    emails: list[str] = []
+
+    # 1) members with roles that should get the digest
+    roles = ['owner','admin','pm','lead']
+    try:
+        ms = sb.table("project_members").select("user_id, role")\
+             .eq("org_id", org_id).eq("project_id", project_id).in_("role", roles).execute().data or []
+        user_ids = [m["user_id"] for m in ms]
+
+        # 2) try contacts table (if you store emails there)
+        if user_ids:
+            try:
+                cs = sb.table("contacts").select("user_id,email").in_("user_id", user_ids).execute().data or []
+                emails.extend([c["email"] for c in cs if c.get("email")])
+            except Exception:
+                pass
+
+        # 3) try users_profile (common pattern) for email
+        if user_ids and not emails:
+            try:
+                up = sb.table("users_profile").select("user_id,email").in_("user_id", user_ids).execute().data or []
+                emails.extend([u["email"] for u in up if u.get("email")])
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 4) final fallback
+    test = os.getenv("DIGEST_TEST_EMAIL")
+    if not emails and test:
+        emails = [test]
+
+    # return unique, sorted for stability
+    return sorted(set([e for e in emails if e]))
+
+
+When you’re ready, point this at your Team Subscriptions matrix to respect per-person preferences.
+
+3) Scheduler sanity & dedupe quick-tests
+
+Run these right now to prove end-to-end:
+
+A) Preview (JSON)
+
+curl -s -H "X-Dev-User: <UUID>" -H "X-Dev-Org: <UUID>" -H "X-Dev-Role: admin" \
+  "http://localhost:5000/api/digest/preview?project_id=<PROJ_UUID>" | jq '.counts,.overdue|length,.html|length'
+
+
+B) Manual weekly (dedup)
+
+curl -s -X POST -H "X-Dev-User: <UUID>" -H "X-Dev-Org: <UUID>" -H "X-Dev-Role: admin" \
+  "http://localhost:5000/api/digest/send-weekly?project_id=<PROJ_UUID>" | jq .
+
+
+Then confirm:
+
+select kind, period_key, to_email, created_at
+from comms_send_log
+where project_id = '<PROJ_UUID>'
+order by created_at desc
+limit 10;
+
+
+C) Quiet hours / cap guard
+
+In Comms Settings, set quiet window to include “now” → sending returns no sends, and reason is recorded by send_guard (you saw this pattern in External Signer).
+
+Temporarily set daily_send_cap=1, send twice → second run should result in zero new comms entries.
+
+D) Scheduler tick
+
+Set SCHEDULER_INTERVAL_SEC=10.
+
+In Comms Settings, set weekly day/hour = current local minute+1.
+
+Watch comms_send_log fill with period_key='wk:YYYY-WW' exactly once.
+
+4) Export UX micro-polish (auth-safe download)
+
+If your streaming export moved from window.open to fetch (to carry auth headers), give users a proper download:
+
+client/src/lib/download.ts
+
+export async function downloadBlob(url: string, filename: string, headers: Record<string,string>) {
+  const res = await fetch(url, { headers });
+  if (!res.ok) throw new Error(await res.text());
+  const blob = await res.blob();
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = filename;
+  document.body.appendChild(link); link.click();
+  URL.revokeObjectURL(link.href); link.remove();
+}
+
+
+Use it in your Admin Projects page, passing the same auth headers you already generate in api.ts.
+
+5) Smoke-check dashboard events (one-liners)
+
+Telemetry 5xx / rate-limits
+
+select kind, path, created_at from telemetry_events order by created_at desc limit 20;
+
+
+Digest sends today
+
+select * from comms_send_log
+where created_at::date = now()::date
+order by created_at desc;
+
+6) What I recommend next (fast wins)
+
+Recipients by subscription: wire _recipients to your Team Subscriptions matrix so only opted-in roles get weekly/monthly.
+
+Nightly backups: 02:00 org-local → zip of artifacts+manifest to backups/ with 14-day retention.
+
+OCR “needs attention” badge: small red dot on Documents tab if anything queued with needs_ocr.
+
+Digest “dry run to self” toggle in AdminComms (sends to you only for a week).
+
+If you want, I’ll wire any two of those right now—just say which.

@@ -1,0 +1,30 @@
+[project]
+name = "repl-nix-workspace"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.11"
+dependencies = [
+    "aiofiles>=24.1.0",
+    "chardet>=5.2.0",
+    "docx>=0.2.4",
+    "email-validator>=2.3.0",
+    "fastapi>=0.116.2",
+    "numpy>=2.3.3",
+    "openai>=1.108.0",
+    "pgvector>=0.4.1",
+    "postgrest>=2.19.0",
+    "psycopg>=3.2.10",
+    "psycopg2-binary>=2.9.10",
+    "pydantic>=2.11.9",
+    "pyjwt>=2.10.1",
+    "pypdf>=6.0.0",
+    "pytesseract>=0.3.13",
+    "python-docx>=1.2.0",
+    "python-magic>=0.4.27",
+    "python-multipart>=0.0.20",
+    "pytz>=2025.2",
+    "requests>=2.32.5",
+    "starlette>=0.48.0",
+    "supabase>=2.19.0",
+    "uvicorn>=0.35.0",
+]
