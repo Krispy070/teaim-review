@@ -1,0 +1,21 @@
+/* Scoped, predictable nav style */
+.nav-bar { display:flex; gap:8px; flex-wrap:wrap; margin:0 0 16px 0; }
+
+/* establish base so other global styles don't override */
+.nav-pill {
+  all: unset;                /* remove foreign styles */
+  display: inline-block;
+  padding: 8px 14px;
+  border-radius: 10px;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  border: 1px solid #e5e7eb; /* light gray */
+  background: #f5f5f5;
+  color: #111;
+}
+.nav-pill:hover { background:#eee; }
+.nav-pill.active {
+  background: #c7d2fe;       /* soft indigo */
+  border-color: #c7d2fe;
+}
