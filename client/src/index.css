@@ -58,7 +58,7 @@
 
 :root {
   /* Brand (from TEAIM Brand Book v2) */
-  --brand-charcoal: #1C1C1E;
+  --brand-charcoal: #12131a;
   --brand-orange:   #F26B1D; /* AI accent */
   --brand-gold:     #FFC933;
   --brand-success:  #2ECC71;
@@ -66,37 +66,39 @@
   --brand-error:    #E74C3C;
   --brand-white:    #FFFFFF;
   --brand-midgray:  #7D7D7D; /* for light themes / borders only on dark */
+  --brand-purple:   #6C4CFF;
+  --brand-neon:     #7CFBD6;
 
-  /* Dark UI surfaces (accessible) */
-  --ui-bg:        #0E0F12;             /* main app background (deeper than charcoal for contrast) */
-  --ui-panel:     #14161D;             /* card surface */
-  --ui-panel-2:   #191C26;             /* elevated surface */
-  --ui-border:    #2C2F3A;             /* visible border on dark */
-  --ui-divider:   #252832;
+  /* Light UI surfaces tuned to brand palette */
+  --ui-bg:        #F6F7FF;
+  --ui-panel:     #FFFFFF;
+  --ui-panel-2:   #EEF0FF;
+  --ui-border:    rgba(21, 20, 35, 0.12);
+  --ui-divider:   rgba(21, 20, 35, 0.14);
 
-  /* Text (accessible on dark) */
-  --text-strong:  #FFFFFF;             /* primary headings */
-  --text:         #E9ECF1;             /* body text */
-  --text-soft:    #C7CCD7;             /* secondary */
-  --text-muted:   #A7ADBD;             /* tertiary */
-  --text-dim:     #8C93A3;             /* placeholders only */
+  /* Text (accessible on light) */
+  --text-strong:  #0F1016;
+  --text:         rgba(17, 19, 30, 0.88);
+  --text-soft:    rgba(17, 19, 30, 0.72);
+  --text-muted:   rgba(17, 19, 30, 0.58);
+  --text-dim:     rgba(17, 19, 30, 0.45);
 
   /* Action & state */
-  --accent:       var(--brand-orange);  /* primary CTAs, highlights */
-  --accent-2:     var(--brand-gold);    /* secondary highlight */
+  --accent:       var(--brand-purple);
+  --accent-2:     var(--brand-neon);
   --success:      var(--brand-success);
   --warn:         var(--brand-warn);
   --error:        var(--brand-error);
 
-  /* Pills / badges backgrounds (transparent tints for dark) */
-  --pill-accent:  rgba(242,107,29,0.18);
-  --pill-gold:    rgba(255,201,51,0.18);
-  --pill-success: rgba(46,204,113,0.18);
-  --pill-warn:    rgba(255,193,7,0.18);
-  --pill-error:   rgba(231,76,60,0.18);
+  /* Pills / badges backgrounds */
+  --pill-accent:  rgba(108, 76, 255, 0.12);
+  --pill-gold:    rgba(255, 201, 51, 0.18);
+  --pill-success: rgba(46, 204, 113, 0.18);
+  --pill-warn:    rgba(255, 193, 7, 0.18);
+  --pill-error:   rgba(231, 76, 60, 0.18);
 
   /* Focus outline for keyboard nav */
-  --focus:        rgba(255,201,51,0.65);
+  --focus:        rgba(124, 251, 214, 0.65);
 
   /* Legacy mappings for existing code */
   --background: var(--ui-bg);
@@ -105,20 +107,20 @@
   --card-foreground: var(--text);
   --popover: var(--ui-panel-2);
   --popover-foreground: var(--text);
-  --primary: var(--brand-orange);              /* Primary actions = orange */
-  --primary-foreground: var(--ui-bg);
+  --primary: var(--brand-purple);
+  --primary-foreground: var(--brand-white);
   --secondary: var(--ui-panel-2);
   --secondary-foreground: var(--text);
   --muted: var(--ui-panel-2);
   --muted-foreground: var(--text-muted);
   --accent-foreground: var(--text-strong);
   --destructive: var(--error);
-  --destructive-foreground: var(--text-strong);
+  --destructive-foreground: var(--brand-white);
   --border: var(--ui-border);
   --input: var(--ui-panel-2);
-  --ring: var(--ui-border);
-  --success: var(--brand-success);             /* Success = green */
-  --chart-1: hsl(220, 70%, 50%);
+  --ring: color-mix(in oklab, var(--brand-purple), transparent 70%);
+  --success: var(--brand-success);
+  --chart-1: hsl(259, 88%, 66%);
   --chart-2: hsl(160, 60%, 45%);
   --chart-3: hsl(30, 80%, 55%);
   --chart-4: hsl(280, 65%, 60%);
@@ -136,32 +138,263 @@
 }
 
 .dark {
-  /* Use same TEAIM brand colors as :root for consistent dark theme */
-  --background: var(--ui-bg);
-  --foreground: var(--text);
-  --card: var(--ui-panel);
-  --card-foreground: var(--text);
-  --popover: var(--ui-panel-2);
-  --popover-foreground: var(--text);
-  --primary: var(--brand-orange);              /* Primary actions = orange */
-  --primary-foreground: var(--ui-bg);
-  --secondary: var(--ui-panel-2);
-  --secondary-foreground: var(--text);
-  --muted: var(--ui-panel-2);
-  --muted-foreground: var(--text-muted);
-  --accent: var(--brand-orange);
-  --accent-foreground: var(--text-strong);
+  /* Dark theme variant anchored in charcoal + neon palette */
+  --background: #0E0F12;
+  --foreground: #E9ECF1;
+  --card: #14161D;
+  --card-foreground: #E9ECF1;
+  --popover: #191C26;
+  --popover-foreground: #E9ECF1;
+  --primary: var(--brand-orange);
+  --primary-foreground: #0B0C12;
+  --secondary: #191C26;
+  --secondary-foreground: #E9ECF1;
+  --muted: #191C26;
+  --muted-foreground: #A7ADBD;
+  --accent: var(--brand-purple);
+  --accent-foreground: var(--brand-white);
   --destructive: var(--error);
-  --destructive-foreground: var(--text-strong);
-  --border: var(--ui-border);
-  --input: var(--ui-panel-2);
-  --ring: var(--ui-border);
-  --success: var(--brand-success);             /* Success = green */
-  --chart-1: hsl(220, 70%, 50%);
+  --destructive-foreground: var(--brand-white);
+  --border: #2C2F3A;
+  --input: #191C26;
+  --ring: color-mix(in oklab, var(--brand-purple), transparent 60%);
+  --success: var(--brand-success);
+  --chart-1: hsl(259, 82%, 72%);
   --chart-2: hsl(160, 60%, 45%);
   --chart-3: hsl(30, 80%, 55%);
   --chart-4: hsl(280, 65%, 60%);
   --chart-5: hsl(340, 75%, 55%);
+}
+
+.dark {
+  --ui-bg:        #0E0F12;
+  --ui-panel:     #14161D;
+  --ui-panel-2:   #191C26;
+  --ui-border:    #2C2F3A;
+  --ui-divider:   #252832;
+  --text-strong:  #FFFFFF;
+  --text:         #E9ECF1;
+  --text-soft:    #C7CCD7;
+  --text-muted:   #A7ADBD;
+  --text-dim:     #8C93A3;
+}
+
+.dark body {
+  background: var(--background);
+  color: var(--foreground);
+}
+
+/* Hero + auth gradients */
+.teaim-hero {
+  background:
+    radial-gradient(120% 120% at 0% 0%, rgba(108, 76, 255, 0.18) 0%, transparent 60%),
+    radial-gradient(110% 110% at 100% 20%, rgba(124, 251, 214, 0.16) 0%, transparent 58%),
+    linear-gradient(135deg, rgba(246, 247, 255, 0.98) 0%, rgba(233, 232, 255, 0.92) 55%, rgba(255, 255, 255, 0.95) 100%);
+}
+
+.dark .teaim-hero {
+  background:
+    radial-gradient(140% 140% at 0% 0%, rgba(108, 76, 255, 0.28) 0%, transparent 60%),
+    radial-gradient(120% 120% at 100% 20%, rgba(124, 251, 214, 0.18) 0%, transparent 60%),
+    linear-gradient(135deg, rgba(14, 15, 18, 0.95) 0%, rgba(24, 18, 38, 0.95) 45%, rgba(16, 17, 28, 0.98) 100%);
+}
+
+.teaim-auth-bg {
+  background:
+    radial-gradient(90% 120% at 15% 15%, rgba(108, 76, 255, 0.22) 0%, transparent 70%),
+    radial-gradient(70% 110% at 85% 0%, rgba(124, 251, 214, 0.18) 0%, transparent 75%),
+    linear-gradient(160deg, rgba(246, 247, 255, 1) 0%, rgba(231, 236, 255, 0.92) 50%, rgba(244, 248, 255, 0.95) 100%);
+}
+
+.dark .teaim-auth-bg {
+  background:
+    radial-gradient(100% 130% at 0% 0%, rgba(108, 76, 255, 0.3) 0%, transparent 70%),
+    radial-gradient(80% 120% at 100% 0%, rgba(124, 251, 214, 0.24) 0%, transparent 70%),
+    linear-gradient(160deg, rgba(8, 9, 14, 0.98) 0%, rgba(16, 15, 28, 0.98) 50%, rgba(18, 20, 32, 0.98) 100%);
+}
+
+.teaim-grid-pattern {
+  position: absolute;
+  inset: 0;
+  opacity: 0.18;
+  background-image: linear-gradient(90deg, rgba(124, 251, 214, 0.12) 1px, transparent 0),
+    linear-gradient(0deg, rgba(108, 76, 255, 0.12) 1px, transparent 0);
+  background-size: 32px 32px;
+  mask: radial-gradient(circle at center, rgba(0, 0, 0, 0.55) 0%, transparent 70%);
+  pointer-events: none;
+}
+
+.dark .teaim-grid-pattern {
+  opacity: 0.22;
+}
+
+.teaim-surface {
+  background: color-mix(in srgb, var(--card) 86%, rgba(124, 251, 214, 0.08));
+  border: 1px solid color-mix(in srgb, var(--border) 80%, rgba(108, 76, 255, 0.14));
+  box-shadow: 0 24px 60px -40px rgba(12, 14, 33, 0.65);
+  backdrop-filter: blur(18px) saturate(140%);
+}
+
+.dark .teaim-surface {
+  background: color-mix(in srgb, var(--card) 88%, rgba(16, 18, 40, 0.65));
+  border-color: color-mix(in srgb, var(--border) 60%, rgba(124, 251, 214, 0.18));
+  box-shadow: 0 28px 72px -44px rgba(2, 5, 15, 0.95);
+}
+
+.teaim-nav {
+  background: color-mix(in srgb, var(--background) 80%, rgba(124, 251, 214, 0.06));
+  backdrop-filter: blur(18px) saturate(140%);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, rgba(108, 76, 255, 0.18));
+}
+
+.dark .teaim-nav {
+  background: color-mix(in srgb, var(--ui-bg) 88%, rgba(14, 16, 33, 0.6));
+  border-bottom-color: color-mix(in srgb, var(--ui-border) 70%, rgba(108, 76, 255, 0.2));
+}
+
+.teaim-footer {
+  background: linear-gradient(180deg, transparent 0%, color-mix(in srgb, var(--ui-panel-2) 70%, rgba(108, 76, 255, 0.08)) 100%);
+}
+
+.teaim-input {
+  border-radius: 18px;
+  border: 1px solid color-mix(in srgb, var(--border) 70%, rgba(108, 76, 255, 0.15));
+  background: color-mix(in srgb, var(--card) 92%, rgba(124, 251, 214, 0.04));
+  padding: 0.9rem 1rem;
+  color: var(--foreground);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.12s ease;
+}
+
+.teaim-input:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--brand-purple) 70%, var(--brand-neon) 30%);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--brand-purple) 25%, transparent 70%);
+}
+
+.teaim-cta {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  border-radius: 999px;
+  padding: 0.9rem 1.8rem;
+  font-weight: 600;
+  background-image: linear-gradient(135deg, var(--brand-purple) 0%, var(--brand-orange) 50%, var(--brand-neon) 100%);
+  color: #05060C;
+  box-shadow: 0 20px 40px -22px rgba(108, 76, 255, 0.55);
+  transition: transform 0.15s ease, box-shadow 0.2s ease;
+}
+
+.teaim-cta:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 26px 50px -20px rgba(108, 76, 255, 0.55);
+}
+
+.teaim-cta:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--brand-neon) 40%, transparent 60%);
+}
+
+.teaim-cta-ghost {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  border-radius: 999px;
+  padding: 0.9rem 1.8rem;
+  font-weight: 600;
+  border: 1px solid color-mix(in srgb, var(--border) 70%, rgba(108, 76, 255, 0.25));
+  color: var(--foreground);
+  background: color-mix(in srgb, var(--card) 90%, transparent);
+  transition: border-color 0.15s ease, background 0.2s ease, transform 0.15s ease;
+}
+
+.teaim-cta-ghost:hover {
+  transform: translateY(-2px);
+  border-color: color-mix(in srgb, var(--brand-purple) 45%, var(--brand-neon) 55%);
+  background: color-mix(in srgb, var(--card) 80%, rgba(124, 251, 214, 0.08));
+}
+
+.teaim-cta-ghost:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--brand-purple) 25%, transparent 70%);
+}
+
+.teaim-toggle {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.35rem;
+  padding: 0.35rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--card) 92%, rgba(108, 76, 255, 0.08));
+  border: 1px solid color-mix(in srgb, var(--border) 70%, rgba(124, 251, 214, 0.16));
+}
+
+.teaim-toggle button {
+  border-radius: 999px;
+  font-weight: 600;
+  padding: 0.65rem 1rem;
+  color: var(--text-soft);
+  transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.teaim-toggle button[data-active="true"] {
+  background: linear-gradient(135deg, var(--brand-purple) 0%, color-mix(in srgb, var(--brand-orange) 70%, var(--brand-purple) 30%) 100%);
+  color: var(--brand-white);
+  box-shadow: 0 16px 32px -18px rgba(108, 76, 255, 0.55);
+}
+
+.teaim-toggle button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--brand-neon) 30%, transparent 70%);
+}
+
+@keyframes teaimFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes teaimFadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.teaim-fade-in {
+  opacity: 0;
+  animation: teaimFadeIn 0.7s ease forwards;
+}
+
+.teaim-fade-in-up {
+  opacity: 0;
+  animation: teaimFadeInUp 0.8s ease forwards;
+}
+
+.teaim-delay-150 {
+  animation-delay: 0.15s;
+}
+
+.teaim-delay-300 {
+  animation-delay: 0.3s;
+}
+
+.teaim-delay-450 {
+  animation-delay: 0.45s;
+}
+
+.teaim-delay-600 {
+  animation-delay: 0.6s;
 }
 
 @layer base {

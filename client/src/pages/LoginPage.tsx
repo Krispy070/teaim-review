@@ -51,66 +51,79 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="min-h-screen grid place-items-center bg-slate-950 text-slate-100">
-      <div className="w-full max-w-md p-8 rounded-2xl border border-slate-800 bg-slate-900/50 space-y-4">
-        <div className="text-center">
-          <a href="/" className="font-bold text-xl" data-testid="link-logo">TEAIM.app</a>
-          <div className="text-sm opacity-70">Sign in to your workspace</div>
-        </div>
+    <div className="relative min-h-screen teaim-auth-bg text-foreground">
+      <div className="teaim-grid-pattern" aria-hidden />
+      <div className="relative z-10 flex min-h-screen items-center justify-center px-6 py-16">
+        <div className="teaim-surface w-full max-w-md space-y-6 rounded-3xl p-10 shadow-2xl teaim-fade-in-up">
+          <div className="text-center space-y-3">
+            <a href="/" className="inline-flex flex-col items-center gap-2" data-testid="link-logo">
+              <img src="/teaim-logo.svg" alt="TEAIM" className="h-12 w-auto drop-shadow" />
+              <span className="text-lg font-semibold tracking-wide text-[var(--text-strong)]">TEAIM.app</span>
+            </a>
+            <p className="text-sm text-muted-foreground">Sign in to your workspace</p>
+          </div>
 
-        <div className="grid grid-cols-2 gap-2">
-          <button
-            className={`px-3 py-2 rounded-xl border ${mode === "signin" ? "bg-slate-800 border-slate-700" : "border-slate-800"}`}
-            onClick={() => setMode("signin")}
-            data-testid="button-mode-signin"
-          >
-            Sign in
-          </button>
-          <button
-            className={`px-3 py-2 rounded-xl border ${mode === "signup" ? "bg-slate-800 border-slate-700" : "border-slate-800"}`}
-            onClick={() => setMode("signup")}
-            data-testid="button-mode-signup"
-          >
-            Sign up
-          </button>
-        </div>
+          <div className="teaim-toggle" role="tablist" aria-label="Choose sign in method">
+            <button
+              type="button"
+              className="text-sm"
+              data-active={mode === "signin"}
+              onClick={() => setMode("signin")}
+              data-testid="button-mode-signin"
+            >
+              Sign in
+            </button>
+            <button
+              type="button"
+              className="text-sm"
+              data-active={mode === "signup"}
+              onClick={() => setMode("signup")}
+              data-testid="button-mode-signup"
+            >
+              Sign up
+            </button>
+          </div>
 
-        <div className="space-y-2">
-          <input
-            className="w-full border rounded-xl px-3 py-2 bg-slate-950/60 border-slate-800"
-            placeholder="email@company.com"
-            value={email}
-            onChange={e => setEmail(e.target.value)}
-            data-testid="input-email"
-          />
-          <input
-            className="w-full border rounded-xl px-3 py-2 bg-slate-950/60 border-slate-800"
-            placeholder="password (optional)"
-            type="password"
-            value={pass}
-            onChange={e => setPass(e.target.value)}
-            data-testid="input-password"
-          />
-        </div>
+          <div className="space-y-3">
+            <input
+              className="teaim-input w-full"
+              placeholder="you@company.com"
+              value={email}
+              onChange={e => setEmail(e.target.value)}
+              data-testid="input-email"
+            />
+            <input
+              className="teaim-input w-full"
+              placeholder="Password (optional)"
+              type="password"
+              value={pass}
+              onChange={e => setPass(e.target.value)}
+              data-testid="input-password"
+            />
+          </div>
 
-        <div className="flex gap-2">
-          <button
-            className="flex-1 px-3 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500"
-            onClick={password}
-            data-testid="button-password-auth"
-          >
-            {mode === "signin" ? "Sign in" : "Create account"}
-          </button>
-          <button
-            className="flex-1 px-3 py-2 rounded-xl border border-slate-700 hover:bg-slate-800"
-            onClick={magic}
-            data-testid="button-magic-link"
-          >
-            Email me a link
-          </button>
-        </div>
+          <div className="space-y-3">
+            <button
+              className="teaim-cta w-full justify-center"
+              onClick={password}
+              data-testid="button-password-auth"
+            >
+              {mode === "signin" ? "Sign in" : "Create account"}
+            </button>
+            <button
+              className="teaim-cta-ghost w-full justify-center"
+              onClick={magic}
+              data-testid="button-magic-link"
+            >
+              Email me a link
+            </button>
+          </div>
 
-        {msg && <div className="text-xs opacity-70" data-testid="text-message">{msg}</div>}
+          {msg && <div className="text-xs text-muted-foreground" data-testid="text-message">{msg}</div>}
+          <p className="text-center text-xs text-muted-foreground">
+            Need help? <a className="font-medium text-[var(--accent)]" href="mailto:info@teaim.app">info@teaim.app</a>
+          </p>
+        </div>
       </div>
     </div>
   );
