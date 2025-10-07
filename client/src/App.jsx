@@ -42,9 +42,6 @@ import TeamPage from './pages/TeamPage'
 import UpdatesReview from './pages/UpdatesReview'
 import Stages from './pages/Stages'
 import StageWizard from './pages/StageWizard'
-import NotificationBell from './components/NotificationBell'
-import NotificationToaster from './components/NotificationToaster'
-import BrandedHeader from './components/BrandedHeader'
 import { getJSON } from "@/lib/authFetch"
 import ErrorBoundary from './components/ErrorBoundary'
 import AppShell from "@/components/AppShell"
@@ -457,7 +454,6 @@ function AppContent({ value }) {
             ) : (
               // Original layout system for non Brand V2
               <AppShell sidebar={<Sidebar />}>
-                <Topbar />
                 <main className="max-w-7xl mx-auto px-4 py-6">
                     <Route path="/">{() => <Redirect to={`/projects/${value.projectId}/dashboard`} />}</Route>
                     <Route path="/dashboard">{() => <Redirect to={`/projects/${value.projectId}/dashboard`} />}</Route>
@@ -624,55 +620,6 @@ function Sidebar(){
       </div>
       <div className="pb-8"></div>
     </aside>
-  )
-}
-
-function Topbar(){
-  const { orgId, projectId, setOrgId, setProjectId } = useOrg()
-  const brandV2 = isBrandV2()
-  
-  if (brandV2) {
-    console.log('🔍 Topbar Brand V2 rendering - BASIC TEST');
-    return (
-      <header className="border-b" style={{borderColor: 'var(--brand-primary, #111111)'}}>
-        <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
-          {/* Left side - Branding with project awareness */}
-          <div className="flex items-center">
-            <BrandedHeader variant="compact" showFallback={true} projectId={projectId} />
-          </div>
-          
-          {/* Right side - Controls with brand styling */}
-          <div className="flex items-center gap-2">
-            <input className="px-2 py-1 border rounded-full text-sm w-48 brand-card"
-                   placeholder="org_id (UUID)" value={orgId} onChange={e=>{window.__ORG__=e.target.value||''; setOrgId(e.target.value)}} data-testid="input-org-id" />
-            <input className="px-2 py-1 border rounded-full text-sm w-56 brand-card"
-                   placeholder="project_id (UUID)" value={projectId} onChange={e=>{window.__PROJ__=e.target.value||''; setProjectId(e.target.value)}} data-testid="input-project-id" />
-          </div>
-        </div>
-      </header>
-    )
-  }
-  
-  console.log('🔍 Topbar Legacy rendering - BASIC TEST');
-  return (
-    <header className="border-b border-slate-800">
-      <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
-        {/* Left side - Branding */}
-        <div className="flex items-center">
-          <BrandedHeader variant="compact" showFallback={true} />
-        </div>
-        
-        {/* Right side - Controls */}
-        <div className="flex items-center gap-2">
-          <NotificationBell />
-          <NotificationToaster />
-          <input className="px-2 py-1 border rounded-full text-sm w-48 bg-slate-900 border-slate-700"
-                 placeholder="org_id (UUID)" value={orgId} onChange={e=>{window.__ORG__=e.target.value||''; setOrgId(e.target.value)}} data-testid="input-org-id" />
-          <input className="px-2 py-1 border rounded-full text-sm w-56 bg-slate-900 border-slate-700"
-                 placeholder="project_id (UUID)" value={projectId} onChange={e=>{window.__PROJ__=e.target.value||''; setProjectId(e.target.value)}} data-testid="input-project-id" />
-        </div>
-      </div>
-    </header>
   )
 }
 

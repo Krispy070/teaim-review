@@ -1,36 +1,24 @@
 import { ReactNode, useState, useEffect, useRef } from "react";
 import { Menu, Sun, Moon, Eye, EyeOff, Command } from "lucide-react";
 import { setTheme } from "../../lib/theme";
-import { HeaderBar } from "../ui/HeaderBar";
-import { isBrandV2 } from "@/lib/brand";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
 import { useLocation } from "wouter";
 import DebugPanel from "@/components/DebugPanel";
 import IngestBanner from "@/components/IngestBanner";
 import ToastViewport from "@/components/ToastViewport";
 import CommandPalette from "@/components/CommandPalette";
+import GlobalHeader from "@/components/GlobalHeader";
+import NotificationToaster from "@/components/NotificationToaster";
 
 // Module-level storage for scroll positions (persists across component remounts)
 const scrollPositions: Record<string, number> = {};
 
-export function AppFrame({ 
-  sidebar, 
-  children, 
-  headerConfig 
-}: { 
-  sidebar: ReactNode; 
+export function AppFrame({
+  sidebar,
+  children
+}: {
+  sidebar: ReactNode;
   children: ReactNode;
-  headerConfig?: {
-    teaim: { src?: string; alt: string; href?: string };
-    customer: { src?: string; alt: string; href?: string };
-    implementor?: { src?: string; alt: string; href?: string };
-    projectName?: string;
-    tagline?: string;
-    env?: "DEV" | "STAGE" | "PROD";
-    onPickProject?: () => void;
-    onBellClick?: () => void;
-    onAvatarClick?: () => void;
-  };
 }) {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [location, navigate] = useLocation();
@@ -207,25 +195,10 @@ export function AppFrame({
       mainElement.removeEventListener('scroll', handleScroll);
     };
   }, [location]);
-  // Default header config
-  const defaultHeaderConfig = {
-    teaim: { alt: "TEAIM", href: "/" },
-    customer: { alt: "Customer", href: "#" },
-    implementor: { alt: "Partner", href: "#" },
-    projectName: "Project Dashboard",
-    tagline: "Workday Implementation Hub",
-    env: "DEV" as const,
-    onPickProject: () => console.log("Pick project"),
-    onBellClick: () => console.log("Bell clicked"),
-    onAvatarClick: () => console.log("Avatar clicked"),
-  };
-
-  const config = { ...defaultHeaderConfig, ...headerConfig };
-
   return (
     <div className="h-screen bg-bg text-fg flex flex-col">
       {/* Header - Always render with logos */}
-      <HeaderBar {...config} />
+      <GlobalHeader />
       <IngestBanner />
 
       <div className="flex flex-1 min-h-0">
@@ -369,6 +342,7 @@ export function AppFrame({
       </div>
       <DebugPanel />
       <ToastViewport />
+      <NotificationToaster />
       <CommandPalette />
     </div>
   );
