@@ -1,0 +1,71 @@
+/* Shimmer skeleton */
+@keyframes shimmer {
+  0% { background-position: -400px 0 }
+  100% { background-position: 400px 0 }
+}
+.skeleton {
+  background: linear-gradient(90deg, rgba(255,255,255,0.04) 25%, rgba(255,255,255,0.10) 37%, rgba(255,255,255,0.04) 63%);
+  background-size: 800px 100%;
+  animation: shimmer 1.5s infinite ease-in-out;
+}
+
+/* Pulse */
+@keyframes pulse {
+  0%, 100% { opacity: 1 }
+  50% { opacity: 0.7 }
+}
+.pulse {
+  animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* Glow - DISABLED for professional SaaS look */
+.glow {
+  box-shadow: none !important;
+}
+
+/* Hover lift - Professional effect without glow */
+.hover-lift {
+  transition: transform .15s ease, box-shadow .15s ease;
+}
+.hover-lift:hover {
+  transform: translateY(-2px);
+  box-shadow: none;
+}
+
+/* KPI count-up: no extra CSS needed (JS-driven), but success glow for actions */
+@keyframes appliedGlow {
+  0% { box-shadow: 0 0 0 rgba(25,212,146,0); }
+  40% { box-shadow: 0 0 22px rgba(25,212,146,.45); }
+  100% { box-shadow: 0 0 0 rgba(25,212,146,0); }
+}
+.applied-glow {
+  animation: appliedGlow 1.6s ease-in-out 1;
+}
+
+@keyframes appliedGlowDown {
+  0% { box-shadow: 0 0 0 rgba(239,68,68,0); }
+  40% { box-shadow: 0 0 22px rgba(239,68,68,.45); }
+  100% { box-shadow: 0 0 0 rgba(239,68,68,0); }
+}
+.applied-glow-down {
+  animation: appliedGlowDown 1.6s ease-in-out 1;
+}
+
+/* CTA pulse (once when visible) */
+@keyframes pulseOnce {
+  0% { transform: scale(1); box-shadow: 0 0 0 rgba(29,228,255,0); }
+  40% { transform: scale(1.02); box-shadow: 0 0 18px rgba(29,228,255,.35); }
+  100% { transform: scale(1); box-shadow: 0 0 0 rgba(29,228,255,0); }
+}
+.pulse-once { animation: pulseOnce 1s ease-in-out 1; }
+
+/* CTA swoosh underline */
+.swoosh {
+  position: relative;
+}
+.swoosh::after {
+  content: ""; position: absolute; left: 8px; right: 8px; bottom: -2px; height: 2px;
+  background: var(--brand-gradient); border-radius: 2px; opacity: 0; transform: scaleX(.2);
+  transition: opacity .18s ease, transform .18s ease;
+}
+.swoosh:hover::after { opacity: .9; transform: scaleX(1); }
