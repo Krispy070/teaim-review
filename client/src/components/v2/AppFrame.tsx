@@ -5,10 +5,7 @@ export type AppFrameProps = {
   children?: React.ReactNode;
 };
 
-/**
- * Minimal frame to satisfy v2 imports and keep builds green.
- * Replace/extend later with your real header/nav when ready.
- */
+/** Minimal placeholder so builds pass; replace later with real shell */
 function AppFrame({ title, children }: AppFrameProps) {
   return (
     <div className="min-h-screen bg-background text-foreground">
