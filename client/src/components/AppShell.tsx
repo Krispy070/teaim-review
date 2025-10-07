@@ -1,8 +1,7 @@
-import BrandedHeader from "@/components/BrandedHeader";
-import HeaderBarWrapper from "@/components/HeaderBarWrapper";
-import SidebarV2 from "@/components/SidebarV2";
 import TopProgressBar from "@/components/TopProgressBar";
 import { isBrandV2 } from "@/lib/brand";
+import GlobalHeader from "@/components/GlobalHeader";
+import NotificationToaster from "@/components/NotificationToaster";
 
 export default function AppShell({ sidebar, children }:{ sidebar?:React.ReactNode; children:React.ReactNode }){
   const brand = isBrandV2();
@@ -13,15 +12,16 @@ export default function AppShell({ sidebar, children }:{ sidebar?:React.ReactNod
   }
   
   return (
-    <div className="app-shell">
+    <div className="app-shell bg-background text-foreground">
       <TopProgressBar />
       <div className="app-shell-header">
-        <HeaderBarWrapper />
+        <GlobalHeader />
       </div>
       <div className="app-shell-main">
         <div className="app-shell-sidebar">{sidebar || null}</div>
         <div className="app-shell-content">{children}</div>
       </div>
+      <NotificationToaster />
     </div>
   );
 }
