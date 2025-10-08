@@ -11,7 +11,9 @@
     "check": "tsc",
     "test": "node scripts/run-tests.mjs",
     "lint": "echo \"(no lint yet)\" && exit 0",
-  "seed:demo": "node scripts/seed-demo.mjs"    
+    "seed:demo": "node scripts/seed-demo.mjs",
+    "mem:ingest:docs": "node scripts/mem-ingest-docs.mjs",
+    "mem:demo": "node scripts/mem-demo.mjs"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",
