@@ -5,14 +5,17 @@
   "license": "MIT",
   "packageManager": "pnpm@10.18.1",
   "scripts": {
-    "dev": "NODE_ENV=development tsx server/index.ts",
-    "build": "vite build && esbuild server/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
-    "start": "NODE_ENV=production node dist/index.js",
-    "check": "tsc",
-    "test": "node scripts/run-tests.mjs",
-    "lint": "echo \"(no lint yet)\" && exit 0",
-  "seed:demo": "node scripts/seed-demo.mjs"    
-  },
+  "dev": "NODE_ENV=development tsx server/index.ts",
+  "build": "vite build && esbuild server/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
+  "start": "NODE_ENV=production node dist/index.js",
+  "check": "tsc",
+  "test": "node scripts/run-tests.mjs",
+  "lint": "echo \"(no lint yet)\" && exit 0",
+  "seed:demo": "node scripts/seed-demo.mjs",
+  "mem:ingest:docs": "node scripts/mem-ingest-docs.mjs",
+  "mem:demo": "node scripts/mem-demo.mjs",
+  "mem:mine": "node server/memory/miner.ts"
+},
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",
     "@jridgewell/trace-mapping": "^0.3.25",

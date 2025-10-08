@@ -28,6 +28,8 @@ import { startPlanTicketSyncWorker } from "./workers/planTicketSyncWorker";
 import { startWeeklyOnboardingDigestWorker } from "./workers/weeklyOnboardingDigestWorker";
 import { startOffboardingWeeklyWorker } from "./workers/offboardingWeeklyWorker";
 import { startBounceAlertWorker } from "./workers/bounceAlertWorker";
+import { memoryRouter } from "./memory/api";
+import { bootstrapMemory } from "./memory/bootstrap";
 
 // Load environment variables from .env file
 import dotenv from 'dotenv';
@@ -340,6 +342,16 @@ process.on("exit", stopPythonServer);
 
   // Health check endpoint (before routes)
   app.get("/health", (_req, res) => res.json({ ok: true }));
+
+  if (process.env.MEMORY_ENABLED === "1") {
+    try {
+      await bootstrapMemory();
+      app.use("/api/memory", memoryRouter);
+      log("Memory service enabled");
+    } catch (error) {
+      log(`Failed to bootstrap memory service: ${error}`);
+    }
+  }
 
   // Mock routes for adapters sandbox
   import("./routes/mock_receiver").then(m => app.use("/mock", m.mock));
