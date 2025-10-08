@@ -1,45 +1,171 @@
+// server/memory/api.ts
+import type { Request, Response } from "express";
 import { Router } from "express";
-import { MemoryError } from "./common";
-import { recommendations } from "./recommend";
+
+// Retrieval (PR-3)
+import { retrieve, type RetrieveInput } from "./retrieve";
+
+// Ingestors (PR-2)
+import * as IngestDocs from "./ingestors/docs";
+import * as IngestSlack from "./ingestors/slack";
+import * as IngestCsv from "./ingestors/csv_release";
+import * as IngestMeetings from "./ingestors/meetings";
+
+// Signals + Recommendations (PR-4)
 import { recordSignal, type Signal } from "./signals";
+import { recommendations } from "./recommend";
 
-const router = Router();
+const MEMORY_ENABLED = process.env.MEMORY_ENABLED === "1";
+const EMBED_ENABLED = !!process.env.OPENAI_API_KEY;
 
-router.use((req, res, next) => {
-  if (process.env.MEMORY_ENABLED !== "1") {
-    return res.status(404).json({ message: "Memory features are disabled" });
-  }
-  next();
+export const memoryRouter = Router();
+
+/* ---------------------------- Health (PR-1) ---------------------------- */
+memoryRouter.get("/health", (_req: Request, res: Response) => {
+  return res.status(200).json({
+    ok: true,
+    memoryEnabled: MEMORY_ENABLED,
+    embedEnabled: EMBED_ENABLED,
+  });
 });
 
-router.post("/signals", async (req, res) => {
+/* ---------------------- Retrieve (PR-3: hybrid) ----------------------- */
+const VALID_PHASES: Set<NonNullable<RetrieveInput["phase"]>> = new Set([
+  "Discovery",
+  "Design",
+  "Build",
+  "Test",
+  "UAT",
+  "Release",
+  "Hypercare",
+]);
+
+memoryRouter.post("/retrieve", async (req: Request, res: Response) => {
   try {
-    await recordSignal(req.body as Signal);
-    res.status(204).end();
-  } catch (error: any) {
-    if (error instanceof MemoryError) {
-      return res.status(error.status).json({ message: error.message, detail: error.detail });
-    }
-    console.error("recordSignal failed", error);
-    return res.status(500).json({ message: "Failed to record signal" });
+    if (!MEMORY_ENABLED) return res.status(503).json({ ok: false, error: "memory disabled" });
+    if (!EMBED_ENABLED) return res.status(503).json({ ok: false, error: "embedding disabled (missing OPENAI_API_KEY)" });
+
+    const body = (req.body ?? {}) as Partial<RetrieveInput>;
+    const project_id = typeof body.project_id === "string" ? body.project_id.trim() : "";
+    const query = typeof body.query === "string" ? body.query.trim() : "";
+    const k = typeof body.k === "number" ? body.k : undefined;
+    const phase =
+      typeof body.phase === "string" && VALID_PHASES.has(body.phase as any)
+        ? (body.phase as RetrieveInput["phase"])
+        : undefined;
+
+    if (!project_id) return res.status(400).json({ ok: false, error: "project_id required" });
+    if (!query) return res.status(400).json({ ok: false, error: "query required" });
+
+    const out = await retrieve({ project_id, query, k, phase, filters: body.filters });
+    return res.status(200).json({ ok: true, ...out });
+  } catch (err: any) {
+    return res.status(500).json({ ok: false, error: err?.message ?? String(err) });
   }
 });
 
-router.get("/recommendations", async (req, res) => {
-  const projectId = String((req.query.project_id || req.query.projectId || "").toString());
-  const phase = req.query.phase ? String(req.query.phase) : undefined;
-  const k = req.query.k ? Number(req.query.k) : undefined;
+/* ---------------------- Ingest (PR-2: pipeline) ----------------------- */
+// helper: accept either named export {ingest} or default export
+const pickIngest = (mod: any): undefined | ((args: any) => Promise<any>) =>
+  (mod && (mod.ingest || mod.default)) as any;
 
+memoryRouter.post("/ingest", async (req: Request, res: Response) => {
   try {
-    const items = await recommendations(projectId, { phase, k });
-    res.json({ recommendations: items });
-  } catch (error: any) {
-    if (error instanceof MemoryError) {
-      return res.status(error.status).json({ message: error.message, detail: error.detail });
+    if (!MEMORY_ENABLED) return res.status(503).json({ ok: false, error: "memory disabled" });
+    if (!EMBED_ENABLED) return res.status(503).json({ ok: false, error: "embedding disabled (missing OPENAI_API_KEY)" });
+
+    const { project_id, source_type, payload, policy } = (req.body ?? {}) as {
+      project_id?: string;
+      source_type?: "docs" | "slack" | "csv_release" | "meetings";
+      payload?: any;
+      policy?: "strict" | "standard" | "off";
+    };
+
+    if (!project_id || !source_type)
+      return res.status(400).json({ ok: false, error: "project_id and source_type are required" });
+
+    const policyNorm: "strict" | "standard" | "off" =
+      policy === "strict" || policy === "off" ? policy : "standard";
+
+    let result: any;
+    switch (source_type) {
+      case "docs": {
+        const fn = pickIngest(IngestDocs);
+        if (typeof fn !== "function") return res.status(500).json({ ok: false, error: "docs ingestor not available" });
+        result = await fn({ project_id, payload, policy: policyNorm });
+        break;
+      }
+      case "slack": {
+        const fn = pickIngest(IngestSlack);
+        if (typeof fn !== "function") return res.status(500).json({ ok: false, error: "slack ingestor not available" });
+        result = await fn({ project_id, payload, policy: policyNorm });
+        break;
+      }
+      case "csv_release": {
+        const fn = pickIngest(IngestCsv);
+        if (typeof fn !== "function") return res.status(500).json({ ok: false, error: "csv_release ingestor not available" });
+        result = await fn({ project_id, payload, policy: policyNorm });
+        break;
+      }
+      case "meetings": {
+        const fn = pickIngest(IngestMeetings);
+        if (typeof fn !== "function") return res.status(500).json({ ok: false, error: "meetings ingestor not available" });
+        result = await fn({ project_id, payload, policy: policyNorm });
+        break;
+      }
+      default:
+        return res.status(400).json({ ok: false, error: `unsupported source_type: ${source_type}` });
     }
-    console.error("recommendations failed", error);
-    return res.status(500).json({ message: "Failed to load recommendations" });
+
+    return res.status(200).json({ ok: true, ...result });
+  } catch (err: any) {
+    return res.status(500).json({ ok: false, error: err?.message ?? String(err) });
   }
 });
 
-export default router;
+/* ------------------ Recommendations (PR-4: miner) --------------------- */
+// GET /api/memory/recommendations?project_id=...&phase=UAT
+memoryRouter.get("/recommendations", async (req: Request, res: Response) => {
+  try {
+    if (!MEMORY_ENABLED) return res.status(503).json({ ok: false, error: "memory disabled" });
+
+    const project_id = String(req.query.project_id ?? "").trim();
+    const phase = typeof req.query.phase === "string" ? req.query.phase : undefined;
+
+    if (!project_id) return res.status(400).json({ ok: false, error: "project_id required" });
+
+    const list = await recommendations(project_id, { phase: phase as any });
+    return res.status(200).json({ ok: true, recommendations: list });
+  } catch (err: any) {
+    return res.status(500).json({ ok: false, error: err?.message ?? String(err) });
+  }
+});
+
+/* ------------------------- Signals (PR-4) ----------------------------- */
+// POST /api/memory/signals  { project_id, kind, ... }
+memoryRouter.post("/signals", async (req: Request, res: Response) => {
+  try {
+    if (!MEMORY_ENABLED) return res.status(503).json({ ok: false, error: "memory disabled" });
+
+    const s = (req.body ?? {}) as Partial<Signal>;
+    if (!s.project_id || !s.kind)
+      return res.status(400).json({ ok: false, error: "project_id and kind are required" });
+
+    await recordSignal({
+      project_id: String(s.project_id),
+      kind: s.kind as Signal["kind"],
+      severity: s.severity,
+      owner: s.owner,
+      event_ts: s.event_ts ?? new Date().toISOString(),
+      features: s.features ?? {},
+      outcome: s.outcome ?? {},
+    });
+
+    return res.status(200).json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ ok: false, error: err?.message ?? String(err) });
+  }
+});
+
+// default export: import memoryRoutes from "./memory/api";
+export default memoryRouter;

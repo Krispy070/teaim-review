@@ -11,6 +11,7 @@ import { SignJWT, jwtVerify } from "jose";
 import { testAdminRouter } from "./admin/test";
 import testsRoutes from "./tests.routes";
 import kapmemRoutes from "./kapmem.routes";
+import memoryRoutes from "./memory/api";
 import { testStubsRouter } from "./test-stubs.routes";
 import { notif } from "./routes/notifications";
 import { releases } from "./routes/releases";
@@ -158,6 +159,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   // Parse JSON bodies with 10MB limit
   app.use(express.json({ limit: '10mb' }));
+
+  if (process.env.MEMORY_ENABLED === "1") {
+    const { createMemoryRouter } = await import("./memory/api");
+    app.use("/api/memory", createMemoryRouter());
+  }
   
   // Mount test admin router (admin only)
   app.use("/admin/test", requireRole("admin"), testAdminRouter);
@@ -170,6 +176,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   if (process.env.MEMORY_ENABLED === '1') {
     app.use("/api/memory", memoryRoutes);
   }
+
   app.use("/api/notifications", requireProject("member"), notif);
   app.use("/api/releases", requireProject("member"), releases);
   app.use("/api/releases", requireProject("member"), rbulk);
