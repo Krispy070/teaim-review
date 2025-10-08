@@ -184,6 +184,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.use("/api/dev", dev);
   app.use("/api/insights", requireProject("member"), insights);
   app.use("/api/kap", requireProject("member"), kap);
+  app.use("/api/memory", requireProject("member"), memoryRoutes);
   app.use("/api/project-members", projectMembersRouter);
   app.use("/api/projects", projects);
   app.use("/api/actions", actionsApi);
