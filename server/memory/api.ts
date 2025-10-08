@@ -1,23 +1,25 @@
 // server/memory/api.ts
-import { Router, Request, Response } from "express";
+import type { Request, Response } from "express";
+import { Router } from "express";
 
-const MEMORY_ENABLED = process.env.MEMORY_ENABLED === "1";
-const EMBED_ENABLED = !!process.env.OPENAI_API_KEY;
+// PR-3: full retrieval API + types
+import { retrieve, type RetrieveInput } from "./retrieve";
 
-// PR-2 deps
-import { redact } from "./redact"; // used by ingestors as needed (kept here for tree shaking hints)
+// PR-2: ingestors (we’ll handle default/named export differences safely)
 import * as IngestDocs from "./ingestors/docs";
 import * as IngestSlack from "./ingestors/slack";
 import * as IngestCsv from "./ingestors/csv_release";
 import * as IngestMeetings from "./ingestors/meetings";
-import { retrieve as doRetrieve } from "./retrieve";
+
+const MEMORY_ENABLED = process.env.MEMORY_ENABLED === "1";
+const EMBED_ENABLED = !!process.env.OPENAI_API_KEY;
 
 export const memoryRouter = Router();
 
-/**
- * Health (kept from PR-1)
- * Always available for smoke checks; returns whether memory is enabled.
- */
+/* ----------------------------------------------------------------------------
+ * Health (from PR-1)
+ * Always available for smoke checks; reports feature flag & embedding key.
+ * --------------------------------------------------------------------------*/
 memoryRouter.get("/health", (_req: Request, res: Response) => {
   return res.status(200).json({
     ok: true,
@@ -26,63 +28,144 @@ memoryRouter.get("/health", (_req: Request, res: Response) => {
   });
 });
 
-/**
- * Ingest endpoint (PR-2)
- * Body: { project_id: string; source_type: "docs"|"slack"|"csv_release"|"meetings"; payload: any; policy?: "strict"|"standard"|"off" }
- */
+/* ----------------------------------------------------------------------------
+ * Retrieve (PR-3: hybrid ranker)
+ * Body: { project_id: string; query: string; k?: number; phase?: string; filters?: {...} }
+ * --------------------------------------------------------------------------*/
+const VALID_PHASES: Set<NonNullable<RetrieveInput["phase"]>> = new Set([
+  "Discovery",
+  "Design",
+  "Build",
+  "Test",
+  "UAT",
+  "Release",
+  "Hypercare",
+]);
+
+memoryRouter.post("/retrieve", async (req: Request, res: Response) => {
+  try {
+    if (!MEMORY_ENABLED) {
+      return res.status(503).json({ ok: false, error: "memory disabled" });
+    }
+    if (!EMBED_ENABLED) {
+      return res
+        .status(503)
+        .json({ ok: false, error: "embedding disabled (missing OPENAI_API_KEY)" });
+    }
+
+    const body = (req.body ?? {}) as Partial<RetrieveInput>;
+    const projectId =
+      typeof body.project_id === "string" ? body.project_id.trim() : "";
+    const query =
+      typeof body.query === "string" ? body.query.trim() : "";
+    const k = typeof body.k === "number" ? body.k : undefined;
+    const phase =
+      typeof body.phase === "string" && VALID_PHASES.has(body.phase as any)
+        ? (body.phase as RetrieveInput["phase"])
+        : undefined;
+    const filters = body.filters;
+
+    if (!projectId)
+      return res.status(400).json({ ok: false, error: "project_id required" });
+    if (!query)
+      return res.status(400).json({ ok: false, error: "query required" });
+
+    const input: RetrieveInput = { project_id: projectId, query, k, phase, filters };
+    const out = await retrieve(input);
+
+    return res.status(200).json({ ok: true, ...out });
+  } catch (err: any) {
+    return res
+      .status(500)
+      .json({ ok: false, error: err?.message ?? String(err) });
+  }
+});
+
+/* ----------------------------------------------------------------------------
+ * Ingest (PR-2)
+ * Body: {
+ *   project_id: string;
+ *   source_type: "docs"|"slack"|"csv_release"|"meetings";
+ *   payload: any;
+ *   policy?: "strict"|"standard"|"off";
+ * }
+ * --------------------------------------------------------------------------*/
+
+// helper: works whether module exports {ingest} or default
+const pickIngest = (mod: any): undefined | ((args: any) => Promise<any>) =>
+  (mod && (mod.ingest || mod.default)) as any;
+
 memoryRouter.post("/ingest", async (req: Request, res: Response) => {
   try {
-    if (!MEMORY_ENABLED) return res.status(503).json({ ok: false, error: "memory disabled" });
-    if (!EMBED_ENABLED) return res.status(503).json({ ok: false, error: "embedding disabled (missing OPENAI_API_KEY)" });
+    if (!MEMORY_ENABLED) {
+      return res.status(503).json({ ok: false, error: "memory disabled" });
+    }
+    if (!EMBED_ENABLED) {
+      return res
+        .status(503)
+        .json({ ok: false, error: "embedding disabled (missing OPENAI_API_KEY)" });
+    }
 
-    const { project_id, source_type, payload, policy } = req.body ?? {};
-    if (!project_id || !source_type)
-      return res.status(400).json({ ok: false, error: "project_id and source_type are required" });
+    const { project_id, source_type, payload, policy } = (req.body ?? {}) as {
+      project_id?: string;
+      source_type?: string;
+      payload?: any;
+      policy?: "strict" | "standard" | "off";
+    };
+
+    if (!project_id || !source_type) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "project_id and source_type are required" });
+    }
 
     const policyNorm: "strict" | "standard" | "off" =
       policy === "strict" || policy === "off" ? policy : "standard";
 
     let result: any;
+
     switch (source_type) {
-      case "docs":
-        result = await IngestDocs.ingest({ project_id, payload, policy: policyNorm });
+      case "docs": {
+        const fn = pickIngest(IngestDocs);
+        if (typeof fn !== "function")
+          return res.status(500).json({ ok: false, error: "docs ingestor not available" });
+        result = await fn({ project_id, payload, policy: policyNorm });
         break;
-      case "slack":
-        result = await IngestSlack.ingest({ project_id, payload, policy: policyNorm });
+      }
+      case "slack": {
+        const fn = pickIngest(IngestSlack);
+        if (typeof fn !== "function")
+          return res.status(500).json({ ok: false, error: "slack ingestor not available" });
+        result = await fn({ project_id, payload, policy: policyNorm });
         break;
-      case "csv_release":
-        result = await IngestCsv.ingest({ project_id, payload, policy: policyNorm });
+      }
+      case "csv_release": {
+        const fn = pickIngest(IngestCsv);
+        if (typeof fn !== "function")
+          return res.status(500).json({ ok: false, error: "csv_release ingestor not available" });
+        result = await fn({ project_id, payload, policy: policyNorm });
         break;
-      case "meetings":
-        result = await IngestMeetings.ingest({ project_id, payload, policy: policyNorm });
+      }
+      case "meetings": {
+        const fn = pickIngest(IngestMeetings);
+        if (typeof fn !== "function")
+          return res.status(500).json({ ok: false, error: "meetings ingestor not available" });
+        result = await fn({ project_id, payload, policy: policyNorm });
         break;
+      }
       default:
-        return res.status(400).json({ ok: false, error: `unsupported source_type: ${source_type}` });
+        return res
+          .status(400)
+          .json({ ok: false, error: `unsupported source_type: ${source_type}` });
     }
 
     return res.status(200).json({ ok: true, ...result });
   } catch (err: any) {
-    return res.status(500).json({ ok: false, error: err?.message ?? String(err) });
+    return res
+      .status(500)
+      .json({ ok: false, error: err?.message ?? String(err) });
   }
 });
 
-/**
- * Retrieve endpoint (PR-2)
- * Body: { project_id: string; query: string; k?: number; phase?: string; filters?: {...} }
- */
-memoryRouter.post("/retrieve", async (req: Request, res: Response) => {
-  try {
-    if (!MEMORY_ENABLED) return res.status(503).json({ ok: false, error: "memory disabled" });
-    if (!EMBED_ENABLED) return res.status(503).json({ ok: false, error: "embedding disabled (missing OPENAI_API_KEY)" });
-
-    const { project_id, query, k, phase, filters } = req.body ?? {};
-    if (!project_id || !query)
-      return res.status(400).json({ ok: false, error: "project_id and query are required" });
-
-    const out = await doRetrieve({ project_id, query, k, phase, filters });
-    return res.status(200).json({ ok: true, ...out });
-  } catch (err: any) {
-    return res.status(500).json({ ok: false, error: err?.message ?? String(err) });
-  }
-});
-
+// default export so other code can: import memoryRoutes from "./memory/api";
+export default memoryRouter;
