@@ -1,110 +1,59 @@
-# Memory Signals & Recommendations
+# TEAIM Memory — Quick Start
 
-The memory subsystem accepts implementation signals, mines correlations nightly, and exposes phase-aware recommendations for project teams.
+This repo includes an opt-in memory subsystem backed by Postgres + pgvector. It stores normalized text “memories” with lineage (docs, Slack, meetings, release notes), retrieves them with a hybrid ranker, and mines nightly “lessons learned.”
 
-## Feature Flag & Environment
+## Enable (env)
+MEMORY_ENABLED=1
+OPENAI_API_KEY=<your key>
+MEMORY_EMBED_MODEL=text-embedding-3-large
+TENANT_PII_POLICY=standard # strict|standard|off
+SHOW_MEMORY_PROMPTS=1 # optional UI surfacing
 
-- Set `MEMORY_ENABLED=1` to enable the `/api/memory/*` endpoints.
-- The miner and API expect the optional `signals`, `memory_items`, and `lessons_learned` tables to exist. If any table is missing the handlers respond with `503` rather than crashing.
+markdown
+Copy code
 
-## Recording Signals
+## Endpoints
+- `GET  /api/memory/health` → `{ ok, memoryEnabled, embedEnabled }`
+- `POST /api/memory/ingest`  
+  Body: `{ project_id, source_type: "docs"|"slack"|"csv_release"|"meetings", payload, policy? }`
+- `POST /api/memory/retrieve`  
+  Body: `{ project_id, query, k?, phase?, filters? }` → `{ contexts[], debug }`
+- `GET  /api/memory/recommendations?project_id=...&phase=...` → mined suggestions
+- `POST /api/memory/signals` → record events `{ project_id, kind, ... }`
 
-`POST /api/memory/signals`
+If `MEMORY_ENABLED != 1` or `OPENAI_API_KEY` missing, endpoints return **503** (fail-closed).
 
-Body (JSON):
+## Demo seeding
 
-```json
-{
-  "project_id": "UUID",
-  "kind": "delay | dependency | approval_latency | defect_escape | scope_change",
-  "severity": "low | med | high",
-  "owner": "optional owner / team",
-  "event_ts": "2025-01-01T12:00:00Z",
-  "features": { "phase": "UAT", "vertical": "payroll" },
-  "outcome": { "impact": "uat_slip" }
-}
-```
+You can seed a small demo set for a project:
 
-Notes:
+One-time
+pnpm i
 
-- `event_ts` defaults to `now()` if omitted.
-- `owner` is clamped to 120 characters.
-- `features` and `outcome` are stored as JSON blobs for downstream mining.
+Set env (or pass project id on the command line)
+export DEMO_PROJECT_ID="<project uuid>"
 
-## Recommendations
+optional helpers
+export DEMO_API_BASE_URL="http://127.0.0.1:3000"
+export DEMO_API_TOKEN="Bearer <session token>"
 
-`GET /api/memory/recommendations?project_id=...&phase=UAT&k=5`
+Seed:
+pnpm mem:demo
 
-Response:
+or inline:
+pnpm mem:demo 00000000-0000-4000-8000-000000000000
 
-```json
-{
-  "recommendations": [
-    {
-      "recommendation": "Re-baseline the plan with buffer on the critical path...",
-      "confidence": 0.82,
-      "support": [
-        { "id": "memory-item-1", "source_type": "playbook" }
-      ],
-      "phase": "uat",
-      "vertical": "payroll"
-    }
-  ]
-}
-```
+vbnet
+Copy code
 
-The miner enriches each lesson with citations to the supporting `memory_items` rows. Confidence is boosted when the caller requests a matching phase.
+What it does:
+- **csv_release**: 3 curated release notes snippets
+- **meetings**: 2 short transcript segments
+- **docs**: 2 risk-register excerpts
 
-## Nightly Miner
+Output prints counts and example queries to try (e.g., *“release blockers”, “uat defects”, “handoff risks”*).
 
-The miner can be run manually or on a schedule:
-
-```bash
-pnpm mem:mine -- --project <PROJECT_ID> --days 45
-```
-
-CLI options:
-
-- `--project` / `--project_id`: limit mining to a single project.
-- `--days`: look-back window (default 30, capped at 365).
-
-### Suggested GitHub Action
-
-```yaml
-name: Nightly Memory Miner
-
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: "0 6 * * *"
-
-jobs:
-  mine:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10.18.1
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: "pnpm"
-      - run: pnpm install --frozen-lockfile
-      - env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          MEMORY_ENABLED: "1"
-        run: pnpm mem:mine
-```
-
-This workflow runs nightly at 06:00 UTC (adjust as needed) and can also be triggered manually.
-
-## Table Expectations
-
-| Table             | Purpose                                |
-| ----------------- | -------------------------------------- |
-| `signals`         | Raw project signals captured via API.  |
-| `memory_items`    | Curated memory snippets used for cite. |
-| `lessons_learned` | Miner output consumed by the API.      |
-
-All tables should be deployed in the `public` schema.
+## Notes
+- PII redaction is controlled by `TENANT_PII_POLICY`.
+- Retrieval scoring = 0.45 semantic + 0.25 recency + 0.20 sourceType + 0.10 phase boost.
+- Nightly miner can run with the GitHub Action in `.github/workflows/memory-mine.yml` or with `pnpm mem:mine`.
