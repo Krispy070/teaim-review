@@ -1,47 +1,59 @@
-# Memory Demo Seeding
+# TEAIM Memory — Quick Start
 
-This repository ships with a scripted demo so you can populate semantic memory with a single command and immediately try the retrieval experience.
+This repo includes an opt-in memory subsystem backed by Postgres + pgvector. It stores normalized text “memories” with lineage (docs, Slack, meetings, release notes), retrieves them with a hybrid ranker, and mines nightly “lessons learned.”
 
-## Quick start
-1. Make sure the API process is running locally and you can reach it at `http://127.0.0.1:3000` (override with `DEMO_API_BASE_URL`).
-2. Export the identifiers the script needs:
-   ```bash
-   export DEMO_PROJECT_ID="<project uuid>"
-   # optional helpers
-   export DEMO_ORG_ID="<org uuid>"
-   export DEMO_API_BASE_URL="https://app.example.com"   # defaults to http://127.0.0.1:3000
-   export DEMO_API_TOKEN="Bearer <session token>"        # attach auth header when required
-   ```
-3. Run the seeder:
-   ```bash
-   pnpm mem:demo
-   # or supply a project inline
-   pnpm mem:demo 00000000-0000-4000-8000-000000000000
-   ```
+## Enable (env)
+MEMORY_ENABLED=1
+OPENAI_API_KEY=<your key>
+MEMORY_EMBED_MODEL=text-embedding-3-large
+TENANT_PII_POLICY=standard # strict|standard|off
+SHOW_MEMORY_PROMPTS=1 # optional UI surfacing
 
-The script calls `POST /api/memory/ingest` three times (once per source type) with `policy="standard"`:
-- **csv_release** - three curated release note rows that highlight sprint outcomes and follow-ups.
-- **meeting_transcript** - two short standups with actions, variances, and go-live checkpoints.
-- **doc** - two risk register excerpts that cover payroll and integrations exposure.
+markdown
+Copy code
 
-You should see console output similar to:
-```
-Seeding memory demo for project ...
--> Release notes (csv_release) ... ok (3 entries)
--> Meeting transcripts ... ok (2 entries)
--> Risk register excerpts ... ok (2 entries)
+## Endpoints
+- `GET  /api/memory/health` → `{ ok, memoryEnabled, embedEnabled }`
+- `POST /api/memory/ingest`  
+  Body: `{ project_id, source_type: "docs"|"slack"|"csv_release"|"meetings", payload, policy? }`
+- `POST /api/memory/retrieve`  
+  Body: `{ project_id, query, k?, phase?, filters? }` → `{ contexts[], debug }`
+- `GET  /api/memory/recommendations?project_id=...&phase=...` → mined suggestions
+- `POST /api/memory/signals` → record events `{ project_id, kind, ... }`
 
-Demo ingest complete
-   • Release notes (csv_release): 3
-   • Meeting transcripts: 2
-   • Risk register excerpts: 2
-   • Total memories added: 7
-```
+If `MEMORY_ENABLED != 1` or `OPENAI_API_KEY` missing, endpoints return **503** (fail-closed).
 
-## What to try after seeding
-Paste any of these prompts into the Memory search UI to verify retrieval quality:
-- "What's the status of payroll parallel testing?"
-- "List integration risks blocking go-live."
-- "Summarize actions from the cutover readiness standup."
+## Demo seeding
 
-Each query should surface the new entries immediately, demonstrating how the Workday project memory accelerates executive briefings, risk reviews, and readiness updates.
+You can seed a small demo set for a project:
+
+One-time
+pnpm i
+
+Set env (or pass project id on the command line)
+export DEMO_PROJECT_ID="<project uuid>"
+
+optional helpers
+export DEMO_API_BASE_URL="http://127.0.0.1:3000"
+export DEMO_API_TOKEN="Bearer <session token>"
+
+Seed:
+pnpm mem:demo
+
+or inline:
+pnpm mem:demo 00000000-0000-4000-8000-000000000000
+
+vbnet
+Copy code
+
+What it does:
+- **csv_release**: 3 curated release notes snippets
+- **meetings**: 2 short transcript segments
+- **docs**: 2 risk-register excerpts
+
+Output prints counts and example queries to try (e.g., *“release blockers”, “uat defects”, “handoff risks”*).
+
+## Notes
+- PII redaction is controlled by `TENANT_PII_POLICY`.
+- Retrieval scoring = 0.45 semantic + 0.25 recency + 0.20 sourceType + 0.10 phase boost.
+- Nightly miner can run with the GitHub Action in `.github/workflows/memory-mine.yml` or with `pnpm mem:mine`.

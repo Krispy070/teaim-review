@@ -2,7 +2,10 @@ import { AppFrame } from "@/components/layout/AppFrame";
 import SidebarV2 from "@/components/SidebarV2";
 import { getProjectId } from "@/lib/project";
 import { fetchWithAuth } from "@/lib/supabase";
-import { useEffect, useState } from "react";
+import MemoryPrompt from "@/components/MemoryPrompt";
+import { useMemoryPrompts } from "@/hooks/useMemoryPrompts";
+import type { MemoryRecommendation } from "@shared/memory";
+import { useEffect, useMemo, useState } from "react";
 
 export default function OnboardingPage(){
   const pid = getProjectId();
@@ -10,6 +13,25 @@ export default function OnboardingPage(){
   const [counts,setCounts]=useState<Record<string,{done:number,total:number}>>({});
   const [sel,setSel]=useState<any|null>(null);
   const [msg,setMsg]=useState("");
+  const memory = useMemoryPrompts(pid, "onboarding");
+
+  const memorySlot = useMemo(() => {
+    if (!memory.featureEnabled || !memory.prompts.length) return null;
+    return (
+      <div className="flex w-full flex-col gap-3 lg:max-w-xs">
+        {memory.prompts.map((prompt: MemoryRecommendation) => (
+          <MemoryPrompt
+            key={prompt.id}
+            title={prompt.title}
+            text={prompt.text}
+            confidence={prompt.confidence ?? undefined}
+            onApply={() => memory.applyPrompt(prompt)}
+            onDismiss={() => memory.dismissPrompt(prompt)}
+          />
+        ))}
+      </div>
+    );
+  }, [memory.applyPrompt, memory.dismissPrompt, memory.featureEnabled, memory.prompts]);
 
   async function load(){
     const r = await fetchWithAuth(`/api/onboarding?projectId=${encodeURIComponent(pid!)}`);
@@ -23,14 +45,19 @@ export default function OnboardingPage(){
   return (
     <AppFrame sidebar={<SidebarV2 />}>
       <div className="p-6 space-y-4">
-        <div className="flex items-center justify-between">
-          <h1 className="text-2xl font-semibold">Onboarding</h1>
-          <div className="flex items-center gap-2">
-            <button className="text-xs px-2 py-1 border rounded" onClick={seed} data-testid="button-seed-steps">Seed 9 Steps</button>
-            <TechIntake />
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div className="flex-1 space-y-2">
+            <div className="flex items-center justify-between">
+              <h1 className="text-2xl font-semibold">Onboarding</h1>
+              <div className="flex items-center gap-2">
+                <button className="text-xs px-2 py-1 border rounded" onClick={seed} data-testid="button-seed-steps">Seed 9 Steps</button>
+                <TechIntake />
+              </div>
+            </div>
+            <div className="text-xs opacity-70" data-testid="text-message">{msg}</div>
           </div>
+          {memorySlot}
         </div>
-        <div className="text-xs opacity-70" data-testid="text-message">{msg}</div>
 
         {/* Tiles */}
         <div className="grid md:grid-cols-3 gap-3">

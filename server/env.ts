@@ -5,7 +5,9 @@ const EnvSchema = z.object({
   PORT: z.string().default("5000"),
   PY_CMD: z.string().default("python3"),
   FASTAPI_PORT: z.string().default("8000"),
-  
+  MEMORY_ENABLED: z.enum(["0", "1"]).default("1"),
+  MEMORY_EMBED_MODEL: z.string().default("text-embedding-3-large"),
+
   // Supabase JWT secret for verifying access tokens
   // In development, this is optional (will fall back to DEV_AUTH if not set)
   SUPABASE_JWT_SECRET: z.string().optional(),
@@ -26,6 +28,8 @@ export const env: Env = (() => {
         PORT: process.env.PORT || "5000",
         PY_CMD: process.env.PY_CMD || "python3",
         FASTAPI_PORT: process.env.FASTAPI_PORT || "8000",
+        MEMORY_ENABLED: process.env.MEMORY_ENABLED === "0" ? "0" : "1",
+        MEMORY_EMBED_MODEL: process.env.MEMORY_EMBED_MODEL || "text-embedding-3-large",
       } as Env;
     }
     throw error;

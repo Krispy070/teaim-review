@@ -1,8 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useLocation } from "wouter";
 import { fetchWithAuth } from "@/lib/supabase";
 import PageHeading from "@/components/PageHeading";
 import { getProjectId } from "@/lib/project";
+import MemoryPrompt from "@/components/MemoryPrompt";
+import { useMemoryPrompts } from "@/hooks/useMemoryPrompts";
+import type { MemoryRecommendation } from "@shared/memory";
 
 interface TestCase {
   id: string;
@@ -21,6 +24,25 @@ export default function Testing() {
   const [loading, setLoading] = useState(true);
   const [location] = useLocation();
   const projectId = getProjectId();
+  const memory = useMemoryPrompts(projectId, "test");
+
+  const memorySlot = useMemo(() => {
+    if (!memory.featureEnabled || !memory.prompts.length) return null;
+    return (
+      <div className="flex w-full flex-col gap-3 lg:max-w-xs">
+        {memory.prompts.map((prompt: MemoryRecommendation) => (
+          <MemoryPrompt
+            key={prompt.id}
+            title={prompt.title}
+            text={prompt.text}
+            confidence={prompt.confidence ?? undefined}
+            onApply={() => memory.applyPrompt(prompt)}
+            onDismiss={() => memory.dismissPrompt(prompt)}
+          />
+        ))}
+      </div>
+    );
+  }, [memory.applyPrompt, memory.dismissPrompt, memory.featureEnabled, memory.prompts]);
 
   useEffect(() => {
     (async () => {
@@ -40,22 +62,25 @@ export default function Testing() {
 
   return (
     <div className="p-3">
-      <div className="flex items-center justify-between mb-4">
-        <PageHeading title="Test Cases" crumbs={[{label:"Overview"},{label:"Testing"}]} />
-        <button
-          className="px-3 py-2 border rounded-lg text-sm"
-          onClick={() => {
-            const pid = getProjectId();
-            if (!pid) return;
-            const a = document.createElement("a");
-            a.href = `/api/exports/tests.csv?projectId=${encodeURIComponent(pid)}`;
-            a.download = "";
-            document.body.appendChild(a); a.click(); a.remove();
-          }}
-          data-testid="button-export-tests-csv"
-        >
-          Export Tests CSV
-        </button>
+      <div className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+        <div className="flex items-center justify-between gap-3">
+          <PageHeading title="Test Cases" crumbs={[{label:"Overview"},{label:"Testing"}]} />
+          <button
+            className="px-3 py-2 border rounded-lg text-sm"
+            onClick={() => {
+              const pid = getProjectId();
+              if (!pid) return;
+              const a = document.createElement("a");
+              a.href = `/api/exports/tests.csv?projectId=${encodeURIComponent(pid)}`;
+              a.download = "";
+              document.body.appendChild(a); a.click(); a.remove();
+            }}
+            data-testid="button-export-tests-csv"
+          >
+            Export Tests CSV
+          </button>
+        </div>
+        {memorySlot}
       </div>
       <div className="p-6">
         {loading ? (
