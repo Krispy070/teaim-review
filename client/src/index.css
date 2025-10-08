@@ -199,6 +199,29 @@
     linear-gradient(135deg, rgba(14, 15, 18, 0.95) 0%, rgba(24, 18, 38, 0.95) 45%, rgba(16, 17, 28, 0.98) 100%);
 }
 
+:root {
+  --brand-ink: #0F1020;
+  --brand-paper: #F7F7FB;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+.brand-surface {
+  background-color: var(--brand-paper);
+}
+
+.dark .brand-surface {
+  background-color: #0F1020;
+}
+
+.brand-hero {
+  @apply bg-brand-gradient;
+}
+
 .teaim-auth-bg {
   background:
     radial-gradient(90% 120% at 15% 15%, rgba(108, 76, 255, 0.22) 0%, transparent 70%),
