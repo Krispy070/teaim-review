@@ -31,9 +31,11 @@ export default {
 
         // Raw brand tokens (HSL format for opacity support)
         brand: {
-          charcoal: 'hsl(var(--brand-charcoal))',
-          orange:   'hsl(var(--brand-orange))',
-          yellow:   'hsl(var(--brand-yellow))',
+          charcoal: "#1C1C28",
+          purple: "#6B46FF",
+          neon: "#4EF0B0",
+          ink: "#0F1020",
+          paper: "#F7F7FB",
         },
 
         // Keep existing shadcn tokens for compatibility
@@ -67,6 +69,9 @@ export default {
           DEFAULT: "var(--destructive)",
           foreground: "var(--destructive-foreground)",
         },
+        "brand-primary": "var(--brand-primary)",
+        "brand-accent": "var(--brand-accent)",
+        "brand-warn": "var(--brand-warn)",
         input: "var(--input)",
         ring: "var(--ring)",
         chart: {
@@ -86,6 +91,10 @@ export default {
           border: "var(--sidebar-border)",
           ring: "var(--sidebar-ring)",
         },
+      },
+      backgroundImage: {
+        "brand-gradient":
+          "radial-gradient(120% 120% at 10% 0%, rgba(107,70,255,.18) 0%, rgba(107,70,255,0) 60%), radial-gradient(120% 120% at 90% 0%, rgba(78,240,176,.16) 0%, rgba(78,240,176,0) 60%)",
       },
       boxShadow: {
         focus: '0 0 0 3px var(--ring)',

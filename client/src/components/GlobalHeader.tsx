@@ -48,28 +48,33 @@ export default function GlobalHeader({ className = "" }: GlobalHeaderProps) {
     return queryString ? `?${queryString}` : "";
   }, [projectId]);
 
+  const headerClasses = cn(
+    "brand-surface sticky top-0 z-40 border-b border-black/5 dark:border-white/10",
+    className
+  );
+
   if (brandV2) {
     if (isLoading) {
       return (
         <>
           {presence}
-          <header
-            className={cn(
-              "header sticky top-0 z-50 w-full border-b border-border bg-background/95 backdrop-blur",
-              className
-            )}
-          >
-            <div className="mx-auto flex h-16 max-w-[1320px] items-center justify-between gap-4 px-4">
-              <div className="flex items-center gap-3 animate-pulse">
-                <div className="h-6 w-20 rounded bg-muted" />
-                <div className="h-6 w-24 rounded bg-muted" />
+          <header className={headerClasses}>
+            <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 h-14 md:h-16 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <img src="/teaim-logo.svg" alt="TEAIM" className="h-6 md:h-7" />
+                <span className="hidden md:inline text-sm tracking-wide text-brand-charcoal dark:text-white/90">
+                  TEAIM.app
+                </span>
               </div>
-              <div className="mx-auto flex-1 max-w-md animate-pulse">
-                <div className="h-5 rounded bg-muted" />
+              <div className="flex flex-1 justify-center px-4">
+                <div className="flex flex-col items-center gap-2 text-center">
+                  <div className="h-6 w-24 rounded bg-muted animate-pulse" />
+                  <div className="h-4 w-32 rounded bg-muted animate-pulse" />
+                </div>
               </div>
-              <div className="flex items-center gap-3 animate-pulse">
-                <div className="h-10 w-36 rounded bg-muted" />
-                <div className="h-8 w-8 rounded-full bg-muted" />
+              <div className="flex items-center gap-2">
+                <div className="h-8 w-32 rounded bg-muted animate-pulse" />
+                <div className="h-8 w-8 rounded-full bg-muted animate-pulse" />
               </div>
             </div>
           </header>
@@ -96,18 +101,15 @@ export default function GlobalHeader({ className = "" }: GlobalHeaderProps) {
       <>
         {presence}
         <BrandTheme projectId={projectId} />
-        <header
-          className={cn(
-            "header sticky top-0 z-50 w-full border-b border-border bg-background/95 backdrop-blur",
-            className
-          )}
-        >
-          <div className="mx-auto flex h-16 max-w-[1320px] items-center justify-between gap-4 px-4">
-            <a href="/" className="flex items-center gap-2 shrink-0" aria-label="TEAIM home">
-              <span className="text-lg font-semibold text-[var(--text-strong)]">TEAIM</span>
-            </a>
-
-            <div className="mx-auto flex min-w-0 flex-col items-center justify-center text-center">
+        <header className={headerClasses}>
+          <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 h-14 md:h-16 flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <img src="/teaim-logo.svg" alt="TEAIM" className="h-6 md:h-7" />
+              <span className="hidden md:inline text-sm tracking-wide text-brand-charcoal dark:text-white/90">
+                TEAIM.app
+              </span>
+            </div>
+            <div className="flex flex-1 flex-col items-center justify-center px-4 text-center">
               <div className="flex items-center gap-3">
                 {customerLogo ? (
                   <ImgLogo
@@ -132,8 +134,7 @@ export default function GlobalHeader({ className = "" }: GlobalHeaderProps) {
                 {headerTagline}
               </span>
             </div>
-
-            <div className="flex items-center gap-3 shrink-0">
+            <div className="flex items-center gap-2">
               <ProjectSelector />
               <span className="k-pill k-pill--gold" data-testid="environment-pill">
                 {env}
@@ -156,14 +157,18 @@ export default function GlobalHeader({ className = "" }: GlobalHeaderProps) {
   return (
     <>
       {presence}
-      <header
-        className={cn(
-          "sticky top-0 z-40 w-full border-b border-border bg-background/95 backdrop-blur",
-          className
-        )}
-      >
-        <div className="mx-auto max-w-7xl px-4 py-2">
-          <BrandedHeader variant="full" showFallback={true} projectId={projectId} />
+      <header className={headerClasses}>
+        <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 h-14 md:h-16 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <img src="/teaim-logo.svg" alt="TEAIM" className="h-6 md:h-7" />
+            <span className="hidden md:inline text-sm tracking-wide text-brand-charcoal dark:text-white/90">
+              TEAIM.app
+            </span>
+          </div>
+          <div className="flex flex-1 justify-center px-4">
+            <BrandedHeader variant="full" showFallback={true} projectId={projectId} />
+          </div>
+          <div className="flex items-center gap-2" />
         </div>
       </header>
     </>
