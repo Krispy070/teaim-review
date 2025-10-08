@@ -3,7 +3,10 @@ import SidebarV2 from "@/components/SidebarV2";
 import { getProjectId } from "@/lib/project";
 import { fetchWithAuth } from "@/lib/supabase";
 import { ensureProjectPath } from "@/lib/project";
-import { useEffect, useRef, useState } from "react";
+import MemoryPrompt from "@/components/MemoryPrompt";
+import { useMemoryPrompts } from "@/hooks/useMemoryPrompts";
+import type { MemoryRecommendation } from "@shared/memory";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 function badge(value:number, label:string, tone:"ok"|"warn"|"err"="ok"){
   const cls = tone==="ok" ? "border-emerald-600 text-emerald-300"
@@ -26,6 +29,25 @@ export default function ReleaseManagerPage(){
   const [sumCache,setSumCache]=useState<Record<string, any>>({});
   const [decisionNotes,setDecisionNotes]=useState("");
   const [meEmail,setMeEmail]=useState<string>("");
+  const memory = useMemoryPrompts(pid, "release");
+
+  const memorySlot = useMemo(() => {
+    if (!memory.featureEnabled || !memory.prompts.length) return null;
+    return (
+      <div className="flex w-full flex-col gap-3 lg:max-w-xs">
+        {memory.prompts.map((prompt: MemoryRecommendation) => (
+          <MemoryPrompt
+            key={prompt.id}
+            title={prompt.title}
+            text={prompt.text}
+            confidence={prompt.confidence ?? undefined}
+            onApply={() => memory.applyPrompt(prompt)}
+            onDismiss={() => memory.dismissPrompt(prompt)}
+          />
+        ))}
+      </div>
+    );
+  }, [memory.applyPrompt, memory.dismissPrompt, memory.featureEnabled, memory.prompts]);
 
   async function loadSummary(relId:string){
     if (sumCache[relId]) return sumCache[relId];
@@ -67,18 +89,23 @@ export default function ReleaseManagerPage(){
   return (
     <AppFrame sidebar={<SidebarV2 />}>
       <div className="p-6 space-y-4">
-        <div className="flex items-center justify-between">
-          <h1 className="text-2xl font-semibold">Releases (R1/R2)</h1>
-          <div className="flex items-center gap-2">
-            <select className="border rounded px-2 py-1 text-sm" value={code} onChange={e=>setCode(e.target.value)} data-testid="select-release-code">
-              <option value="R1">R1</option><option value="R2">R2</option><option value="hotfix">hotfix</option>
-            </select>
-            <input type="number" className="border rounded px-2 py-1 text-sm w-24" value={year} onChange={e=>setYear(Number(e.target.value||year))} data-testid="input-release-year"/>
-            <input type="file" ref={fileRef} accept=".xlsx,.xls" className="text-xs" data-testid="input-file"/>
-            <button className="text-xs px-2 py-1 border rounded" onClick={importExcel} data-testid="button-import">Import</button>
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div className="flex-1 space-y-2">
+            <div className="flex items-center justify-between">
+              <h1 className="text-2xl font-semibold">Releases (R1/R2)</h1>
+              <div className="flex items-center gap-2">
+                <select className="border rounded px-2 py-1 text-sm" value={code} onChange={e=>setCode(e.target.value)} data-testid="select-release-code">
+                  <option value="R1">R1</option><option value="R2">R2</option><option value="hotfix">hotfix</option>
+                </select>
+                <input type="number" className="border rounded px-2 py-1 text-sm w-24" value={year} onChange={e=>setYear(Number(e.target.value||year))} data-testid="input-release-year"/>
+                <input type="file" ref={fileRef} accept=".xlsx,.xls" className="text-xs" data-testid="input-file"/>
+                <button className="text-xs px-2 py-1 border rounded" onClick={importExcel} data-testid="button-import">Import</button>
+              </div>
+            </div>
+            <div className="text-xs opacity-70" data-testid="text-message">{msg}</div>
           </div>
+          {memorySlot}
         </div>
-        <div className="text-xs opacity-70" data-testid="text-message">{msg}</div>
 
         <div className="space-y-2">
           {items.map(r=>(
