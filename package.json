@@ -4,7 +4,7 @@
   "type": "module",
   "license": "MIT",
   "packageManager": "pnpm@10.18.1",
-  "scripts": {
+ "scripts": {
   "dev": "NODE_ENV=development tsx server/index.ts",
   "build": "vite build && esbuild server/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
   "start": "NODE_ENV=production node dist/index.js",
@@ -14,7 +14,8 @@
   "seed:demo": "node scripts/seed-demo.mjs",
   "mem:ingest:docs": "node scripts/mem-ingest-docs.mjs",
   "mem:demo": "node scripts/mem-demo.mjs",
-  "mem:mine": "node server/memory/miner.ts"
+  "mem:mine": "node server/memory/miner.ts",
+  "db:push": "drizzle-kit push"
 },
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",
