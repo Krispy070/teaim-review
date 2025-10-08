@@ -158,6 +158,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   // Parse JSON bodies with 10MB limit
   app.use(express.json({ limit: '10mb' }));
+
+  if (process.env.MEMORY_ENABLED === "1") {
+    const { createMemoryRouter } = await import("./memory/api");
+    app.use("/api/memory", createMemoryRouter());
+  }
   
   // Mount test admin router (admin only)
   app.use("/admin/test", requireRole("admin"), testAdminRouter);
