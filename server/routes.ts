@@ -126,6 +126,7 @@ import { docs, docChunks, notifications, embedJobs, parseJobs } from "../shared/
 import { eq, sql, or, isNull, inArray } from "drizzle-orm";
 import { chunkText, generateEmbeddings } from "./lib/embed";
 import { extractKeywords, summarize } from "./lib/text";
+import memoryRoutes from "./memory/api";
 
 export async function registerRoutes(app: Express): Promise<Server> {
   // Secret for signing file access tokens (in production, use secure env var)
@@ -166,6 +167,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.use("/api/projects", projManage);
   app.use("/api/tests", requireRole("admin"), testsRoutes);
   app.use("/api/kapmem", kapmemRoutes);
+  if (process.env.MEMORY_ENABLED === '1') {
+    app.use("/api/memory", memoryRoutes);
+  }
   app.use("/api/notifications", requireProject("member"), notif);
   app.use("/api/releases", requireProject("member"), releases);
   app.use("/api/releases", requireProject("member"), rbulk);
