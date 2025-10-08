@@ -11,6 +11,7 @@ import { SignJWT, jwtVerify } from "jose";
 import { testAdminRouter } from "./admin/test";
 import testsRoutes from "./tests.routes";
 import kapmemRoutes from "./kapmem.routes";
+import memoryRoutes from "./memory/api";
 import { testStubsRouter } from "./test-stubs.routes";
 import { notif } from "./routes/notifications";
 import { releases } from "./routes/releases";
@@ -166,6 +167,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.use("/api/projects", projManage);
   app.use("/api/tests", requireRole("admin"), testsRoutes);
   app.use("/api/kapmem", kapmemRoutes);
+  app.use("/api/memory", memoryRoutes);
   app.use("/api/notifications", requireProject("member"), notif);
   app.use("/api/releases", requireProject("member"), releases);
   app.use("/api/releases", requireProject("member"), rbulk);
