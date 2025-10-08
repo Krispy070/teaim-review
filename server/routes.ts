@@ -158,6 +158,57 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Parse JSON bodies with 10MB limit
   app.use(express.json({ limit: '10mb' }));
   
+  app.post("/api/internal/slack/demo-kit", async (req, res) => {
+    const expectedToken = process.env.SLACK_DEMO_TOKEN;
+    if (!expectedToken) {
+      return res.status(501).json({ error: "SLACK_DEMO_TOKEN not configured" });
+    }
+
+    const authHeader = typeof req.headers.authorization === "string" ? req.headers.authorization : "";
+    const headerToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    const bodyToken = typeof (req as any).body?.token === "string" ? (req as any).body.token : "";
+    const providedToken = headerToken || bodyToken;
+
+    if (providedToken !== expectedToken) {
+      return res.status(401).json({ error: "unauthorized" });
+    }
+
+    const body: any = (req as any).body || {};
+    const explicitProject = typeof body.projectId === "string" ? body.projectId : undefined;
+    const textProject = typeof body.text === "string"
+      ? (body.text.match(/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/) || [])[0]
+      : undefined;
+    const projectId = explicitProject || textProject;
+
+    if (!projectId) {
+      return res.status(400).json({ error: "projectId required" });
+    }
+
+    try {
+      const { runSlackDemoKit } = await import("../scripts/slack-demo-kit.mjs");
+      const result = await runSlackDemoKit({
+        projectId,
+        channel: typeof body.channel_id === "string" ? body.channel_id : undefined,
+        actor: typeof body.user_name === "string" ? body.user_name : undefined,
+      });
+
+      const ackText = `${result.summary}${result.posted ? ` · posted via ${result.method}` : " · Slack post skipped"}`;
+
+      if (typeof body.command === "string") {
+        return res.json({ response_type: "ephemeral", text: ackText });
+      }
+
+      return res.json({ ok: true, ...result });
+    } catch (error: any) {
+      const message = error?.message || String(error);
+      console.error("[slack demo kit]", message);
+      if (typeof (req as any).body?.command === "string") {
+        return res.json({ response_type: "ephemeral", text: `Demo kit error: ${message}` });
+      }
+      return res.status(500).json({ error: message });
+    }
+  });
+
   // Mount test admin router (admin only)
   app.use("/admin/test", requireRole("admin"), testAdminRouter);
   
