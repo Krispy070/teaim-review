@@ -35,10 +35,16 @@ import { bootstrapMemory } from "./memory/bootstrap";
 import dotenv from 'dotenv';
 dotenv.config();
 
+const isProduction = process.env.NODE_ENV === 'production';
+
 // Production safety: Refuse to start with DEV_AUTH enabled in production
-if (process.env.NODE_ENV === 'production' && process.env.DEV_AUTH === '1') {
-  console.error('SECURITY ERROR: DEV_AUTH cannot be enabled in production environment');
-  process.exit(1);
+if (process.env.DEV_AUTH === '1') {
+  if (isProduction) {
+    console.error('SECURITY ERROR: DEV_AUTH cannot be enabled in production environment');
+    process.exit(1);
+  } else {
+    console.warn('DEV_AUTH is enabled outside production - continuing without exit');
+  }
 }
 
 const app = express();

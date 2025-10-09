@@ -7,7 +7,29 @@ const POLL_MS = Number(process.env.PARSE_POLL_MS || 7000);
 const MAX_ATTEMPTS = 3;
 const MAX_CHARS = Number(process.env.INSIGHTS_MAX_CHARS || 20000);
 
+const SCHEMA_ERROR_CODES = new Set(["42P01", "42P10"]);
+let loggedSchemaError = false;
+
+function getPgErrorCode(error: any): string | undefined {
+  return error?.code ?? error?.original?.code ?? error?.cause?.code;
+}
+
+function handleSchemaError(context: string, error: any): boolean {
+  const code = getPgErrorCode(error);
+  if (code && SCHEMA_ERROR_CODES.has(code)) {
+    if (!loggedSchemaError) {
+      console.warn(`${context} database not ready (${code}): ${error?.message ?? error}`);
+      loggedSchemaError = true;
+    }
+    return true;
+  }
+  return false;
+}
+
 async function beat(name: string, info: any = {}) {
+  if (process.env.WORKERS_ENABLED === "0") {
+    return;
+  }
   try {
     const infoJson = JSON.stringify(info);
     await db.execute(sql`
@@ -16,7 +38,9 @@ async function beat(name: string, info: any = {}) {
       ON CONFLICT (worker) DO UPDATE SET info=${infoJson}::jsonb, updated_at=now()
     `);
   } catch (e) {
-    console.error("[beat] failed", e);
+    if (!handleSchemaError("[parseWorker]", e)) {
+      console.error("[parseWorker] beat failed", e);
+    }
   }
 }
 
@@ -181,41 +205,60 @@ async function processJob(job: any) {
 }
 
 export function startParseWorker() {
+  if (process.env.WORKERS_ENABLED === "0") {
+    console.log("[parseWorker] disabled (WORKERS_ENABLED=0)");
+    return;
+  }
   if (process.env.PARSE_WORKER === "0") {
     console.log("[parseWorker] disabled (PARSE_WORKER=0)");
     return;
   }
 
   console.log(`[parseWorker] starting with ${POLL_MS}ms poll interval`);
-  setInterval(async () => {
+  const tick = async () => {
+    if (process.env.WORKERS_ENABLED === "0") {
+      return;
+    }
     try {
       const job = await nextJob();
       if (!job) {
         const countResult: any = await db.execute(sql`select count(*)::int as n from parse_jobs where status='pending'`);
         const pending = (countResult.rows || countResult)?.[0]?.n || 0;
         await beat("parse", { pending });
+        loggedSchemaError = false;
         return;
       }
-      
+
       console.log(`[parseWorker] Processing job ${job.id} for doc ${job.docId}`);
-      
-      try { 
-        await processJob(job); 
+
+      try {
+        await processJob(job);
         console.log(`[parseWorker] Completed job ${job.id}`);
       }
       catch (err: any) {
+        if (handleSchemaError("[parseWorker]", err)) {
+          return;
+        }
         console.error("[parseWorker] failed", err?.message);
         await db.execute(sql`
-          UPDATE parse_jobs 
+          UPDATE parse_jobs
           SET status = CASE WHEN attempts >= ${MAX_ATTEMPTS} THEN 'failed' ELSE 'pending' END,
               last_error = ${String(err?.message || err)}, updated_at = now()
           WHERE id = ${job.id}
         `);
       }
-      
+
       const countResult: any = await db.execute(sql`select count(*)::int as n from parse_jobs where status='pending'`);
       const pending = (countResult.rows || countResult)?.[0]?.n || 0;
       await beat("parse", { pending });
-    } catch (e) { console.error("[parseWorker] tick error", e); }
-  }, POLL_MS);
+      loggedSchemaError = false;
+    } catch (e) {
+      if (!handleSchemaError("[parseWorker]", e)) {
+        console.error("[parseWorker] tick error", e);
+      }
+    }
+  };
+
+  setInterval(tick, POLL_MS);
+  void tick();
 }

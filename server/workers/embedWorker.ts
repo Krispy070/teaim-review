@@ -6,7 +6,29 @@ import { chunkText, generateEmbeddings } from "../lib/embed";
 const POLL_MS = Number(process.env.EMBED_POLL_MS || 5000);
 const MAX_ATTEMPTS = 3;
 
+const SCHEMA_ERROR_CODES = new Set(["42P01", "42P10"]);
+let loggedSchemaError = false;
+
+function getPgErrorCode(error: any): string | undefined {
+  return error?.code ?? error?.original?.code ?? error?.cause?.code;
+}
+
+function handleSchemaError(context: string, error: any): boolean {
+  const code = getPgErrorCode(error);
+  if (code && SCHEMA_ERROR_CODES.has(code)) {
+    if (!loggedSchemaError) {
+      console.warn(`${context} database not ready (${code}): ${error?.message ?? error}`);
+      loggedSchemaError = true;
+    }
+    return true;
+  }
+  return false;
+}
+
 async function beat(name: string, info: any = {}) {
+  if (process.env.WORKERS_ENABLED === "0") {
+    return;
+  }
   try {
     const infoJson = JSON.stringify(info);
     await db.execute(sql`
@@ -15,7 +37,9 @@ async function beat(name: string, info: any = {}) {
       ON CONFLICT (worker) DO UPDATE SET info=${infoJson}::jsonb, updated_at=now()
     `);
   } catch (e) {
-    console.error("[beat] failed", e);
+    if (!handleSchemaError("[embedWorker]", e)) {
+      console.error("[embedWorker] beat failed", e);
+    }
   }
 }
 
@@ -47,7 +71,9 @@ async function nextJob(): Promise<Job | null> {
     const rows = (result as any).rows || result;
     return rows.length > 0 ? rows[0] : null;
   } catch (err: any) {
-    console.error("[embedWorker] nextJob error:", err.message);
+    if (!handleSchemaError("[embedWorker]", err)) {
+      console.error("[embedWorker] nextJob error:", err.message);
+    }
     return null;
   }
 }
@@ -115,6 +141,10 @@ async function processJob(job: Job) {
 }
 
 export async function startEmbedWorker() {
+  if (process.env.WORKERS_ENABLED === "0") {
+    console.log("[embedWorker] disabled (WORKERS_ENABLED=0)");
+    return;
+  }
   if (process.env.EMBED_WORKER === "0") {
     console.log("[embedWorker] disabled (EMBED_WORKER=0)");
     return;
@@ -123,12 +153,16 @@ export async function startEmbedWorker() {
   console.log(`[embedWorker] starting with ${POLL_MS}ms poll interval`);
 
   async function tick() {
+    if (process.env.WORKERS_ENABLED === "0") {
+      return;
+    }
     try {
       const job = await nextJob();
       if (!job) {
         const countResult: any = await db.execute(sql`select count(*)::int as n from embed_jobs where status='pending'`);
         const pending = (countResult.rows || countResult)?.[0]?.n || 0;
         await beat("embed", { pending });
+        loggedSchemaError = false;
         return;
       }
 
@@ -137,12 +171,15 @@ export async function startEmbedWorker() {
       try {
         await processJob(job);
       } catch (err: any) {
+        if (handleSchemaError("[embedWorker]", err)) {
+          return;
+        }
         console.error(`[embedWorker] Job ${job.id} failed:`, err.message);
-        
+
         // Update job with error, mark as failed if max attempts reached
         const updateResult = await db.execute(sql`
           UPDATE embed_jobs
-          SET 
+          SET
             status = CASE WHEN attempts >= ${MAX_ATTEMPTS} THEN 'failed' ELSE 'pending' END,
             last_error = ${String(err?.message || err)},
             updated_at = NOW()
@@ -151,17 +188,20 @@ export async function startEmbedWorker() {
         
         console.log(`[embedWorker] Job ${job.id} status updated after failure`);
       }
-      
+
       const countResult: any = await db.execute(sql`select count(*)::int as n from embed_jobs where status='pending'`);
       const pending = (countResult.rows || countResult)?.[0]?.n || 0;
       await beat("embed", { pending });
+      loggedSchemaError = false;
     } catch (err: any) {
-      console.error("[embedWorker] tick error:", err.message);
+      if (!handleSchemaError("[embedWorker]", err)) {
+        console.error("[embedWorker] tick error:", err.message);
+      }
     }
   }
 
   // Run first tick immediately
-  tick();
+  void tick();
   
   // Then poll at intervals
   setInterval(tick, POLL_MS);
