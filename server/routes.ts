@@ -127,7 +127,6 @@ import { docs, docChunks, notifications, embedJobs, parseJobs } from "../shared/
 import { eq, sql, or, isNull, inArray } from "drizzle-orm";
 import { chunkText, generateEmbeddings } from "./lib/embed";
 import { extractKeywords, summarize } from "./lib/text";
-import memoryRoutes from "./memory/api";
 
 export async function registerRoutes(app: Express): Promise<Server> {
   // Secret for signing file access tokens (in production, use secure env var)
@@ -161,8 +160,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.use(express.json({ limit: '10mb' }));
 
   if (process.env.MEMORY_ENABLED === "1") {
-    const { createMemoryRouter } = await import("./memory/api");
-    app.use("/api/memory", createMemoryRouter());
+    app.use("/api/memory", memoryRoutes);
   }
   
   app.post("/api/internal/slack/demo-kit", async (req, res) => {
@@ -224,9 +222,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.use("/api/projects", projManage);
   app.use("/api/tests", requireRole("admin"), testsRoutes);
   app.use("/api/kapmem", kapmemRoutes);
-  if (process.env.MEMORY_ENABLED === '1') {
-    app.use("/api/memory", memoryRoutes);
-  }
 
   app.use("/api/notifications", requireProject("member"), notif);
   app.use("/api/releases", requireProject("member"), releases);
@@ -235,7 +230,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.use("/api/dev", dev);
   app.use("/api/insights", requireProject("member"), insights);
   app.use("/api/kap", requireProject("member"), kap);
-  app.use("/api/memory", requireProject("member"), memoryRoutes);
   app.use("/api/project-members", projectMembersRouter);
   app.use("/api/projects", projects);
   app.use("/api/actions", actionsApi);
