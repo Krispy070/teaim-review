@@ -1,33 +1,15 @@
 import { db } from "../db/client";
 import { sql } from "drizzle-orm";
 import OpenAI from "openai";
+import { handleWorkerError, workersDisabled } from "./utils";
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const POLL_MS = Number(process.env.PARSE_POLL_MS || 7000);
 const MAX_ATTEMPTS = 3;
 const MAX_CHARS = Number(process.env.INSIGHTS_MAX_CHARS || 20000);
 
-const SCHEMA_ERROR_CODES = new Set(["42P01", "42P10"]);
-let loggedSchemaError = false;
-
-function getPgErrorCode(error: any): string | undefined {
-  return error?.code ?? error?.original?.code ?? error?.cause?.code;
-}
-
-function handleSchemaError(context: string, error: any): boolean {
-  const code = getPgErrorCode(error);
-  if (code && SCHEMA_ERROR_CODES.has(code)) {
-    if (!loggedSchemaError) {
-      console.warn(`${context} database not ready (${code}): ${error?.message ?? error}`);
-      loggedSchemaError = true;
-    }
-    return true;
-  }
-  return false;
-}
-
 async function beat(name: string, info: any = {}) {
-  if (process.env.WORKERS_ENABLED === "0") {
+  if (workersDisabled()) {
     return;
   }
   try {
@@ -38,31 +20,34 @@ async function beat(name: string, info: any = {}) {
       ON CONFLICT (worker) DO UPDATE SET info=${infoJson}::jsonb, updated_at=now()
     `);
   } catch (e) {
-    if (!handleSchemaError("[parseWorker]", e)) {
-      console.error("[parseWorker] beat failed", e);
-    }
+    handleWorkerError("parseWorker", e);
   }
 }
 
 async function nextJob() {
-  const result: any = await db.execute(sql`
-    WITH next_job AS (
-      SELECT id, doc_id, project_id
-      FROM parse_jobs
-      WHERE status = 'pending'
-      ORDER BY created_at ASC
-      LIMIT 1
-      FOR UPDATE SKIP LOCKED
-    )
-    UPDATE parse_jobs
-    SET status = 'running', attempts = attempts + 1, updated_at = NOW()
-    FROM next_job
-    WHERE parse_jobs.id = next_job.id
-    RETURNING parse_jobs.id, parse_jobs.doc_id as "docId", parse_jobs.project_id as "projectId"
-  `);
-  
-  const rows = result.rows || result;
-  return rows.length > 0 ? rows[0] : null;
+  try {
+    const result: any = await db.execute(sql`
+      WITH next_job AS (
+        SELECT id, doc_id, project_id
+        FROM parse_jobs
+        WHERE status = 'pending'
+        ORDER BY created_at ASC
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE parse_jobs
+      SET status = 'running', attempts = attempts + 1, updated_at = NOW()
+      FROM next_job
+      WHERE parse_jobs.id = next_job.id
+      RETURNING parse_jobs.id, parse_jobs.doc_id as "docId", parse_jobs.project_id as "projectId"
+    `);
+
+    const rows = result.rows || result;
+    return rows.length > 0 ? rows[0] : null;
+  } catch (error) {
+    handleWorkerError("parseWorker", error);
+    return null;
+  }
 }
 
 const SYS = `You are an expert Workday/M&A integration analyst. Extract structured data from the given document text.
@@ -205,7 +190,7 @@ async function processJob(job: any) {
 }
 
 export function startParseWorker() {
-  if (process.env.WORKERS_ENABLED === "0") {
+  if (workersDisabled()) {
     console.log("[parseWorker] disabled (WORKERS_ENABLED=0)");
     return;
   }
@@ -216,7 +201,7 @@ export function startParseWorker() {
 
   console.log(`[parseWorker] starting with ${POLL_MS}ms poll interval`);
   const tick = async () => {
-    if (process.env.WORKERS_ENABLED === "0") {
+    if (workersDisabled()) {
       return;
     }
     try {
@@ -225,7 +210,6 @@ export function startParseWorker() {
         const countResult: any = await db.execute(sql`select count(*)::int as n from parse_jobs where status='pending'`);
         const pending = (countResult.rows || countResult)?.[0]?.n || 0;
         await beat("parse", { pending });
-        loggedSchemaError = false;
         return;
       }
 
@@ -236,7 +220,7 @@ export function startParseWorker() {
         console.log(`[parseWorker] Completed job ${job.id}`);
       }
       catch (err: any) {
-        if (handleSchemaError("[parseWorker]", err)) {
+        if (handleWorkerError("parseWorker", err)) {
           return;
         }
         console.error("[parseWorker] failed", err?.message);
@@ -251,11 +235,11 @@ export function startParseWorker() {
       const countResult: any = await db.execute(sql`select count(*)::int as n from parse_jobs where status='pending'`);
       const pending = (countResult.rows || countResult)?.[0]?.n || 0;
       await beat("parse", { pending });
-      loggedSchemaError = false;
     } catch (e) {
-      if (!handleSchemaError("[parseWorker]", e)) {
-        console.error("[parseWorker] tick error", e);
+      if (handleWorkerError("parseWorker", e)) {
+        return;
       }
+      console.error("[parseWorker] tick error", e);
     }
   };
 

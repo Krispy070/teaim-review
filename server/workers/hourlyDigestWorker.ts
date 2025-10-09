@@ -2,8 +2,10 @@ import { db } from "../db/client";
 import { sql } from "drizzle-orm";
 import { sendEmail } from "../lib/notify";
 import { sendSlackWebhook } from "../lib/slack";
+import { handleWorkerError, workersDisabled } from "./utils";
 
 async function processHourlyDigests() {
+  if (workersDisabled()) return;
   try {
     const { rows } = await db.execute(
       sql`select project_id as "projectId", user_email as "userEmail", email, slack_webhook_id as "slackWebhookId"
@@ -48,7 +50,7 @@ async function processHourlyDigests() {
       );
     }
   } catch (err) {
-    console.error("[hourlyDigestWorker] error:", err);
+    handleWorkerError("hourlyDigestWorker", err);
   }
 }
 

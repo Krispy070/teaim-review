@@ -1,34 +1,16 @@
 import { db } from "../db/client";
 import { sql } from "drizzle-orm";
 import { beat } from "../lib/heartbeat";
-
-const SCHEMA_ERROR_CODES = new Set(["42P01", "42P10"]);
-let loggedSchemaError = false;
-
-function getPgErrorCode(error: any): string | undefined {
-  return error?.code ?? error?.original?.code ?? error?.cause?.code;
-}
-
-function handleSchemaError(error: any): boolean {
-  const code = getPgErrorCode(error);
-  if (code && SCHEMA_ERROR_CODES.has(code)) {
-    if (!loggedSchemaError) {
-      console.warn(`[planTicketSync] database not ready (${code}): ${error?.message ?? error}`);
-      loggedSchemaError = true;
-    }
-    return true;
-  }
-  return false;
-}
+import { handleWorkerError, workersDisabled } from "./utils";
 
 export function startPlanTicketSyncWorker(){
-  if (process.env.WORKERS_ENABLED === "0") {
+  if (workersDisabled()) {
     console.log("[planTicketSync] disabled (WORKERS_ENABLED=0)");
     return;
   }
 
   setInterval(async ()=>{
-    if (process.env.WORKERS_ENABLED === "0") {
+    if (workersDisabled()) {
       return;
     }
     try{
@@ -54,13 +36,12 @@ export function startPlanTicketSyncWorker(){
         }
       }
       await beat("planTicketSync", true);
-      loggedSchemaError = false;
     }catch(e){
-      if (handleSchemaError(e)) {
+      await beat("planTicketSync", false, String(e));
+      if (handleWorkerError("planTicketSync", e)) {
         return;
       }
       console.error("[planTicketSync]", e);
-      await beat("planTicketSync", false, String(e));
     }
   }, 10*60*1000);
 

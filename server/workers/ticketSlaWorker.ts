@@ -1,9 +1,11 @@
 import { db } from "../db/client";
 import { sendEmail } from "../lib/notify";
 import { sql } from "drizzle-orm";
+import { handleWorkerError, workersDisabled } from "./utils";
 
 export function startTicketSlaWorker() {
   setInterval(async () => {
+    if (workersDisabled()) return;
     try {
       // Mark first response timestamp when first outbound message posted
       await db.execute(
@@ -73,7 +75,7 @@ export function startTicketSlaWorker() {
         }
       }
     } catch (e) {
-      console.error("[ticketSLA]", e);
+      handleWorkerError("ticketSLA", e);
     }
   }, 60_000); // Run every minute
 }

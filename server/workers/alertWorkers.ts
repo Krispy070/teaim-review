@@ -2,6 +2,7 @@ import { db } from "../db/client";
 import { sql } from "drizzle-orm";
 import { sendEmail, sendSMS } from "../lib/notify";
 import { sendSlackWebhook, sendGenericWebhook } from "../lib/slack";
+import { handleWorkerError, workersDisabled } from "./utils";
 
 async function projectMutedUntil(projectId: string) {
   const { rows } = await db.execute(
@@ -60,6 +61,7 @@ async function shouldSend(projectId:string|null, key:string, cooldownMin=15){
 
 export function startAlertWorkers(){
   setInterval(async ()=>{
+    if (workersDisabled()) return;
     try {
       const errRows = (await db.execute(
         sql`select project_id as "projectId", count(*)::int as n
@@ -173,8 +175,8 @@ export function startAlertWorkers(){
           }
         }
       }
-    } catch (err) {
-      console.error("[alertWorkers] error:", err);
+    } catch (error) {
+      handleWorkerError("alertWorkers", error);
     }
   }, 60_000);
 }

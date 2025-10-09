@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { db } from "../db/client";
+import { handleWorkerError, workersDisabled } from "./utils";
 
 /**
  * Every hour:
@@ -8,6 +9,7 @@ import { db } from "../db/client";
  */
 export function startArtifactRetentionWorker(){
   setInterval(async ()=>{
+    if (workersDisabled()) return;
     try {
       const { rows: projs } = await db.execute(`select id from projects`, [] as any);
       for (const p of projs || []){
@@ -25,7 +27,9 @@ export function startArtifactRetentionWorker(){
         await enforceCap("integration_run_artifacts", pid, cfg.gb);
         await enforceCap("ticket_attachments", pid, cfg.gb);
       }
-    } catch (e) { console.error("[artifactRetention]", e); }
+    } catch (error) {
+      handleWorkerError("artifactRetention", error);
+    }
   }, 60 * 60 * 1000);
 }
 
