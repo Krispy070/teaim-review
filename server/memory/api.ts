@@ -17,6 +17,22 @@ import { recommendations } from "./recommend";
 
 const MEMORY_ENABLED = process.env.MEMORY_ENABLED === "1";
 const EMBED_ENABLED = !!process.env.OPENAI_API_KEY;
+const SCHEMA_ERROR_CODES = new Set(["42P01", "42P10"]);
+
+const isSchemaNotReady = (err: any): boolean => {
+  if (!err || typeof err !== "object") return false;
+
+  const code = (err as any).code;
+  if (code && SCHEMA_ERROR_CODES.has(String(code))) return true;
+
+  const originalCode = (err as any)?.originalError?.code;
+  if (originalCode && SCHEMA_ERROR_CODES.has(String(originalCode))) return true;
+
+  const causeCode = (err as any)?.cause?.code;
+  if (causeCode && SCHEMA_ERROR_CODES.has(String(causeCode))) return true;
+
+  return false;
+};
 
 export const memoryRouter = Router();
 
@@ -43,7 +59,7 @@ const VALID_PHASES: Set<NonNullable<RetrieveInput["phase"]>> = new Set([
 memoryRouter.post("/retrieve", async (req: Request, res: Response) => {
   try {
     if (!MEMORY_ENABLED) return res.status(503).json({ ok: false, error: "memory disabled" });
-    if (!EMBED_ENABLED) return res.status(503).json({ ok: false, error: "embedding disabled (missing OPENAI_API_KEY)" });
+    if (!EMBED_ENABLED) return res.status(503).json({ ok: false, error: "embedding disabled" });
 
     const body = (req.body ?? {}) as Partial<RetrieveInput>;
     const project_id = typeof body.project_id === "string" ? body.project_id.trim() : "";
@@ -60,6 +76,9 @@ memoryRouter.post("/retrieve", async (req: Request, res: Response) => {
     const out = await retrieve({ project_id, query, k, phase, filters: body.filters });
     return res.status(200).json({ ok: true, ...out });
   } catch (err: any) {
+    if (isSchemaNotReady(err)) {
+      return res.status(503).json({ ok: false, error: "memory schema not ready" });
+    }
     return res.status(500).json({ ok: false, error: err?.message ?? String(err) });
   }
 });
@@ -72,7 +91,7 @@ const pickIngest = (mod: any): undefined | ((args: any) => Promise<any>) =>
 memoryRouter.post("/ingest", async (req: Request, res: Response) => {
   try {
     if (!MEMORY_ENABLED) return res.status(503).json({ ok: false, error: "memory disabled" });
-    if (!EMBED_ENABLED) return res.status(503).json({ ok: false, error: "embedding disabled (missing OPENAI_API_KEY)" });
+    if (!EMBED_ENABLED) return res.status(503).json({ ok: false, error: "embedding disabled" });
 
     const { project_id, source_type, payload, policy } = (req.body ?? {}) as {
       project_id?: string;
@@ -119,6 +138,9 @@ memoryRouter.post("/ingest", async (req: Request, res: Response) => {
 
     return res.status(200).json({ ok: true, ...result });
   } catch (err: any) {
+    if (isSchemaNotReady(err)) {
+      return res.status(503).json({ ok: false, error: "memory schema not ready" });
+    }
     return res.status(500).json({ ok: false, error: err?.message ?? String(err) });
   }
 });
