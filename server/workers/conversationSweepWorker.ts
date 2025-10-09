@@ -1,6 +1,25 @@
 import { db } from "../db/client";
 import { beat } from "../lib/heartbeat";
 
+const SCHEMA_ERROR_CODES = new Set(["42P01", "42P10"]);
+let loggedSchemaError = false;
+
+function getPgErrorCode(error: any): string | undefined {
+  return error?.code ?? error?.original?.code ?? error?.cause?.code;
+}
+
+function handleSchemaError(error: any): boolean {
+  const code = getPgErrorCode(error);
+  if (code && SCHEMA_ERROR_CODES.has(code)) {
+    if (!loggedSchemaError) {
+      console.warn(`[conversationSweep] database not ready (${code}): ${error?.message ?? error}`);
+      loggedSchemaError = true;
+    }
+    return true;
+  }
+  return false;
+}
+
 /** Nightly auto-sweep of empty conversations (0 msgs) older than N days.
  * Uses project_settings:
  *  - conversation_sweep_enabled (bool)
@@ -9,7 +28,15 @@ import { beat } from "../lib/heartbeat";
  *  - conversation_sweep_last_at (timestamp)
  */
 export function startConversationSweepWorker() {
+  if (process.env.WORKERS_ENABLED === "0") {
+    console.log("[conversationSweep] disabled (WORKERS_ENABLED=0)");
+    return;
+  }
+
   setInterval(async () => {
+    if (process.env.WORKERS_ENABLED === "0") {
+      return;
+    }
     try {
       const { rows: projs } = await db.execute(
         `select project_id as "projectId",
@@ -57,7 +84,11 @@ export function startConversationSweepWorker() {
         );
       }
       await beat("conversationSweep", true);
+      loggedSchemaError = false;
     } catch (e) {
+      if (handleSchemaError(e)) {
+        return;
+      }
       console.error("[conversationSweep] error", e);
       await beat("conversationSweep", false, String(e));
     }
