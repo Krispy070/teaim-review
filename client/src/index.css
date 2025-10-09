@@ -846,3 +846,9 @@ html, body, #root { height: 100%; }
 :root { --border:#e5e7eb; }
 body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji"; }
 button { cursor:pointer; }
+.teaim-theme .brand-surface { background-color: #F7F7FB; }
+.teaim-theme.dark .brand-surface { background-color: #0F1020; }
+.teaim-theme .brand-hero { background-image:
+  radial-gradient(120% 120% at 10% 0%, rgba(107,70,255,.18) 0%, rgba(107,70,255,0) 60%),
+  radial-gradient(120% 120% at 90% 0%, rgba(78,240,176,.16) 0%, rgba(78,240,176,0) 60%);
+}

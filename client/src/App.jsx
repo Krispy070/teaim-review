@@ -192,16 +192,18 @@ export default function App(){
   const value = { projectId, setProjectId, orgId, setOrgId, userRole, setUserRole }
 
   return (
-    <QueryClientProvider client={queryClient}>
-      <TooltipProvider>
-        <AuthProvider>
-          <ProjectProvider>
-            <AppContent value={value} />
-            <HelpModal />
-          </ProjectProvider>
-        </AuthProvider>
-      </TooltipProvider>
-    </QueryClientProvider>
+    <div className="teaim-theme">
+      <QueryClientProvider client={queryClient}>
+        <TooltipProvider>
+          <AuthProvider>
+            <ProjectProvider>
+              <AppContent value={value} />
+              <HelpModal />
+            </ProjectProvider>
+          </AuthProvider>
+        </TooltipProvider>
+      </QueryClientProvider>
+    </div>
   )
 }
 

@@ -43,7 +43,7 @@ export default function LandingPage() {
   }
 
   return (
-    <div className="min-h-screen bg-background text-foreground">
+    <div className="min-h-screen brand-hero">
       <PublicNav authed={authed} nextLink={nextLink} />
       <main className="relative overflow-hidden">
         {/* Hero Section */}
