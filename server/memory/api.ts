@@ -18,6 +18,19 @@ import { recommendations } from "./recommend";
 const MEMORY_ENABLED = process.env.MEMORY_ENABLED === "1";
 const EMBED_ENABLED = !!process.env.OPENAI_API_KEY;
 
+const isSchemaNotReadyError = (err: unknown) => {
+  const code = typeof err === "object" && err && "code" in err ? (err as any).code : undefined;
+  return code === "42P01" || code === "42P10";
+};
+
+const handleMemoryError = (res: Response, err: any) => {
+  if (isSchemaNotReadyError(err)) {
+    return res.status(503).json({ ok: false, error: "memory schema not ready" });
+  }
+
+  return res.status(500).json({ ok: false, error: err?.message ?? String(err) });
+};
+
 export const memoryRouter = Router();
 
 /* ---------------------------- Health (PR-1) ---------------------------- */
@@ -43,7 +56,7 @@ const VALID_PHASES: Set<NonNullable<RetrieveInput["phase"]>> = new Set([
 memoryRouter.post("/retrieve", async (req: Request, res: Response) => {
   try {
     if (!MEMORY_ENABLED) return res.status(503).json({ ok: false, error: "memory disabled" });
-    if (!EMBED_ENABLED) return res.status(503).json({ ok: false, error: "embedding disabled (missing OPENAI_API_KEY)" });
+    if (!EMBED_ENABLED) return res.status(503).json({ ok: false, error: "embedding disabled" });
 
     const body = (req.body ?? {}) as Partial<RetrieveInput>;
     const project_id = typeof body.project_id === "string" ? body.project_id.trim() : "";
@@ -57,10 +70,14 @@ memoryRouter.post("/retrieve", async (req: Request, res: Response) => {
     if (!project_id) return res.status(400).json({ ok: false, error: "project_id required" });
     if (!query) return res.status(400).json({ ok: false, error: "query required" });
 
-    const out = await retrieve({ project_id, query, k, phase, filters: body.filters });
-    return res.status(200).json({ ok: true, ...out });
+    try {
+      const out = await retrieve({ project_id, query, k, phase, filters: body.filters });
+      return res.status(200).json({ ok: true, ...out });
+    } catch (err: any) {
+      return handleMemoryError(res, err);
+    }
   } catch (err: any) {
-    return res.status(500).json({ ok: false, error: err?.message ?? String(err) });
+    return handleMemoryError(res, err);
   }
 });
 
@@ -72,7 +89,7 @@ const pickIngest = (mod: any): undefined | ((args: any) => Promise<any>) =>
 memoryRouter.post("/ingest", async (req: Request, res: Response) => {
   try {
     if (!MEMORY_ENABLED) return res.status(503).json({ ok: false, error: "memory disabled" });
-    if (!EMBED_ENABLED) return res.status(503).json({ ok: false, error: "embedding disabled (missing OPENAI_API_KEY)" });
+    if (!EMBED_ENABLED) return res.status(503).json({ ok: false, error: "embedding disabled" });
 
     const { project_id, source_type, payload, policy } = (req.body ?? {}) as {
       project_id?: string;
@@ -88,38 +105,48 @@ memoryRouter.post("/ingest", async (req: Request, res: Response) => {
       policy === "strict" || policy === "off" ? policy : "standard";
 
     let result: any;
-    switch (source_type) {
-      case "docs": {
-        const fn = pickIngest(IngestDocs);
-        if (typeof fn !== "function") return res.status(500).json({ ok: false, error: "docs ingestor not available" });
-        result = await fn({ project_id, payload, policy: policyNorm });
-        break;
+    try {
+      switch (source_type) {
+        case "docs": {
+          const fn = pickIngest(IngestDocs);
+          if (typeof fn !== "function")
+            return res.status(500).json({ ok: false, error: "docs ingestor not available" });
+          result = await fn({ project_id, payload, policy: policyNorm });
+          break;
+        }
+        case "slack": {
+          const fn = pickIngest(IngestSlack);
+          if (typeof fn !== "function")
+            return res.status(500).json({ ok: false, error: "slack ingestor not available" });
+          result = await fn({ project_id, payload, policy: policyNorm });
+          break;
+        }
+        case "csv_release": {
+          const fn = pickIngest(IngestCsv);
+          if (typeof fn !== "function")
+            return res.status(500).json({ ok: false, error: "csv_release ingestor not available" });
+          result = await fn({ project_id, payload, policy: policyNorm });
+          break;
+        }
+        case "meetings": {
+          const fn = pickIngest(IngestMeetings);
+          if (typeof fn !== "function")
+            return res.status(500).json({ ok: false, error: "meetings ingestor not available" });
+          result = await fn({ project_id, payload, policy: policyNorm });
+          break;
+        }
+        default:
+          return res
+            .status(400)
+            .json({ ok: false, error: `unsupported source_type: ${source_type}` });
       }
-      case "slack": {
-        const fn = pickIngest(IngestSlack);
-        if (typeof fn !== "function") return res.status(500).json({ ok: false, error: "slack ingestor not available" });
-        result = await fn({ project_id, payload, policy: policyNorm });
-        break;
-      }
-      case "csv_release": {
-        const fn = pickIngest(IngestCsv);
-        if (typeof fn !== "function") return res.status(500).json({ ok: false, error: "csv_release ingestor not available" });
-        result = await fn({ project_id, payload, policy: policyNorm });
-        break;
-      }
-      case "meetings": {
-        const fn = pickIngest(IngestMeetings);
-        if (typeof fn !== "function") return res.status(500).json({ ok: false, error: "meetings ingestor not available" });
-        result = await fn({ project_id, payload, policy: policyNorm });
-        break;
-      }
-      default:
-        return res.status(400).json({ ok: false, error: `unsupported source_type: ${source_type}` });
-    }
 
-    return res.status(200).json({ ok: true, ...result });
+      return res.status(200).json({ ok: true, ...result });
+    } catch (err: any) {
+      return handleMemoryError(res, err);
+    }
   } catch (err: any) {
-    return res.status(500).json({ ok: false, error: err?.message ?? String(err) });
+    return handleMemoryError(res, err);
   }
 });
 
