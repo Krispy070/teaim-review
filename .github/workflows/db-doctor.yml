@@ -1,0 +1,20 @@
+name: DB Doctor
+on:
+  pull_request:
+    branches: ["**"]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 9 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: pnpm i --frozen-lockfile
+      - name: Run normalization migration
+        env: { DATABASE_URL: ${{ secrets.DATABASE_URL }} }
+        run: pnpm exec psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f drizzle/migrations/2025-10-09_normalize_embeddings.sql
+      - name: Drizzle push
+        env: { DATABASE_URL: ${{ secrets.DATABASE_URL }} }
+        run: pnpm exec drizzle-kit push --force

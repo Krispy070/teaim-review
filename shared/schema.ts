@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
-import { pgTable, text, varchar, uuid, timestamp, jsonb, integer, boolean, vector, numeric, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, text, varchar, uuid, timestamp, jsonb, integer, boolean, vector as pgVector, numeric, uniqueIndex } from "drizzle-orm/pg-core";
+import { vector } from "../src/db/types/vector";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
@@ -88,7 +89,7 @@ export const artifactChunks = pgTable("artifact_chunks", {
   artifactId: uuid("artifact_id").notNull().references(() => artifacts.id),
   content: text("content").notNull(),
   chunkIndex: integer("chunk_index").notNull(),
-  embedding: vector("embedding", { dimensions: 3072 }),
+  embedding: vector("embedding", 3072),
   createdAt: timestamp("created_at").defaultNow(),
 });
 
@@ -141,7 +142,7 @@ export const memChunks = pgTable("mem_chunks", {
   projectId: uuid("project_id").notNull().references(() => projects.id),
   memEntryId: uuid("mem_entry_id").notNull().references(() => memEntries.id),
   content: text("content").notNull(),
-  embedding: vector("embedding", { dimensions: 3072 }),
+  embedding: vector("embedding", 3072),
   createdAt: timestamp("created_at").defaultNow(),
 });
 
@@ -1139,8 +1140,8 @@ export const docChunks = pgTable("doc_chunks", {
   projectId: uuid("project_id").notNull(),
   chunkIndex: integer("chunk_index").default(0),
   chunk: text("chunk").notNull(),
-  embedding: jsonb("embedding").$type<number[]>(),
-  embeddingVec: vector("embedding_vec", { dimensions: 3072 }),
+  embedding: vector("embedding", 3072),
+  embeddingVec: pgVector("embedding_vec", { dimensions: 3072 }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
 });
 
