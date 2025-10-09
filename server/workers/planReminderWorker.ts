@@ -3,25 +3,7 @@ import { sendEmail } from "../lib/notify";
 import { sendSlackWebhook } from "../lib/slack";
 import { sql } from "drizzle-orm";
 import { beat } from "../lib/heartbeat";
-
-const SCHEMA_ERROR_CODES = new Set(["42P01", "42P10"]);
-let loggedSchemaError = false;
-
-function getPgErrorCode(error: any): string | undefined {
-  return error?.code ?? error?.original?.code ?? error?.cause?.code;
-}
-
-function handleSchemaError(error: any): boolean {
-  const code = getPgErrorCode(error);
-  if (code && SCHEMA_ERROR_CODES.has(code)) {
-    if (!loggedSchemaError) {
-      console.warn(`[planReminder] database not ready (${code}): ${error?.message ?? error}`);
-      loggedSchemaError = true;
-    }
-    return true;
-  }
-  return false;
-}
+import { handleWorkerError, workersDisabled } from "./utils";
 
 async function projectMutedUntil(projectId: string) {
   const r = await db.execute(
@@ -54,13 +36,13 @@ async function ownerEmailList(projectId: string, owner: string | null) {
 }
 
 export function startPlanReminderWorker() {
-  if (process.env.WORKERS_ENABLED === "0") {
+  if (workersDisabled()) {
     console.log("[planReminder] disabled (WORKERS_ENABLED=0)");
     return;
   }
 
   setInterval(async () => {
-    if (process.env.WORKERS_ENABLED === "0") {
+    if (workersDisabled()) {
       return;
     }
     try {
@@ -142,13 +124,12 @@ export function startPlanReminderWorker() {
         }
       }
       await beat("planReminder", true);
-      loggedSchemaError = false;
     } catch (e) {
-      if (handleSchemaError(e)) {
+      await beat("planReminder", false, String(e));
+      if (handleWorkerError("planReminder", e)) {
         return;
       }
       console.error("[planReminder]", e);
-      await beat("planReminder", false, String(e));
     }
   }, 10 * 60 * 1000);
 }

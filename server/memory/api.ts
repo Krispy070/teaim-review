@@ -1,6 +1,7 @@
 // server/memory/api.ts
 import type { Request, Response } from "express";
 import { Router } from "express";
+import { isVectorAvailable } from "./bootstrap";
 
 // Retrieval (PR-3)
 import { retrieve, type RetrieveInput } from "./retrieve";
@@ -18,6 +19,7 @@ import { recommendations } from "./recommend";
 const MEMORY_ENABLED = process.env.MEMORY_ENABLED === "1";
 const EMBED_ENABLED = !!process.env.OPENAI_API_KEY;
 const SCHEMA_ERROR_CODES = new Set(["42P01", "42P10"]);
+const VECTOR_MESSAGE = "pgvector extension unavailable";
 
 const isSchemaNotReady = (err: any): boolean => {
   if (!err || typeof err !== "object") return false;
@@ -42,6 +44,7 @@ memoryRouter.get("/health", (_req: Request, res: Response) => {
     ok: true,
     memoryEnabled: MEMORY_ENABLED,
     embedEnabled: EMBED_ENABLED,
+    vectorAvailable: isVectorAvailable(),
   });
 });
 
@@ -60,6 +63,7 @@ memoryRouter.post("/retrieve", async (req: Request, res: Response) => {
   try {
     if (!MEMORY_ENABLED) return res.status(503).json({ ok: false, error: "memory disabled" });
     if (!EMBED_ENABLED) return res.status(503).json({ ok: false, error: "embedding disabled" });
+    if (!isVectorAvailable()) return res.status(503).json({ ok: false, error: VECTOR_MESSAGE });
 
     const body = (req.body ?? {}) as Partial<RetrieveInput>;
     const project_id = typeof body.project_id === "string" ? body.project_id.trim() : "";
@@ -92,6 +96,7 @@ memoryRouter.post("/ingest", async (req: Request, res: Response) => {
   try {
     if (!MEMORY_ENABLED) return res.status(503).json({ ok: false, error: "memory disabled" });
     if (!EMBED_ENABLED) return res.status(503).json({ ok: false, error: "embedding disabled" });
+    if (!isVectorAvailable()) return res.status(503).json({ ok: false, error: VECTOR_MESSAGE });
 
     const { project_id, source_type, payload, policy } = (req.body ?? {}) as {
       project_id?: string;
@@ -150,6 +155,7 @@ memoryRouter.post("/ingest", async (req: Request, res: Response) => {
 memoryRouter.get("/recommendations", async (req: Request, res: Response) => {
   try {
     if (!MEMORY_ENABLED) return res.status(503).json({ ok: false, error: "memory disabled" });
+    if (!isVectorAvailable()) return res.status(503).json({ ok: false, error: VECTOR_MESSAGE });
 
     const project_id = String(req.query.project_id ?? "").trim();
     const phase = typeof req.query.phase === "string" ? req.query.phase : undefined;
@@ -168,6 +174,7 @@ memoryRouter.get("/recommendations", async (req: Request, res: Response) => {
 memoryRouter.post("/signals", async (req: Request, res: Response) => {
   try {
     if (!MEMORY_ENABLED) return res.status(503).json({ ok: false, error: "memory disabled" });
+    if (!isVectorAvailable()) return res.status(503).json({ ok: false, error: VECTOR_MESSAGE });
 
     const s = (req.body ?? {}) as Partial<Signal>;
     if (!s.project_id || !s.kind)

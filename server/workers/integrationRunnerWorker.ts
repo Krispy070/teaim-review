@@ -14,6 +14,7 @@ import FormData from "form-data";
 import { acquire } from "../lib/concurrency";
 import { hostOf } from "../lib/net";
 import { getSftp } from "../lib/sftpAbstraction";
+import { handleWorkerError, workersDisabled } from "./utils";
 
 const RUN_DIR = "/tmp/run-artifacts";
 if (!fs.existsSync(RUN_DIR)) fs.mkdirSync(RUN_DIR, { recursive:true });
@@ -494,6 +495,7 @@ async function runHttpPut(projectId:string, integ:any, runId:string){
 
 export function startIntegrationRunnerWorker(){
   setInterval(async ()=>{
+    if (workersDisabled()) return;
     try{
       const { rows } = await db.execute(
         sql`select r.id as "runId", r.project_id as "projectId", r.integration_id as "integrationId",
@@ -548,6 +550,9 @@ export function startIntegrationRunnerWorker(){
             }
           }
         } catch (e:any) {
+          if (handleWorkerError("integrationRunner", e)) {
+            return;
+          }
           const attemptsRow = await db.execute(sql`select attempts from integration_runs where id=${r.runId}`);
           const attempts = attemptsRow.rows?.[0]?.attempts || 1;
           const maxRetries = Number(r.adapterConfig?.retries ?? 2);
@@ -585,6 +590,8 @@ export function startIntegrationRunnerWorker(){
           }
         }
       }
-    }catch(e){ console.error("[runner]", e); }
+    }catch(e){
+      handleWorkerError("integrationRunner", e);
+    }
   }, 30_000);
 }

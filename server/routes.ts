@@ -122,7 +122,7 @@ import pbump from "./routes/plan_bump";
 import wh from "./routes/workers_health";
 import { requireRole } from "./auth/supabaseAuth";
 import { requireProject } from "./auth/projectAccess";
-import { db } from "./db/client";
+import { db, pool } from "./db/client";
 import { docs, docChunks, notifications, embedJobs, parseJobs } from "../shared/schema";
 import { eq, sql, or, isNull, inArray } from "drizzle-orm";
 import { chunkText, generateEmbeddings } from "./lib/embed";
@@ -158,6 +158,48 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   // Parse JSON bodies with 10MB limit
   app.use(express.json({ limit: '10mb' }));
+
+  if (process.env.NODE_ENV !== "production") {
+    app.get("/api/health/schema", async (_req, res) => {
+      const checks: Array<{ type: "table" | "index"; name: string }> = [
+        { type: "table", name: "public.user_alerts" },
+        { type: "index", name: "idx_user_alerts_project_user" },
+        { type: "index", name: "idx_user_alerts_global_user" },
+        { type: "table", name: "public.user_prefs" },
+        { type: "index", name: "idx_user_prefs_project_user_key" },
+        { type: "table", name: "public.project_channels" },
+        { type: "index", name: "idx_project_channels_project_category" },
+        { type: "table", name: "public.secrets" },
+        { type: "index", name: "idx_secrets_project_scope_key_null_ref" },
+        { type: "index", name: "idx_secrets_project_scope_ref_key" },
+        { type: "table", name: "public.alert_state" },
+        { type: "index", name: "idx_alert_state_project_key" },
+        { type: "index", name: "idx_alert_state_global_key" },
+        { type: "table", name: "public.embed_jobs" },
+        { type: "index", name: "idx_embed_jobs_doc" },
+        { type: "table", name: "public.parse_jobs" },
+        { type: "index", name: "idx_parse_jobs_doc" },
+        { type: "table", name: "public.email_suppressions" },
+        { type: "index", name: "idx_email_suppressions_email" },
+      ];
+
+      try {
+        const missing: typeof checks = [];
+        for (const check of checks) {
+          const { rows } = await pool.query<{ oid: string | null }>(
+            "SELECT to_regclass($1) AS oid",
+            [check.name]
+          );
+          if (!rows?.[0]?.oid) {
+            missing.push(check);
+          }
+        }
+        return res.json({ ok: missing.length === 0, missing });
+      } catch (error) {
+        return res.status(500).json({ ok: false, error: String(error) });
+      }
+    });
+  }
 
   if (process.env.MEMORY_ENABLED === "1") {
     app.use("/api/memory", memoryRoutes);

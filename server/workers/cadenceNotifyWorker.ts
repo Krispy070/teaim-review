@@ -2,6 +2,7 @@ import { db } from "../db/client";
 import { sql } from "drizzle-orm";
 import { sendEmail } from "../lib/notify";
 import { sendSlackWebhook, sendGenericWebhook } from "../lib/slack";
+import { handleWorkerError, workersDisabled } from "./utils";
 
 async function projectWebhooks(projectId:string, evt:string){
   const eventsJson = JSON.stringify([evt]);
@@ -43,6 +44,7 @@ async function subscribers(projectId: string, evt: string): Promise<Array<{ emai
 
 export function startCadenceNotifyWorker(){
   setInterval(async ()=>{
+    if (workersDisabled()) return;
     try{
       const now = new Date();
       const in15 = new Date(now.getTime() + 15*60*1000);
@@ -114,6 +116,8 @@ export function startCadenceNotifyWorker(){
           }
         }
       }
-    }catch(e){ console.error("[cadenceNotify] error", e); }
+    }catch(error){
+      handleWorkerError("cadenceNotify", error);
+    }
   }, 60*1000);
 }

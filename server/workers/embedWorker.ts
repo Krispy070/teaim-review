@@ -2,31 +2,13 @@ import { db } from "../db";
 import { embedJobs, docs, docChunks } from "../../shared/schema";
 import { eq, sql } from "drizzle-orm";
 import { chunkText, generateEmbeddings } from "../lib/embed";
+import { handleWorkerError, workersDisabled } from "./utils";
 
 const POLL_MS = Number(process.env.EMBED_POLL_MS || 5000);
 const MAX_ATTEMPTS = 3;
 
-const SCHEMA_ERROR_CODES = new Set(["42P01", "42P10"]);
-let loggedSchemaError = false;
-
-function getPgErrorCode(error: any): string | undefined {
-  return error?.code ?? error?.original?.code ?? error?.cause?.code;
-}
-
-function handleSchemaError(context: string, error: any): boolean {
-  const code = getPgErrorCode(error);
-  if (code && SCHEMA_ERROR_CODES.has(code)) {
-    if (!loggedSchemaError) {
-      console.warn(`${context} database not ready (${code}): ${error?.message ?? error}`);
-      loggedSchemaError = true;
-    }
-    return true;
-  }
-  return false;
-}
-
 async function beat(name: string, info: any = {}) {
-  if (process.env.WORKERS_ENABLED === "0") {
+  if (workersDisabled()) {
     return;
   }
   try {
@@ -36,10 +18,8 @@ async function beat(name: string, info: any = {}) {
       VALUES (${name}, ${infoJson}::jsonb, now())
       ON CONFLICT (worker) DO UPDATE SET info=${infoJson}::jsonb, updated_at=now()
     `);
-  } catch (e) {
-    if (!handleSchemaError("[embedWorker]", e)) {
-      console.error("[embedWorker] beat failed", e);
-    }
+  } catch (error) {
+    handleWorkerError("embedWorker", error);
   }
 }
 
@@ -71,9 +51,7 @@ async function nextJob(): Promise<Job | null> {
     const rows = (result as any).rows || result;
     return rows.length > 0 ? rows[0] : null;
   } catch (err: any) {
-    if (!handleSchemaError("[embedWorker]", err)) {
-      console.error("[embedWorker] nextJob error:", err.message);
-    }
+    handleWorkerError("embedWorker", err);
     return null;
   }
 }
@@ -141,7 +119,7 @@ async function processJob(job: Job) {
 }
 
 export async function startEmbedWorker() {
-  if (process.env.WORKERS_ENABLED === "0") {
+  if (workersDisabled()) {
     console.log("[embedWorker] disabled (WORKERS_ENABLED=0)");
     return;
   }
@@ -153,7 +131,7 @@ export async function startEmbedWorker() {
   console.log(`[embedWorker] starting with ${POLL_MS}ms poll interval`);
 
   async function tick() {
-    if (process.env.WORKERS_ENABLED === "0") {
+    if (workersDisabled()) {
       return;
     }
     try {
@@ -162,7 +140,6 @@ export async function startEmbedWorker() {
         const countResult: any = await db.execute(sql`select count(*)::int as n from embed_jobs where status='pending'`);
         const pending = (countResult.rows || countResult)?.[0]?.n || 0;
         await beat("embed", { pending });
-        loggedSchemaError = false;
         return;
       }
 
@@ -171,10 +148,9 @@ export async function startEmbedWorker() {
       try {
         await processJob(job);
       } catch (err: any) {
-        if (handleSchemaError("[embedWorker]", err)) {
+        if (handleWorkerError("embedWorker", err)) {
           return;
         }
-        console.error(`[embedWorker] Job ${job.id} failed:`, err.message);
 
         // Update job with error, mark as failed if max attempts reached
         const updateResult = await db.execute(sql`
@@ -192,10 +168,9 @@ export async function startEmbedWorker() {
       const countResult: any = await db.execute(sql`select count(*)::int as n from embed_jobs where status='pending'`);
       const pending = (countResult.rows || countResult)?.[0]?.n || 0;
       await beat("embed", { pending });
-      loggedSchemaError = false;
     } catch (err: any) {
-      if (!handleSchemaError("[embedWorker]", err)) {
-        console.error("[embedWorker] tick error:", err.message);
+      if (handleWorkerError("embedWorker", err)) {
+        return;
       }
     }
   }

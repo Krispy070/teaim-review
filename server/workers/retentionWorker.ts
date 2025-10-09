@@ -1,10 +1,12 @@
 import { db } from "../db/client";
 import { sql } from "drizzle-orm";
+import { handleWorkerError, workersDisabled } from "./utils";
 
 export function startRetentionWorker() {
   const every = Math.max(5, Number(process.env.RETENTION_SWEEP_MINUTES || 60));
   console.log(`[retention] sweep every ${every} min`);
   setInterval(async () => {
+    if (workersDisabled()) return;
     try {
       // originals: clear storagePath after N days (keep redacted text)
       await db.execute(sql`
@@ -39,7 +41,7 @@ export function startRetentionWorker() {
         await db.execute(sql`delete from docs where id = any(${ids}::uuid[])`);
       }
     } catch (e) {
-      console.error("[retention] sweep error", e);
+      handleWorkerError("retention", e);
     }
   }, every * 60 * 1000);
 }

@@ -2,6 +2,7 @@ import { db } from "../db/client";
 import { sql } from "drizzle-orm";
 import { sendEmail } from "../lib/notify";
 import { sendSlackWebhook, sendGenericWebhook } from "../lib/slack";
+import { handleWorkerError, workersDisabled } from "./utils";
 
 async function projectWebhooks(projectId:string, evt:string){
   const eventsJson = JSON.stringify([evt]);
@@ -47,6 +48,7 @@ async function subscribers(projectId: string, evt: string): Promise<Array<{ emai
  */
 export function startTrainingReminderWorker(){
   const tick = async ()=>{
+    if (workersDisabled()) return;
     const now = new Date();
     const iso = (d:Date)=> d.toISOString();
 
@@ -176,5 +178,15 @@ export function startTrainingReminderWorker(){
   };
 
   // Run every minute
-  setInterval(()=>tick().catch(e=>console.error("[trainingReminder] error", e)), 60*1000);
+  setInterval(async () => {
+    if (workersDisabled()) return;
+    try {
+      await tick();
+    } catch (error) {
+      if (handleWorkerError("trainingReminder", error)) {
+        return;
+      }
+      console.error("[trainingReminder] error", error);
+    }
+  }, 60*1000);
 }

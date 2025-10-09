@@ -1,6 +1,7 @@
 import { db } from "../db/client";
 import fetch from "node-fetch";
 import { beat } from "../lib/heartbeat";
+import { handleWorkerError, workersDisabled } from "./utils";
 
 const THRESH = Number(process.env.EMAIL_BOUNCE_ALERT_THRESHOLD || "0.02");
 
@@ -14,6 +15,7 @@ async function post(projectId:string, text:string){
 
 export function startBounceAlertWorker(){
   setInterval(async ()=>{
+    if (workersDisabled()) return;
     try{
       const projs = (await db.execute(
         `select coalesce(project_id,'(global)') as pid
@@ -48,9 +50,9 @@ export function startBounceAlertWorker(){
         }
       }
       await beat("bounceAlert", true);
-    } catch(e){ 
-      console.error("[bounceAlertWorker]", e); 
-      await beat("bounceAlert", false, String(e));
+    } catch(error){
+      await beat("bounceAlert", false, String(error));
+      handleWorkerError("bounceAlertWorker", error);
     }
   }, 24*60*60*1000);
 }

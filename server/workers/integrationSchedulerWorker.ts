@@ -2,6 +2,7 @@ import { db } from "../db/client";
 import { sql } from "drizzle-orm";
 import parser from "cron-parser";
 import { sendSlackWebhook, sendGenericWebhook } from "../lib/slack";
+import { handleWorkerError, workersDisabled } from "./utils";
 
 async function projectWebhooks(projectId:string, evt:string){
   const { rows } = await db.execute(sql.raw(`select type, url from webhooks where project_id=$1 and (events @> $2::jsonb)`), [projectId, JSON.stringify([evt])] as any);
@@ -10,6 +11,7 @@ async function projectWebhooks(projectId:string, evt:string){
 
 export function startIntegrationSchedulerWorker(){
   setInterval(async ()=>{
+    if (workersDisabled()) return;
     try{
       const { rows: ints } = await db.execute(sql.raw(
         `select id, project_id as "projectId", schedule_cron as "cron", timezone, next_run_at as "nextRunAt"
@@ -36,14 +38,20 @@ export function startIntegrationSchedulerWorker(){
               ), [it.projectId, it.id, next.toISOString()] as any);
             }
           }
-        } catch (e) { 
+        } catch (e) {
+          if (handleWorkerError("integrationScheduler", e)) {
+            return;
+          }
           console.error(`[scheduler] integration ${it.id} cron error: ${(e as Error).message}`, { cron: it.cron, timezone: it.timezone });
         }
       }
-    }catch(e){ console.error("[scheduler] error", e); }
+    }catch(e){
+      handleWorkerError("integrationScheduler", e);
+    }
   }, 120_000);
 
   setInterval(async ()=>{
+    if (workersDisabled()) return;
     try{
       const now = new Date();
       const { rows } = await db.execute(sql.raw(
@@ -80,6 +88,8 @@ export function startIntegrationSchedulerWorker(){
           }
         }
       }
-    } catch(e){ console.error("[scheduler][sla] error", e); }
+    } catch(e){
+      handleWorkerError("integrationScheduler", e);
+    }
   }, 300_000);
 }
