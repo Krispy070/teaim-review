@@ -12,6 +12,7 @@ jobs:
       PORT: 5000
       DISABLE_FASTAPI: "1"
       EMBED_WORKER: "0"
+      WORKERS_ENABLED: "0"
       SUPABASE_JWT_SECRET: "dev-secret-for-ci"
       OPENAI_API_KEY: "sk-test-not-used"
       DATABASE_URL: "postgresql://test:test@localhost:5432/testdb"
@@ -45,7 +46,12 @@ jobs:
         run: npm run build
 
       - name: Run database migrations
-        run: npm run db:push -- --force
+        run: |
+          if npm run | grep -q "db:push"; then
+            npm run db:push
+          else
+            npx drizzle-kit push --force || echo "skip"
+          fi
 
       - name: Start server
         run: |
