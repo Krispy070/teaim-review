@@ -1,5 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
-import SidebarV2 from "@/components/SidebarV2";
 import { fetchWithAuth } from "@/lib/supabase";
 import { getProjectId } from "@/lib/project";
 import { useEffect, useRef, useState } from "react";
@@ -57,7 +55,7 @@ export default function IssuesBoard(){
   }
 
   return (
-    <AppFrame sidebar={<SidebarV2 />}>
+    
       <div className="p-6 space-y-4">
         <div className="flex items-center justify-between">
           <h1 className="text-2xl font-semibold" data-testid="heading-issues">Integration Issues</h1>
@@ -134,7 +132,7 @@ export default function IssuesBoard(){
           <button className="text-xs px-2 py-1 border rounded" onClick={()=>setPage(p=>p+1)} data-testid="button-next-page">Next</button>
         </div>
       </div>
-    </AppFrame>
+    
   );
 }
 

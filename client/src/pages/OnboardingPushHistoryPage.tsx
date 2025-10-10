@@ -1,4 +1,3 @@
-import AppFrame from "@/components/v2/AppFrame";
 import { getProjectId, ensureProjectPath } from "@/lib/project";
 import { fetchWithAuth } from "@/lib/supabase";
 import { useEffect, useState } from "react";
@@ -16,7 +15,7 @@ export default function OnboardingPushHistoryPage(){
   useEffect(()=>{ load(); },[pid,page]);
 
   return (
-    <AppFrame>
+    
       <div className="p-6 space-y-3">
         <div className="flex items-center justify-between">
           <h1 className="text-2xl font-semibold" data-testid="heading-push-history">Onboarding → Plan: Push History</h1>
@@ -56,6 +55,6 @@ export default function OnboardingPushHistoryPage(){
           </table>
         </div>
       </div>
-    </AppFrame>
+    
   );
 }

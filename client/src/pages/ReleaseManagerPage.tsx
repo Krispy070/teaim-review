@@ -1,5 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
-import SidebarV2 from "@/components/SidebarV2";
 import { getProjectId } from "@/lib/project";
 import { fetchWithAuth } from "@/lib/supabase";
 import { ensureProjectPath } from "@/lib/project";
@@ -87,7 +85,7 @@ export default function ReleaseManagerPage(){
   }
 
   return (
-    <AppFrame sidebar={<SidebarV2 />}>
+    
       <div className="p-6 space-y-4">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
           <div className="flex-1 space-y-2">
@@ -287,6 +285,6 @@ export default function ReleaseManagerPage(){
           </div>
         )}
       </div>
-    </AppFrame>
+    
   );
 }

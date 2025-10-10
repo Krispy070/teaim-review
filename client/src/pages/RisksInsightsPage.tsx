@@ -1,5 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
-import SidebarV2 from "@/components/SidebarV2";
 import { getProjectId } from "@/lib/project";
 import { fetchWithAuth } from "@/lib/supabase";
 import OriginBadge from "@/components/OriginBadge";
@@ -29,7 +27,6 @@ export default function RisksInsightsPage(){
   const exportUrl = `/api/insights/risks/export.csv?projectId=${encodeURIComponent(pid!)}${q?`&q=${encodeURIComponent(q)}`:""}${otype?`&originType=${encodeURIComponent(otype)}`:""}`;
 
   return (
-    <AppFrame sidebar={<SidebarV2 />}>
       <div className="p-6 space-y-4">
         <div className="flex items-center justify-between">
           <h1 className="text-2xl font-semibold" data-testid="heading-risks">Risks</h1>
@@ -105,6 +102,5 @@ export default function RisksInsightsPage(){
           </button>
         </div>
       </div>
-    </AppFrame>
   );
 }

@@ -1,4 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
 import { fetchWithAuth } from "@/lib/supabase";
 import { getProjectId } from "@/lib/project";
 import { useEffect, useRef, useState } from "react";
@@ -35,7 +34,7 @@ export default function StakeholderMatrixPage(){
   };
 
   return (
-    <AppFrame>
+    
       <div className="p-6 space-y-4">
         <div className="flex items-center justify-between">
           <h1 className="text-2xl font-semibold" data-testid="heading-raci-matrix">RACI Matrix</h1>
@@ -69,6 +68,6 @@ export default function StakeholderMatrixPage(){
 
         <div className="text-[11px] opacity-60">CSV/XLSX columns: <code>Name, Email, Org, Role, RACI</code></div>
       </div>
-    </AppFrame>
+    
   );
 }

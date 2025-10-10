@@ -1,5 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
-import SidebarV2 from "@/components/SidebarV2";
 import { getProjectId } from "@/lib/project";
 import { fetchWithAuth } from "@/lib/supabase";
 import { useEffect, useRef, useState } from "react";
@@ -73,7 +71,6 @@ export default function TicketsPage(){
   const overdue = items.filter(i=>i.escalatedAt).length;
 
   return (
-    <AppFrame sidebar={<SidebarV2 />}>
       <div className="p-6 space-y-4">
         <div className="flex items-center justify-between">
           <div>
@@ -211,7 +208,7 @@ export default function TicketsPage(){
         </div>
       </div>
       {openThreadId && <TicketThreadDrawer id={openThreadId} onClose={()=>setOpenThreadId(null)} />}
-    </AppFrame>
+    
   );
 }
 
@@ -591,6 +588,5 @@ function TicketThreadDrawer({ id, onClose }:{ id:string; onClose:()=>void }){
           </div>
         </div>
       </div>
-    </div>
   );
 }

@@ -1,5 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
-import SidebarV2 from "@/components/SidebarV2";
 import { getProjectId } from "@/lib/project";
 import { fetchWithAuth } from "@/lib/supabase";
 import { useEffect, useRef, useState } from "react";
@@ -72,7 +70,7 @@ export default function MAndAHubPage() {
   useEffect(() => { if (pid) loadAll(); }, [pid, ownerFilter, statusFilter, qFilter, cohPage]);
 
   return (
-    <AppFrame sidebar={<SidebarV2 />}>
+    
       <div className="p-6 space-y-4">
         <div className="flex items-center justify-between">
           <h1 className="text-2xl font-semibold">M&A Hub</h1>
@@ -510,7 +508,7 @@ export default function MAndAHubPage() {
           </div>
         )}
       </div>
-    </AppFrame>
+    
   );
 }
 

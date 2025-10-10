@@ -1,5 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
-import SidebarV2 from "@/components/SidebarV2";
 import { getProjectId } from "@/lib/project";
 import { fetchWithAuth } from "@/lib/supabase";
 import MemoryPrompt from "@/components/MemoryPrompt";
@@ -43,7 +41,7 @@ export default function OnboardingPage(){
   useEffect(()=>{ load(); },[]);
 
   return (
-    <AppFrame sidebar={<SidebarV2 />}>
+    
       <div className="p-6 space-y-4">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
           <div className="flex-1 space-y-2">
@@ -82,7 +80,7 @@ export default function OnboardingPage(){
         <Reflections />
         <MetricsCard />
       </div>
-    </AppFrame>
+    
   );
 
   async function seed(){ await fetchWithAuth(`/api/onboarding/seed`, { method:"POST", body: JSON.stringify({ projectId: pid }) }); load(); }

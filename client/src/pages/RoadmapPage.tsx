@@ -1,5 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
-import SidebarV2 from "@/components/SidebarV2";
 import { fetchWithAuth } from "@/lib/supabase";
 import { getProjectId } from "@/lib/project";
 import { useEffect, useState } from "react";
@@ -80,7 +78,7 @@ export default function RoadmapPage(){
   useEffect(()=>{ if(pid) loadProg(); },[pid, selPhase, items.length, phases.length]);
 
   return (
-    <AppFrame sidebar={<SidebarV2 />}>
+    
       <div className="p-6 space-y-5">
         <div className="flex items-center justify-between">
           <h1 className="text-2xl font-semibold" data-testid="heading-roadmap">Roadmap</h1>
@@ -194,7 +192,7 @@ export default function RoadmapPage(){
           </table>
         </div>
       </div>
-    </AppFrame>
+    
   );
 
   async function updateItem(id:string, body:any){

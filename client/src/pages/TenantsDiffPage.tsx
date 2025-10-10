@@ -1,5 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
-import SidebarV2 from "@/components/SidebarV2";
 import { fetchWithAuth } from "@/lib/supabase";
 import { getProjectId } from "@/lib/project";
 import { useEffect, useState } from "react";
@@ -24,7 +22,7 @@ export default function TenantsDiffPage(){
   }
 
   return (
-    <AppFrame sidebar={<SidebarV2 />}>
+    
       <div className="p-6 space-y-4">
         <h1 className="text-2xl font-semibold" data-testid="heading-diff">Tenant Diff</h1>
 
@@ -114,6 +112,6 @@ export default function TenantsDiffPage(){
           </div>
         )}
       </div>
-    </AppFrame>
+    
   );
 }

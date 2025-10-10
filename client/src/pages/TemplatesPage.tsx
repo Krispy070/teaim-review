@@ -1,5 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
-import SidebarV2 from "@/components/SidebarV2";
 import { getProjectId } from "@/lib/project";
 import { fetchWithAuth } from "@/lib/supabase";
 import { useEffect, useState } from "react";
@@ -21,7 +19,7 @@ export default function TemplatesPage() {
   useEffect(() => { load(); }, []);
 
   return (
-    <AppFrame sidebar={<SidebarV2 />}>
+    
       <div className="p-6 space-y-4">
         <div className="flex items-center justify-between">
           <h1 className="text-2xl font-semibold">Templates & Change Orders</h1>
@@ -40,7 +38,7 @@ export default function TemplatesPage() {
           <TemplateList items={project} canInstantiate onDone={load} />
         </section>
       </div>
-    </AppFrame>
+    
   );
 }
 
