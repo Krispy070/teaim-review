@@ -339,7 +339,7 @@ export default function DocDetailPage() {
           <TabsContent value="preview" className="mt-4">
             {wordPreviewHtml ? (
               <div 
-                className="border rounded-lg p-6 prose prose-sm max-w-none bg-white dark:bg-gray-900"
+                className="brand-card p-6 prose prose-sm max-w-none"
                 dangerouslySetInnerHTML={{ __html: wordPreviewHtml }}
                 data-testid="word-preview-content"
               />

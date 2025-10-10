@@ -10,6 +10,8 @@ import { isBrandV2 } from "@/lib/brand";
 import { useAuth } from "@/contexts/AuthContext";
 import { useOrg } from "@/App";
 import { cn } from "@/lib/utils";
+import ThemeToggle from "@/components/ThemeToggle";
+import teaimLogo from "@/assets/teaim-logo.svg";
 
 interface GlobalHeaderProps {
   className?: string;
@@ -108,7 +110,7 @@ export default function GlobalHeader({ className = "" }: GlobalHeaderProps) {
               className="flex items-center gap-2 shrink-0"
               aria-label="TEAIM home"
             >
-              <img src="/teaim-logo.svg" alt="TEAIM" className="h-6 md:h-7" />
+              <img src={teaimLogo} alt="TEAIM" className="h-6 md:h-7" />
             </a>
 
             <div className="mx-auto flex min-w-0 flex-col items-center justify-center text-center">
@@ -139,6 +141,7 @@ export default function GlobalHeader({ className = "" }: GlobalHeaderProps) {
 
             <div className="flex items-center gap-3 shrink-0">
               <ProjectSelector />
+              <ThemeToggle />
               <span className="k-pill k-pill--gold" data-testid="environment-pill">
                 {env}
               </span>

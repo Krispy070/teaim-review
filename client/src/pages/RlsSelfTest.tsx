@@ -73,7 +73,7 @@ export default function RlsSelfTest() {
       <div className="space-y-4">
         <div className="flex gap-3">
           <input
-            className="flex-1 border border-gray-300 dark:border-gray-600 rounded-md px-3 py-2 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-500 dark:placeholder-gray-400"
+            className="teaim-input flex-1"
             placeholder="Other Project UUID (e.g., 12345678-9999-9999-9999-999999999999)"
             value={otherProjectId}
             onChange={e => setOtherProjectId(e.target.value)}

@@ -133,7 +133,7 @@ export default function TestRunner(){
       <div className="text-xs">
         {results.length? <>Passed: {okCount}/{results.length}</> : null}
       </div>
-      <div className="text-[11px] whitespace-pre-wrap bg-white/5 p-2 rounded border">
+      <div className="text-[11px] whitespace-pre-wrap rounded border border-[var(--brand-card-border)] bg-[var(--brand-card-bg)] p-2 shadow-sm">
         {log.join("\n")}
       </div>
       {seedLog && (

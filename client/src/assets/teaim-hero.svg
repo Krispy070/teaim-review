@@ -1,0 +1,17 @@
+<svg width="320" height="160" viewBox="0 0 320 160" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>TEAIM hero emblem</title>
+  <rect x="0.75" y="0.75" width="318.5" height="158.5" rx="22.25" fill="#0D0F12" stroke="#FF7A00" stroke-width="1.5" />
+  <rect x="28" y="36" width="52" height="52" rx="16" fill="#111318" stroke="rgba(255,255,255,0.14)" stroke-width="1.5" />
+  <path d="M56 48L72 64L56 80L40 64L56 48Z" fill="#FF7A00" />
+  <circle cx="56" cy="64" r="8" fill="#FFD166" />
+  <path d="M48 64C48 58.4772 52.4772 54 58 54" stroke="#111318" stroke-width="2" stroke-linecap="round" />
+  <g font-family="Inter, 'Segoe UI', sans-serif" font-weight="700">
+    <text x="112" y="78" font-size="40" letter-spacing="0.18em" fill="#FFFFFF">TE</text>
+    <text x="194" y="78" font-size="40" letter-spacing="0.18em" fill="#FF7A00">AI</text>
+    <text x="252" y="78" font-size="40" letter-spacing="0.18em" fill="#FFFFFF">M</text>
+  </g>
+  <text x="112" y="110" font-size="16" font-weight="500" fill="#9AA3AF" font-family="Inter, 'Segoe UI', sans-serif" letter-spacing="0.12em">
+    AI IN YOUR TEAM · POWER IN YOUR PROJECT
+  </text>
+  <rect x="112" y="120" width="180" height="4" rx="2" fill="#FF7A00" opacity="0.5" />
+</svg>

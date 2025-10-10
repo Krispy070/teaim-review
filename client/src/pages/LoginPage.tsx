@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { supa } from "@/lib/supabase";
+import ThemeToggle from "@/components/ThemeToggle";
+import teaimLogo from "@/assets/teaim-logo.svg";
 
 export default function LoginPage() {
   const [mode, setMode] = useState<"signin" | "signup">("signin");
@@ -53,11 +55,14 @@ export default function LoginPage() {
   return (
     <div className="relative min-h-screen teaim-auth-bg text-foreground">
       <div className="teaim-grid-pattern" aria-hidden />
+      <div className="absolute right-6 top-6 z-20">
+        <ThemeToggle />
+      </div>
       <div className="relative z-10 flex min-h-screen items-center justify-center px-6 py-16">
         <div className="teaim-surface w-full max-w-md space-y-6 rounded-3xl p-10 shadow-2xl teaim-fade-in-up">
           <div className="text-center space-y-3">
             <a href="/" className="inline-flex flex-col items-center gap-2" data-testid="link-logo">
-              <img src="/teaim-logo.svg" alt="TEAIM" className="h-12 w-auto drop-shadow" />
+              <img src={teaimLogo} alt="TEAIM" className="h-12 w-auto drop-shadow" />
               <span className="text-lg font-semibold tracking-wide text-[var(--text-strong)]">TEAIM.app</span>
             </a>
             <p className="text-sm text-muted-foreground">Sign in to your workspace</p>

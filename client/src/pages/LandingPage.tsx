@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
 import { supa } from "@/lib/supabase";
 import { Zap, Brain, Building2 } from "lucide-react";
+import ThemeToggle from "@/components/ThemeToggle";
+import teaimLogo from "@/assets/teaim-logo.svg";
+import teaimHero from "@/assets/teaim-hero.svg";
 
 export default function LandingPage() {
   const [authed, setAuthed] = useState(false);
@@ -51,9 +54,9 @@ export default function LandingPage() {
           <div className="teaim-grid-pattern" aria-hidden />
           <div className="relative mx-auto flex min-h-[calc(100vh-4rem)] w-full max-w-5xl flex-col items-center justify-center gap-8 px-6 py-24 text-center">
             <img
-              src="/teaim-logo.svg"
-              alt="TEAIM logo"
-              className="h-16 w-auto teaim-fade-in drop-shadow-xl"
+              src={teaimHero}
+              alt="TEAIM hero logo"
+              className="h-20 w-auto teaim-fade-in drop-shadow-xl"
             />
             <div className="space-y-6">
               <h1
@@ -189,7 +192,7 @@ function PublicNav({ authed, nextLink }: { authed: boolean; nextLink: string }) 
     <header className="teaim-nav sticky top-0 z-40 border-b">
       <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-6">
         <a href="/" className="flex items-center gap-3" data-testid="link-logo">
-          <img src="/teaim-logo.svg" alt="TEAIM" className="h-9 w-auto drop-shadow" />
+          <img src={teaimLogo} alt="TEAIM" className="h-9 w-auto drop-shadow" />
           <span className="hidden text-lg font-semibold tracking-wide text-[var(--text-strong)] sm:inline">TEAIM.app</span>
         </a>
         <nav className="flex items-center gap-4 text-sm">
@@ -203,6 +206,7 @@ function PublicNav({ authed, nextLink }: { authed: boolean; nextLink: string }) 
           >
             {authed ? "Open App" : "Sign in"}
           </a>
+          <ThemeToggle />
         </nav>
       </div>
     </header>
@@ -213,7 +217,7 @@ function PublicFooter() {
   return (
     <footer className="teaim-footer border-t border-border py-10 text-center text-sm text-muted-foreground">
       <div className="mb-5 flex justify-center">
-        <img src="/teaim-logo.svg" alt="TEAIM mark" className="h-10 w-auto drop-shadow" />
+        <img src={teaimLogo} alt="TEAIM mark" className="h-10 w-auto drop-shadow" />
       </div>
       <p className="text-[var(--text-soft)]">© {new Date().getFullYear()} TEAIM.app — The AI-powered PMOS</p>
       <div className="mt-3 flex items-center justify-center gap-6 text-sm">

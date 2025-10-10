@@ -274,7 +274,7 @@ export default function DigestPreview() {
                 </div>
               ) : previewData?.html ? (
                 <div 
-                  className="border rounded-lg p-4 bg-white dark:bg-gray-900 max-h-96 overflow-y-auto"
+                  className="brand-card p-4 max-h-96 overflow-y-auto"
                   dangerouslySetInnerHTML={{ __html: previewData.html }}
                   data-testid="div-digest-preview-html"
                 />

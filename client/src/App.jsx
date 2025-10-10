@@ -8,7 +8,7 @@ import { HelpModal } from "@/components/HelpModal"
 import { AuthProvider, AuthGuard } from "./contexts/AuthContext"
 import { ProjectProvider } from "./contexts/ProjectContext"
 import { isBrandV2, applyBrandClass } from "@/lib/brand"
-import { initTheme } from "./lib/theme"
+import { ThemeProvider } from "./contexts/ThemeContext"
 import NotificationDrawer from "@/components/NotificationDrawer"
 import SidebarV2 from "@/components/SidebarV2"
 import ChatDock from './components/ChatDock'
@@ -168,9 +168,6 @@ export default function App(){
   
   // Initialize theme and get role from dev auth or environment
   useEffect(() => {
-    // Initialize TEAIM theme system
-    initTheme();
-    
     // Enable Brand V2 mode for the new UI layout
     localStorage.setItem("kap.brandv2", "1");
     
@@ -192,18 +189,20 @@ export default function App(){
   const value = { projectId, setProjectId, orgId, setOrgId, userRole, setUserRole }
 
   return (
-    <div className="teaim-theme">
-      <QueryClientProvider client={queryClient}>
-        <TooltipProvider>
-          <AuthProvider>
-            <ProjectProvider>
-              <AppContent value={value} />
-              <HelpModal />
-            </ProjectProvider>
-          </AuthProvider>
-        </TooltipProvider>
-      </QueryClientProvider>
-    </div>
+    <ThemeProvider>
+      <div className="teaim-theme bg-[var(--brand-bg)] text-[var(--brand-fg)] min-h-screen">
+        <QueryClientProvider client={queryClient}>
+          <TooltipProvider>
+            <AuthProvider>
+              <ProjectProvider>
+                <AppContent value={value} />
+                <HelpModal />
+              </ProjectProvider>
+            </AuthProvider>
+          </TooltipProvider>
+        </QueryClientProvider>
+      </div>
+    </ThemeProvider>
   )
 }
 
@@ -271,7 +270,13 @@ function AppContent({ value }) {
   return (
     <AuthGuard>
       <OrgCtx.Provider value={value}>
-        <div className={brandV2 ? "brand-v2 min-h-screen" : "min-h-screen bg-slate-950 text-slate-100"}>
+        <div
+          className={
+            brandV2
+              ? "brand-v2 min-h-screen bg-[var(--brand-bg)] text-[var(--brand-fg)]"
+              : "min-h-screen bg-[var(--brand-bg)] text-[var(--brand-fg)]"
+          }
+        >
           <ErrorBoundary>
             {brandV2 ? (
               // Brand V2 uses its own layout system via DashboardV2's AppFrame
