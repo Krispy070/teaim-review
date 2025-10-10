@@ -41,17 +41,26 @@ export default function ChangeKanban(){
             <div className="text-xs font-medium mb-2 uppercase">{c.replace("_"," ")}</div>
             <div className="space-y-2">
               {items.filter(i=>(i.status||"intake")===c).map(i=>(
-                <div key={i.id} className="border rounded p-2 text-xs bg-white/5" data-testid={`cr-card-${i.id}`}>
+                <div
+                  key={i.id}
+                  className="rounded-lg border border-[var(--brand-card-border)] bg-[var(--brand-card-bg)] p-2 text-xs text-[var(--text)] shadow-sm"
+                  data-testid={`cr-card-${i.id}`}
+                >
                   <div className="font-medium">{i.title} <SlaBadge s={i.sla}/></div>
                   <div className="text-muted-foreground">Area: {i.area||"—"} · P: {i.priority} · R: {i.risk} · Due: {i.due_date||"—"}</div>
                   <div className="mt-1">
                     <WatcherPicker projectId={projectId!} changeId={i.id} initial={i.watchers||[]} />
                   </div>
                   <div className="mt-1 flex gap-1">
-                    <input className="border rounded p-1 w-[120px]" defaultValue={i.assignee||""}
+                    <input
+                      className="teaim-input h-8 w-[120px] px-2 py-1"
+                      defaultValue={i.assignee||""}
                            onBlur={e=> fetch(`/api/changes/update_small?id=${i.id}&project_id=${projectId}&assignee=${encodeURIComponent(e.target.value)}`, {method:"POST",credentials:"include"}) }
                            data-testid={`input-assignee-${i.id}`} />
-                    <input type="date" className="border rounded p-1" defaultValue={i.due_date||""}
+                    <input
+                      type="date"
+                      className="teaim-input h-8 px-2 py-1"
+                      defaultValue={i.due_date||""}
                            onBlur={e=> fetch(`/api/changes/update_small?id=${i.id}&project_id=${projectId}&due_date=${encodeURIComponent(e.target.value)}`, {method:"POST",credentials:"include"}) }
                            data-testid={`input-due-${i.id}`} />
                   </div>

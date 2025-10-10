@@ -51,18 +51,18 @@ export default function StageTemplateApplyProject({ projectId, stages, onClose }
 
   return (
     <div className="fixed inset-0 bg-black/40 z-[200]" onClick={onClose}>
-      <div className="mx-auto mt-[6vh] w-[980px] max-w-[97%] bg-white dark:bg-neutral-900 rounded shadow-xl border"
+      <div className="mx-auto mt-[6vh] w-[980px] max-w-[97%] teaim-modal"
            onClick={e=>e.stopPropagation()}>
-        <div className="p-3 border-b text-sm font-medium">Apply Template to Project (Preview)</div>
+        <div className="p-3 border-b border-[var(--brand-card-border)] text-sm font-medium">Apply Template to Project (Preview)</div>
         <div className="p-3 space-y-2 max-h-[75vh] overflow-auto">
           <div className="flex items-center gap-2">
-            <select className="border rounded p-2 text-sm" value={tplKey} onChange={e=>setTplKey(e.target.value)}
+            <select className="teaim-input text-sm" value={tplKey} onChange={e=>setTplKey(e.target.value)}
                     data-testid="select-template">
               <option value="">Pick template…</option>
               {templates.map((t:any)=> <option key={t.key} value={t.key}>{t.label}</option>)}
             </select>
             <label className="text-xs">Baseline</label>
-            <input type="date" className="border rounded p-2 text-sm" value={base} onChange={e=>setBase(e.target.value)}
+            <input type="date" className="teaim-input text-sm" value={base} onChange={e=>setBase(e.target.value)}
                    data-testid="input-baseline-date" />
             <div className="text-xs text-muted-foreground">Guardrails: {rails.min_days}-{rails.max_days} days</div>
           </div>
@@ -76,28 +76,30 @@ export default function StageTemplateApplyProject({ projectId, stages, onClose }
               </label>
             ))}
           </div>
-          <table className="w-full text-sm">
-            <thead><tr><th className="text-left p-1">Area</th><th className="text-left p-1">Title</th><th className="text-left p-1">Current</th><th className="text-left p-1">New</th><th className="text-left p-1">Δ days</th><th className="text-left p-1">Update?</th></tr></thead>
-            <tbody>
-              {preview.map((p:any)=>(
-                <tr key={p.id} data-testid={`row-stage-${p.id}`}>
-                  <td className="p-1">{p.area||"—"}</td>
-                  <td className="p-1">{p.title}</td>
-                  <td className="p-1">{p.start_date||"—"} → {p.end_date||"—"}</td>
-                  <td className="p-1">{p.new_start||"—"} → {p.new_end||"—"}</td>
-                  <td className={`p-1 ${p.delta>0?'text-red-500':p.delta<0?'text-[var(--brand-good)]':'text-muted-foreground'}`}>
-                    {p.delta>0?`+${p.delta}`: p.delta}
-                  </td>
-                  <td className="p-1">{p.will_update? "✓": "—"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <div className="brand-card">
+            <table className="w-full text-sm">
+              <thead><tr><th className="text-left p-1">Area</th><th className="text-left p-1">Title</th><th className="text-left p-1">Current</th><th className="text-left p-1">New</th><th className="text-left p-1">Δ days</th><th className="text-left p-1">Update?</th></tr></thead>
+              <tbody>
+                {preview.map((p:any)=>(
+                  <tr key={p.id} data-testid={`row-stage-${p.id}`} className="border-b border-[var(--brand-card-border)] last:border-0">
+                    <td className="p-1">{p.area||"—"}</td>
+                    <td className="p-1">{p.title}</td>
+                    <td className="p-1">{p.start_date||"—"} → {p.end_date||"—"}</td>
+                    <td className="p-1">{p.new_start||"—"} → {p.new_end||"—"}</td>
+                    <td className={`p-1 ${p.delta>0?'text-red-500':p.delta<0?'text-[var(--brand-good)]':'text-muted-foreground'}`}>
+                      {p.delta>0?`+${p.delta}`: p.delta}
+                    </td>
+                    <td className="p-1">{p.will_update? "✓": "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
-        <div className="p-3 border-t flex justify-end gap-2">
+        <div className="p-3 border-t border-[var(--brand-card-border)] flex justify-end gap-2">
           <button className="brand-btn text-xs" onClick={onClose} data-testid="button-cancel">Cancel</button>
-          <button className="brand-btn text-xs swoosh" onClick={apply} 
-                  disabled={!preview.some((p:any)=>p.will_update)} 
+          <button className="brand-btn text-xs swoosh" onClick={apply}
+                  disabled={!preview.some((p:any)=>p.will_update)}
                   data-testid="button-apply-template">Apply</button>
         </div>
       </div>

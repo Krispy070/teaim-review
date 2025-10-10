@@ -80,9 +80,9 @@ export default function Workstreams(){
             // Use neutral cards with colored accent borders instead of full colored backgrounds
             const accentColor = s==="green"?"border-l-emerald-500":s==="at_risk"?"border-l-red-500":s==="late"?"border-l-orange-500":"border-l-amber-500";
             return (
-              <button 
-                key={i.area} 
-                className={`brand-card p-3 text-left border-l-4 ${accentColor} bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors`} 
+              <button
+                key={i.area}
+                className={`brand-card p-3 text-left border-l-4 ${accentColor} transition-colors hover:bg-[color-mix(in_srgb,var(--brand-card-bg) 88%, rgba(255,255,255,0.08) 12%)]`}
                 data-testid={`area-card-${i.area.toLowerCase().replace(/\s+/g, '-')}`}
                 onClick={()=>setLocation(`/projects/${projectId}/workstreams/${encodeURIComponent(i.area)}`)}
               >
@@ -95,7 +95,15 @@ export default function Workstreams(){
                   Next mtg: {m.next_meeting? new Date(m.next_meeting).toLocaleString():"—"}
                 </div>
                 <div className="mt-1 flex gap-1 flex-wrap" data-testid={`area-owners-${i.area.toLowerCase().replace(/\s+/g, '-')}`}>
-                  {(owners[i.area]||[]).slice(0,3).map(u=><span key={u} className="text-[11px] px-1.5 py-[1px] rounded bg-slate-500/15 text-slate-600" data-testid={`owner-chip-${u}`}>{u}</span>)}
+                  {(owners[i.area]||[]).slice(0,3).map(u=>(
+                    <span
+                      key={u}
+                      className="text-[11px] px-1.5 py-[1px] rounded border border-[var(--brand-card-border)] bg-[color-mix(in_srgb,var(--brand-card-bg) 80%, transparent)] text-[var(--text-muted)]"
+                      data-testid={`owner-chip-${u}`}
+                    >
+                      {u}
+                    </span>
+                  ))}
                 </div>
               </button>
             );

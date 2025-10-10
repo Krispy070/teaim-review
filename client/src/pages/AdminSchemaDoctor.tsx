@@ -27,9 +27,9 @@ export default function AdminSchemaDoctor(){
         bullets={["Uses information_schema to check coverage","Shows SQL to add missing columns (e.g., area)"]}
       />
       
-      <button 
-        className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 focus:ring-2 focus:ring-blue-500" 
-        onClick={run} 
+      <button
+        className="brand-btn text-sm"
+        onClick={run}
         disabled={loading}
         data-testid="button-rerun-check"
       >
@@ -43,20 +43,20 @@ export default function AdminSchemaDoctor(){
           </div>
           
           {!data.ok && data.missing?.length > 0 && (
-            <div className="border border-gray-300 dark:border-gray-600 rounded p-2 text-sm bg-white dark:bg-gray-800">
-              <div className="font-medium mb-2 text-gray-900 dark:text-gray-100">Missing Schema Items:</div>
+            <div className="brand-card p-2 text-sm">
+              <div className="font-medium mb-2 text-[var(--text-strong)]">Missing Schema Items:</div>
               {data.missing.map((m:any,i:number)=>(
-                <div key={i} className="border-b border-gray-200 dark:border-gray-700 last:border-0 py-1 text-gray-700 dark:text-gray-300">
+                <div key={i} className="border-b border-[var(--brand-card-border)] last:border-0 py-1 text-[var(--text)]">
                   <b>{m.table}</b>: {m.missing || (m.missing_columns||[]).join(", ")}
                 </div>
               ))}
             </div>
           )}
-          
+
           {data.suggested_sql?.length > 0 && (
-            <div className="border border-gray-300 dark:border-gray-600 rounded p-2 bg-white dark:bg-gray-800">
-              <div className="text-sm font-medium mb-2 text-gray-900 dark:text-gray-100">Suggested SQL (copy-paste ready):</div>
-              <pre className="text-xs whitespace-pre-wrap font-mono bg-gray-50 dark:bg-gray-900 p-2 rounded border text-gray-800 dark:text-gray-200">
+            <div className="brand-card p-2">
+              <div className="text-sm font-medium mb-2 text-[var(--text-strong)]">Suggested SQL (copy-paste ready):</div>
+              <pre className="text-xs whitespace-pre-wrap font-mono rounded border border-[var(--brand-card-border)] bg-[color-mix(in_srgb,var(--brand-card-bg) 92%, rgba(255,255,255,0.08) 8%)] text-[var(--text)] p-2">
                 {data.suggested_sql.join("\n")}
               </pre>
             </div>

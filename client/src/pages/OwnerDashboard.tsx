@@ -27,7 +27,12 @@ export default function OwnerDashboard(){
       <PageHeading title="My Areas" crumbs={[{label:"Team"},{label:"Owner Dashboard"}]} />
       <div className="grid md:grid-cols-3 gap-3">
         {mine.map(a=>(
-          <button key={a} className="brand-card p-3 text-left bg-white/5" onClick={()=>setLocation(`/projects/${projectId}/workstreams/${encodeURIComponent(a)}`)} data-testid={`area-card-${a}`}>
+          <button
+            key={a}
+            className="brand-card p-3 text-left transition-colors hover:bg-[color-mix(in_srgb,var(--brand-card-bg) 88%, rgba(255,255,255,0.08) 12%)]"
+            onClick={()=>setLocation(`/projects/${projectId}/workstreams/${encodeURIComponent(a)}`)}
+            data-testid={`area-card-${a}`}
+          >
             <div className="text-sm font-medium" data-testid={`area-name-${a}`}>{a}</div>
             <div className="text-xs text-muted-foreground">Click to manage</div>
           </button>

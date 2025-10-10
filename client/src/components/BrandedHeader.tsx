@@ -17,12 +17,12 @@ import { useNavUpdates } from "@/hooks/useNavUpdates";
 import { useRouteUpdates } from "@/hooks/useRouteUpdates";
 import { useOrg } from "@/App";
 import { useState } from "react";
+import teaimLogo from "@/assets/teaim-logo.svg";
 
 import PresenceTracker from "@/components/PresenceTracker";
 import PresenceIndicator from "@/components/PresenceIndicator";
 
-// Use the public asset (Vite serves /public at the site root)
-const teamlogourl = "/teaim-logo.svg";
+const teaimLogoUrl = teaimLogo;
 
 
 interface BrandedHeaderProps {

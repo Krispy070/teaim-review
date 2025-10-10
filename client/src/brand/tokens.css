@@ -2,45 +2,71 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Poppins:wght@500;600;700&display=swap');
 
 :root {
-  --brand-bg: #0b0d10;
-  --brand-surface: #12161b;
-  --brand-text: #e6eef8;
-  --brand-muted: #8fa1b3;
+  --brand-bg: #111318;
+  --brand-surface: #0d0f12;
+  --brand-text: #ffffff;
+  --brand-muted: #9aa3af;
 
-  --brand-primary: #5a73ff;    /* Royal */
-  --brand-accent:  #1de4ff;    /* Neon Aqua */
-  --brand-magenta: #f13cff;    /* Magenta */
-  --brand-orange:  #ff6b35;    /* Enterprise Orange */
-  --brand-warn:    #ffd34f;    /* Yellow */
-  --brand-good:    #19d492;    /* Green */
-
-  --brand-gradient: linear-gradient(90deg, var(--brand-primary), var(--brand-magenta));
-  --brand-glow: none;
-  --brand-ring: 0 0 0 2px rgba(255,193,7,0.5);
+  --brand-primary: #ff7a00;
+  --brand-accent: #ffd166;
+  --brand-orange: #ff7a00;
+  --brand-warn: #ffd166;
+  --brand-good: #3dd2a2;
+  --brand-ring: 0 0 0 3px rgba(255, 209, 102, 0.45);
 }
 
-/* Brand v2 "on" class flips typography + subtle background */
 .brand-v2 {
   background: var(--brand-bg);
   color: var(--brand-text);
   font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Arial, sans-serif;
 }
 
-.brand-v2 h1, .brand-v2 h2, .brand-v2 h3, .brand-v2 .heading {
+.brand-v2 h1,
+.brand-v2 h2,
+.brand-v2 h3,
+.brand-v2 .heading {
   font-family: Poppins, Inter, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Arial, sans-serif;
 }
 
 .brand-card {
-  background: var(--brand-surface);
-  border: 1px solid rgba(255,255,255,0.06);
-  border-radius: 10px;
+  background: var(--brand-card-bg);
+  border: 1px solid var(--brand-card-border);
+  border-radius: 0.9rem;
+  color: var(--brand-fg);
+  box-shadow: var(--brand-card-shadow);
+  transition: border-color 0.15s ease, box-shadow 0.2s ease, background-color 0.2s ease;
+}
+
+[data-theme="dark"] .brand-card,
+.dark .brand-card {
+  background: #050608;
+  border-color: rgba(255, 255, 255, 0.2);
+  color: #ffffff;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.6);
+}
+
+[data-theme="light"] .brand-card,
+:root:not([data-theme="dark"]) .brand-card {
+  background: #ffffff;
+  border-color: rgba(17, 19, 24, 0.12);
+  color: #111318;
+  box-shadow: 0 16px 32px rgba(12, 18, 31, 0.08);
 }
 
 .brand-chip {
-  border: 1px solid rgba(255,255,255,0.08);
+  border: 1px solid var(--brand-chip-border);
   border-radius: 999px;
-  padding: 4px 8px;
+  padding: 4px 10px;
   font-size: 12px;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--brand-card-bg) 88%, transparent);
+  color: var(--text-soft);
+}
+
+[data-theme="dark"] .brand-chip,
+.dark .brand-chip {
+  background: rgba(0, 0, 0, 0.45);
+  color: #ffffff;
 }
 
 .brand-btn {
@@ -50,42 +76,33 @@
   padding: 0.55rem 1rem;
   border-radius: 12px;
   font-weight: 600;
-  background: var(--brand-orange);      /* your TEAIM accent */
-  border: 1px solid #C65115;            /* darker edge */
-  color: #0B0B0D;                       /* dark text for contrast */
-  box-shadow: none;                     /* kill glow */
-  transition: background .12s ease, border-color .12s ease, transform .06s ease;
+  background: var(--accent, #ff7a00);
+  border: 1px solid color-mix(in srgb, var(--accent, #ff7a00) 75%, #000 25%);
+  color: var(--accent-foreground, #111318);
+  box-shadow: 0 10px 24px rgba(255, 122, 0, 0.22);
+  transition: background 0.12s ease, border-color 0.12s ease, transform 0.06s ease, box-shadow 0.12s ease;
 }
 
 .brand-btn:hover {
-  background: #ff752a;                  /* slight brighten */
-  border-color: #d85a1a;
+  background: color-mix(in srgb, var(--accent, #ff7a00) 88%, white 12%);
+  border-color: color-mix(in srgb, var(--accent, #ff7a00) 80%, #000 20%);
 }
 
 .brand-btn:active {
-  transform: translateY(1px);           /* subtle tactile press */
+  transform: translateY(1px);
 }
 
 .brand-btn:focus-visible {
-  outline: 2px solid var(--brand-warn); /* keeps keyboard users visible */
-  outline-offset: 2px;
-  box-shadow: none;
+  outline: none;
+  box-shadow: 0 0 0 3px var(--focus, rgba(255, 209, 102, 0.4));
 }
 
 .brand-btn:disabled,
 .brand-btn[aria-busy="true"] {
-  opacity: .65;
+  opacity: 0.65;
   cursor: not-allowed;
 }
 
-.gradient-text {
-  background: var(--brand-gradient);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-}
-
-/* Focus ring */
 .brand-v2 :focus-visible {
   outline: none;
   box-shadow: var(--brand-ring);

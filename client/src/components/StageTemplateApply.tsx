@@ -52,23 +52,23 @@ export default function StageTemplateApply({ projectId, stages, area, onClose }:
 
   return (
     <div className="fixed inset-0 bg-black/40 z-[200]" onClick={onClose}>
-      <div className="mx-auto mt-[8vh] w-[900px] max-w-[96%] bg-white dark:bg-neutral-900 rounded shadow-xl border" onClick={e=>e.stopPropagation()}>
-        <div className="p-3 border-b flex items-center justify-between">
+      <div className="mx-auto mt-[8vh] w-[900px] max-w-[96%] teaim-modal" onClick={e=>e.stopPropagation()}>
+        <div className="p-3 border-b border-[var(--brand-card-border)] flex items-center justify-between">
           <div className="text-sm font-medium">Apply Template (with Preview)</div>
         </div>
         <div className="p-3 space-y-3">
           <div className="flex items-center gap-2">
-            <select className="border rounded p-2 text-sm" value={tplKey} onChange={e=>setTplKey(e.target.value)}>
+            <select className="teaim-input text-sm" value={tplKey} onChange={e=>setTplKey(e.target.value)}>
               <option value="">Select template…</option>
               {templates.map(t=> <option key={t.key} value={t.key}>{t.name}</option>)}
             </select>
-            <input type="date" className="border rounded p-2 text-sm" value={base} onChange={e=>setBase(e.target.value)} placeholder="Baseline date" />
+            <input type="date" className="teaim-input text-sm" value={base} onChange={e=>setBase(e.target.value)} placeholder="Baseline date" />
             <button className="brand-btn text-xs" onClick={restore}>Restore last template</button>
             <span className="text-xs text-muted-foreground">Guardrails: {rails.min_days}–{rails.max_days} days</span>
           </div>
           {preview.length>0 && (
-            <div className="border rounded">
-              <div className="p-2 bg-muted text-xs font-medium grid grid-cols-6 gap-2">
+            <div className="brand-card">
+              <div className="p-2 bg-muted text-xs font-medium grid grid-cols-6 gap-2 rounded-t-[inherit]">
                 <span>Stage</span><span>Area</span><span>Current Start</span><span>Current End</span><span>New Start</span><span>New End</span>
               </div>
               <div className="max-h-[40vh] overflow-auto">
@@ -77,7 +77,7 @@ export default function StageTemplateApply({ projectId, stages, area, onClose }:
                   const dur = (diffDays(p.new_start, p.new_end) || 0);
                   const isViolation = p.will_update && (dur < rails.min_days || dur > rails.max_days);
                   return (
-                  <div key={p.id} className={`p-2 text-xs grid grid-cols-6 gap-2 border-b ${p.will_update?'bg-yellow-50 dark:bg-yellow-900/20':''}`}>
+                  <div key={p.id} className={`p-2 text-xs grid grid-cols-6 gap-2 border-b border-[var(--brand-card-border)] ${p.will_update?'bg-[color-mix(in_srgb,var(--brand-card-bg) 88%, #facc1515 12%)]':''}`}>
                     <span className={isViolation ? 'text-red-500' : ''}>{p.title}</span>
                     <span className={isViolation ? 'text-red-500' : ''}>{p.area||"—"}</span>
                     <span className={isViolation ? 'text-red-500' : ''}>{p.start_date||"—"}</span>

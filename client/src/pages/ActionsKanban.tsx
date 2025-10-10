@@ -235,16 +235,19 @@ export default function ActionsKanban(){
       )}
       <div className="grid md:grid-cols-3 gap-4">
         {COLUMNS.map(col=>(
-          <div key={col.key} onDragOver={onDragOver} onDrop={e=>onDrop(e, col.key)}
-               className="border rounded min-h-[320px] p-2 bg-gray-50 dark:bg-gray-900"
+          <div
+            key={col.key}
+            onDragOver={onDragOver}
+            onDrop={e=>onDrop(e, col.key)}
+            className="brand-card min-h-[320px] p-2"
                data-testid={`kanban-column-${col.key}`}>
-            <div className="text-sm font-medium mb-2 text-gray-700 dark:text-gray-300">{col.title}</div>
+            <div className="text-sm font-medium mb-2 text-[var(--text-muted)]">{col.title}</div>
             <div className="space-y-2">
               {filteredItems.filter(a=>a.status===col.key).map(a=>(
                 <div key={a.id} draggable onDragStart={e=>onDragStart(e, a.id)}
-                     className="border rounded p-3 bg-white dark:bg-gray-800 cursor-move hover:shadow-md transition-shadow"
+                     className="rounded-lg border border-[var(--brand-card-border)] bg-[var(--brand-card-bg)] p-3 cursor-move hover:shadow-md transition-shadow"
                      data-testid={`kanban-item-${a.id}`}>
-                  <div className="text-sm font-medium text-gray-900 dark:text-gray-100 mb-2">{a.title}</div>
+                  <div className="text-sm font-medium text-[var(--text-strong)] mb-2">{a.title}</div>
                   <div className="flex items-center justify-between">
                     <OwnerPicker
                       value={a.owner}

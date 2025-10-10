@@ -3,8 +3,10 @@ import { createRoot } from 'react-dom/client'
 import App from './App'
 import './index.css'
 import { applyBrandClass } from "@/lib/brand"
+import { initTheme } from "@/lib/theme"
 import GlobalErrorBoundary from "@/components/GlobalErrorBoundary"
 
+initTheme();
 applyBrandClass(); // ensure the brand-v2 class is on <html> before app renders
 
 // Development-only cache clearing to fix persistent UI caching issues

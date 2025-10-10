@@ -168,8 +168,8 @@ export default function StageWizard(){
         bullets={["Apply templates for common Workday patterns", "Add rows; Save creates project_stages entries", "Use Stage Editor to refine later"]}/>
       
       <div className="flex gap-2 items-center flex-wrap">
-        <select 
-          className="border border-gray-300 dark:border-gray-600 rounded p-2 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-blue-500" 
+        <select
+          className="teaim-input w-full sm:w-auto"
           onChange={e=>applyTemplate(e.target.value)}
           disabled={templatesLoading}
           data-testid="select-template"
@@ -187,10 +187,10 @@ export default function StageWizard(){
         </select>
         
         <div className="flex gap-2 items-center">
-          <label className="text-sm text-gray-700 dark:text-gray-300">Baseline Date:</label>
+          <label className="text-sm text-[var(--text-muted)]">Baseline Date:</label>
           <input
             type="date"
-            className="border border-gray-300 dark:border-gray-600 rounded p-2 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-blue-500"
+            className="teaim-input w-full sm:w-auto"
             value={baselineDate}
             onChange={e => setBaselineDate(e.target.value)}
             data-testid="input-baseline-date"
@@ -205,20 +205,20 @@ export default function StageWizard(){
           </button>
         </div>
       </div>
-      <div className="border border-gray-300 dark:border-gray-600 rounded divide-y divide-gray-200 dark:divide-gray-700 bg-white dark:bg-gray-800">
+      <div className="teaim-surface rounded-xl divide-y divide-[var(--brand-card-border)]">
         {rows.map((r,i)=>(
           <div key={i} className="grid md:grid-cols-5 gap-2 p-2">
-            <input 
-              className="border border-gray-300 dark:border-gray-600 rounded p-2 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-gray-500 dark:placeholder:text-gray-400 focus:ring-2 focus:ring-blue-500 focus:border-transparent" 
-              placeholder="Title" 
-              value={r.title} 
+            <input
+              className="teaim-input"
+              placeholder="Title"
+              value={r.title}
               onChange={e=>set(i,'title',e.target.value)}
               data-testid={`input-title-${i}`}
             />
-            <input 
-              className="border border-gray-300 dark:border-gray-600 rounded p-2 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-gray-500 dark:placeholder:text-gray-400 focus:ring-2 focus:ring-blue-500 focus:border-transparent" 
-              placeholder="Area" 
-              value={r.area} 
+            <input
+              className="teaim-input"
+              placeholder="Area"
+              value={r.area}
               onChange={e=>set(i,'area',e.target.value)}
               data-testid={`input-area-${i}`}
             />
@@ -227,14 +227,14 @@ export default function StageWizard(){
               const isInvalid = r.start_date && r.end_date && (dur < rails.min_days || dur > rails.max_days);
               return (
                 <div className="flex flex-col">
-                  <input 
-                    className={`border rounded p-2 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-gray-500 dark:placeholder:text-gray-400 focus:ring-2 focus:border-transparent ${
-                      isInvalid 
-                        ? 'border-red-500 dark:border-red-500 focus:ring-red-500' 
-                        : 'border-gray-300 dark:border-gray-600 focus:ring-blue-500'
+                  <input
+                    className={`teaim-input ${
+                      isInvalid
+                        ? 'border-red-500 focus-visible:ring-2 focus-visible:ring-red-500 focus-visible:ring-offset-0'
+                        : ''
                     }`}
-                    type="date" 
-                    value={r.start_date} 
+                    type="date"
+                    value={r.start_date}
                     onChange={e=>set(i,'start_date',e.target.value)}
                     data-testid={`input-start-date-${i}`}
                   />
@@ -252,14 +252,14 @@ export default function StageWizard(){
               const isInvalid = r.start_date && r.end_date && (dur < rails.min_days || dur > rails.max_days);
               return (
                 <div className="flex flex-col">
-                  <input 
-                    className={`border rounded p-2 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-gray-500 dark:placeholder:text-gray-400 focus:ring-2 focus:border-transparent ${
-                      isInvalid 
-                        ? 'border-red-500 dark:border-red-500 focus:ring-red-500' 
-                        : 'border-gray-300 dark:border-gray-600 focus:ring-blue-500'
+                  <input
+                    className={`teaim-input ${
+                      isInvalid
+                        ? 'border-red-500 focus-visible:ring-2 focus-visible:ring-red-500 focus-visible:ring-offset-0'
+                        : ''
                     }`}
-                    type="date" 
-                    value={r.end_date} 
+                    type="date"
+                    value={r.end_date}
                     onChange={e=>set(i,'end_date',e.target.value)}
                     data-testid={`input-end-date-${i}`}
                   />

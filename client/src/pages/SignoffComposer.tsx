@@ -260,23 +260,33 @@ export default function SignoffComposer(){
           </button>
         </div>
       </div>
-      <div className="border rounded p-3 bg-background">
+      <div className="brand-card p-3">
         <div className="text-sm mb-2">Preview</div>
-        <div 
-          className="prose prose-sm max-w-none" 
+        <div
+          className="prose prose-sm max-w-none"
           dangerouslySetInnerHTML={{__html: html}}
           data-testid="preview-content"
         />
       </div>
       {kapOpen && (
         <div className="fixed inset-0 bg-black/30 z-[80] flex items-center justify-center" onClick={()=>setKapOpen(false)}>
-          <div className="w-[580px] bg-white border rounded shadow-xl p-3" onClick={e=>e.stopPropagation()}>
+          <div className="w-[580px] brand-card shadow-xl p-3" onClick={e=>e.stopPropagation()}>
             <div className="text-sm font-medium mb-2">Generate Kap Draft</div>
-            <textarea className="w-full h-[120px] border rounded p-2 text-sm" placeholder="PM summary for this sign-off…" value={kapSummary} onChange={e=>setKapSummary(e.target.value)} />
-            <input className="border rounded p-2 w-full mt-2" placeholder="Bullets (separate with |)" value={kapBullets} onChange={e=>setKapBullets(e.target.value)} />
+            <textarea
+              className="teaim-input w-full h-[120px] resize-none text-sm"
+              placeholder="PM summary for this sign-off…"
+              value={kapSummary}
+              onChange={e=>setKapSummary(e.target.value)}
+            />
+            <input
+              className="teaim-input w-full mt-2"
+              placeholder="Bullets (separate with |)"
+              value={kapBullets}
+              onChange={e=>setKapBullets(e.target.value)}
+            />
             <div className="mt-2 flex gap-2">
-              <button className="px-3 py-2 border rounded" onClick={generateKap}>Generate</button>
-              <button className="px-3 py-2 border rounded" onClick={()=>setKapOpen(false)}>Cancel</button>
+              <button className="brand-btn text-sm" onClick={generateKap}>Generate</button>
+              <button className="k-btn text-sm" onClick={()=>setKapOpen(false)}>Cancel</button>
             </div>
           </div>
         </div>

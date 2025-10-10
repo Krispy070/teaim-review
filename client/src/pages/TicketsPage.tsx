@@ -122,7 +122,7 @@ export default function TicketsPage(){
             <h2 className="text-sm font-semibold mb-3">SLA Policies</h2>
             <div className="grid md:grid-cols-4 gap-3 mb-4">
               {PRIORITIES.map(pri=>(
-                <div key={pri} className="p-3 border rounded dark:border-slate-600 bg-white dark:bg-slate-800">
+                <div key={pri} className="brand-card p-3">
                   <div className="text-xs font-semibold mb-2 uppercase">{pri}</div>
                   <div className="space-y-2">
                     <div>

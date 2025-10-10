@@ -284,7 +284,10 @@ function ReleaseCard({projectId,rel,crs,onUpdate,sumCache,secondsLeft,bgRefreshi
     onUpdate();
   }
   return (
-    <div className="border rounded p-2 text-xs bg-white/5" data-testid={`release-card-${rel.id}`}>
+    <div
+      className="rounded-xl border border-[var(--brand-card-border)] bg-[var(--brand-card-bg)] p-2 text-xs text-[var(--text)] shadow-sm"
+      data-testid={`release-card-${rel.id}`}
+    >
       <div className="flex items-center gap-2">
         <div className="font-medium" data-testid={`release-name-${rel.id}`}>{rel.name}</div>
         <span className="align-middle">

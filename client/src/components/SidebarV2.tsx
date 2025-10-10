@@ -147,14 +147,13 @@ export default function SidebarV2(){
       {/* Insights */}
       <Group title="Insights" collapsed={collapsed}>
         <Item to={p("insights/timeline")} icon={Calendar} label="Timeline Events" collapsed={collapsed} />
-        <Item to={p("insights/actions")} icon={CheckSquare} label="Actions" collapsed={collapsed} />
         <Item to={p("insights/decisions")} icon={CheckSquare} label="Decisions" collapsed={collapsed} />
         <Item to={p("insights/tests")} icon={FlaskConical} label="Test Cases" collapsed={collapsed} />
       </Group>
 
       {/* Actions & Tasks */}
       <Group title="Actions & Tasks" collapsed={collapsed}>
-        <Item to={p("actions/list")} icon={CheckSquare} label="Actions" collapsed={collapsed} />
+        <Item to={p("insights/actions")} icon={CheckSquare} label="Actions" collapsed={collapsed} />
         <Item to={p("actions/kanban")} icon={PenTool} label="Actions Kanban" collapsed={collapsed} />
         <Item to={p("stages/manage")} icon={Calendar} label="Stages" collapsed={collapsed} />
         <Item to={p("stages/wizard")} icon={Box} label="Stage Wizard" collapsed={collapsed} />

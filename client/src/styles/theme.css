@@ -1,214 +1,168 @@
-/* TEAIM Theme – Dark Enterprise (v2.0) */
 :root {
-  /* Core surface & text */
-  --bg: 224 41% 7%;                /* #0B0F1A */
-  --surface: 222 36% 11%;          /* #121826 */
-  --surface-elevated: 222 30% 16%; /* #1A2333 */
-  --fg: 220 22% 92%;               /* #E6E9EF */
-  --muted: 217 11% 67%;            /* #A1A8B3 */
-  --panel: var(--surface);
-  --panel-contrast: var(--surface-elevated);
-  --panelc: var(--panel-contrast);
-  --border: 222 24% 20%;           /* #1F2633 */
+  color-scheme: light;
 
-  /* Brand palette */
-  --brand-charcoal: #0B0F1A;
-  --brand-surface: #121826;
-  --brand-orange: #FF9900;
-  --brand-yellow: #FFD166;
-  --brand-success: #3DD2A2;
-  --brand-warn: #FF9900;
-  --brand-error: #F25F5C;
-  --brand-white: #FFFFFF;
+  --brand-bg: #ffffff;
+  --brand-bg-dark: #111318;
+  --brand-surface: #f4f6fb;
+  --brand-surface-dark: #0d0f12;
+  --brand-surface-contrast: #e9edf5;
+  --brand-fg: #111318;
+  --brand-muted: #4b5563;
+  --brand-border: rgba(17, 19, 24, 0.08);
+  --brand-card-bg: #ffffff;
+  --brand-card-border: rgba(17, 19, 24, 0.12);
+  --brand-card-shadow: 0 18px 38px rgba(12, 18, 31, 0.08);
+  --brand-chip-border: rgba(17, 19, 24, 0.12);
+  --pill-accent: rgba(255, 122, 0, 0.16);
+  --pill-gold: rgba(255, 209, 102, 0.18);
+  --pill-success: rgba(61, 210, 162, 0.18);
+  --pill-warn: rgba(255, 122, 0, 0.2);
+  --pill-error: rgba(242, 95, 92, 0.18);
 
-  /* Actions */
-  --primary: 36 100% 50%;          /* #FF9900 */
-  --primary-fg: 224 41% 7%;        /* #0B0F1A */
-  --primary-hover: 36 100% 56%;    /* #FFA31A */
-  --accent: 42 100% 70%;           /* #FFD166 */
-  --accent-fg: 224 41% 7%;         /* #0B0F1A */
+  --accent: #ff7a00;
+  --accent-2: #ffd166;
+  --accent-foreground: #111318;
 
-  /* Status */
-  --success: 148 60% 44%;          /* Balanced green */
-  --warning: 36 100% 50%;          /* Warm orange */
-  --error: 5 80% 56%;              /* Alert red */
+  --background: var(--brand-bg);
+  --foreground: var(--brand-fg);
+  --card: var(--brand-card-bg);
+  --card-foreground: var(--brand-fg);
+  --popover: var(--brand-card-bg);
+  --popover-foreground: var(--brand-fg);
+  --secondary: var(--brand-surface);
+  --secondary-foreground: var(--brand-fg);
+  --muted: var(--brand-surface);
+  --muted-foreground: var(--brand-muted);
+  --destructive: #f25f5c;
+  --destructive-foreground: #ffffff;
+  --border: var(--brand-border);
+  --input: #ffffff;
+  --ring: rgba(255, 122, 0, 0.45);
+  --focus: rgba(255, 209, 102, 0.4);
+  --radius: 0.75rem;
 
-  /* TEAIM semantic tokens */
-  --teaim-primary: var(--primary);
-  --teaim-secondary: var(--accent);
-  --teaim-accent: var(--warning);
+  --ui-bg: var(--brand-bg);
+  --ui-panel: var(--brand-card-bg);
+  --ui-panel-2: var(--brand-surface);
+  --ui-border: var(--brand-border);
+  --ui-divider: rgba(17, 19, 24, 0.08);
 
-  /* Environment pills */
-  --env-dev-bg: 204 70% 45% / 0.22;
-  --env-dev-text: 204 80% 78%;
-  --env-dev-border: 204 70% 38%;
+  --text-strong: var(--brand-fg);
+  --text: var(--brand-fg);
+  --text-soft: rgba(17, 19, 24, 0.7);
+  --text-muted: rgba(17, 19, 24, 0.56);
+  --text-dim: rgba(17, 19, 24, 0.42);
 
-  --env-stage-bg: 36 100% 50% / 0.16;
-  --env-stage-text: 36 100% 70%;
-  --env-stage-border: 36 100% 40%;
+  --brand-orange: #ff7a00;
+  --brand-gold: #ffd166;
+  --brand-success: #3dd2a2;
+  --brand-warn: #ff7a00;
+  --brand-error: #f25f5c;
 
-  --env-prod-bg: 148 60% 44% / 0.18;
-  --env-prod-text: 148 55% 78%;
-  --env-prod-border: 148 55% 35%;
+  --success: #3dd2a2;
+  --warn: #ff7a00;
+  --error: #f25f5c;
 
-  /* Focus */
-  --focus: 36 100% 56%;
+  --teaim-primary: var(--accent);
+  --teaim-secondary: var(--accent-2);
+  --teaim-accent: var(--accent);
+
+  --chart-1: #ff7a00;
+  --chart-2: #ffd166;
+  --chart-3: #3dd2a2;
+  --chart-4: #5c7cfa;
+  --chart-5: #f25f5c;
+
+  --sidebar-background: var(--brand-surface);
+  --sidebar-foreground: var(--brand-fg);
+  --sidebar-primary: var(--accent);
+  --sidebar-primary-foreground: var(--accent-foreground);
+  --sidebar-accent: rgba(255, 122, 0, 0.14);
+  --sidebar-accent-foreground: var(--brand-fg);
+  --sidebar-border: var(--brand-border);
+  --sidebar-ring: rgba(255, 122, 0, 0.4);
+
+  --font-sans: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-serif: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'SFMono-Regular', Menlo, monospace;
 }
 
-[data-theme="light"] {
-  /* Optional light mode variant */
-  --bg: 220 24% 94%;
-  --surface: 220 18% 98%;
-  --surface-elevated: 220 16% 92%;
-  --fg: 220 24% 12%;
-  --muted: 220 12% 44%;
-  --panel: var(--surface);
-  --panel-contrast: var(--surface-elevated);
-  --panelc: var(--panel-contrast);
-  --border: 220 18% 82%;
+[data-theme="dark"], .dark {
+  color-scheme: dark;
 
-  --primary: 36 100% 50%;
-  --primary-fg: 224 41% 7%;
-  --primary-hover: 36 100% 56%;
-  --accent: 42 100% 62%;
-  --accent-fg: 224 41% 12%;
+  --brand-bg: var(--brand-bg-dark);
+  --brand-surface: var(--brand-surface-dark);
+  --brand-surface-contrast: #161920;
+  --brand-fg: #ffffff;
+  --brand-muted: #9aa3af;
+  --brand-border: rgba(255, 255, 255, 0.14);
+  --brand-card-bg: #050608;
+  --brand-card-border: rgba(255, 255, 255, 0.2);
+  --brand-card-shadow: 0 20px 42px rgba(0, 0, 0, 0.58);
+  --brand-chip-border: rgba(255, 255, 255, 0.24);
+  --pill-accent: rgba(255, 122, 0, 0.28);
+  --pill-gold: rgba(255, 209, 102, 0.26);
+  --pill-success: rgba(61, 210, 162, 0.26);
+  --pill-warn: rgba(255, 122, 0, 0.32);
+  --pill-error: rgba(242, 95, 92, 0.3);
 
-  --success: 147 53% 42%;
-  --warning: 36 100% 50%;
-  --error: 4 75% 53%;
-}
+  --background: var(--brand-bg);
+  --foreground: var(--brand-fg);
+  --card: var(--brand-card-bg);
+  --card-foreground: var(--brand-fg);
+  --popover: #14171e;
+  --popover-foreground: var(--brand-fg);
+  --secondary: #161920;
+  --secondary-foreground: var(--brand-fg);
+  --muted: #161920;
+  --muted-foreground: var(--brand-muted);
+  --accent-foreground: #111318;
+  --destructive: #f25f5c;
+  --destructive-foreground: #0d0f12;
+  --border: var(--brand-border);
+  --input: #050608;
+  --ring: rgba(255, 122, 0, 0.58);
+  --focus: rgba(255, 209, 102, 0.5);
 
-/* Utility tokens derived from vars */
-:root, [data-theme="dark"] {
-  --ring: var(--focus);
-}
+  --ui-bg: var(--brand-bg);
+  --ui-panel: var(--brand-card-bg);
+  --ui-panel-2: #13161c;
+  --ui-border: var(--brand-border);
+  --ui-divider: rgba(255, 255, 255, 0.12);
 
-/* Map Tailwind-style tokens to CSS variables for consistency */
-.bg-bg { background-color: hsl(var(--bg)); }
-.text-fg { color: hsl(var(--fg)); }
-.text-muted { color: hsl(var(--muted)); }
-.bg-panel { background-color: hsl(var(--panel)); }
-.bg-panelc { background-color: hsl(var(--panelc)); }
-.border-border { border-color: hsl(var(--border)); }
-.bg-primary { background-color: hsl(var(--primary)); }
-.text-primary-fg { color: hsl(var(--primary-fg)); }
-.hover\:bg-primary-hover:hover { background-color: hsl(var(--primary-hover)); }
-.bg-success { background-color: hsl(var(--success)); }
-.text-success { color: hsl(var(--success)); }
-.bg-warning { background-color: hsl(var(--warning)); }
-.text-warning { color: hsl(var(--warning)); }
-.bg-error { background-color: hsl(var(--error)); }
-.text-error { color: hsl(var(--error)); }
-.text-brand-orange { color: hsl(var(--brand-orange)); }
+  --text-strong: var(--brand-fg);
+  --text: var(--brand-fg);
+  --text-soft: rgba(255, 255, 255, 0.82);
+  --text-muted: var(--brand-muted);
+  --text-dim: rgba(255, 255, 255, 0.5);
 
-/* Optional: default body styles */
-html, body { 
-  background: hsl(var(--bg)); 
-  color: hsl(var(--fg)); 
-}
+  --brand-orange: #ff7a00;
+  --brand-gold: #ffd166;
+  --brand-success: #3dd2a2;
+  --brand-warn: #ff7a00;
+  --brand-error: #f25f5c;
 
-/* ==== Beta Perks tiles ==== */
-.perk-grid{
-  display:grid; gap:12px;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-}
-.perk-tile{
-  position:relative; border:1px solid var(--border); background:var(--panel);
-  border-radius:16px; padding:14px;
-  transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease;
-}
-.perk-tile:hover{
-  transform: translateY(-2px);
-  border-color: var(--brand-orange);
-  box-shadow: 0 10px 24px rgba(242,107,29,.09);
-}
-.perk-icon{
-  display:inline-flex; align-items:center; justify-content:center;
-  width:28px; height:28px; border-radius:8px;
-  background: rgba(242,107,29,.12); color: var(--brand-orange);
-  transition: transform .18s ease;
-}
-.perk-tile:hover .perk-icon{ transform: scale(1.06); }
+  --success: #3dd2a2;
+  --warn: #ff7a00;
+  --error: #f25f5c;
 
-/* Hover spark pop */
-.perk-tile::after{
-  content:''; position:absolute; inset:auto auto 12px 12px; width:10px; height:10px; border-radius:9999px;
-  opacity:0; pointer-events:none;
-  background: radial-gradient(circle, rgba(255,201,51,.95), rgba(242,107,29,.9) 60%, rgba(242,107,29,0) 70%);
-  filter: blur(.3px);
-}
-.perk-tile:hover::after{ animation: spark-pop .6s ease forwards; }
-@keyframes spark-pop{
-  0%{opacity:0; transform: scale(.4) translateY(6px)}
-  40%{opacity:.9; transform: scale(1) translateY(-2px)}
-  100%{opacity:0; transform: scale(1.4) translateY(-10px)}
+  --sidebar-background: var(--brand-card-bg);
+  --sidebar-foreground: var(--brand-fg);
+  --sidebar-primary: var(--accent);
+  --sidebar-primary-foreground: #111318;
+  --sidebar-accent: rgba(255, 122, 0, 0.24);
+  --sidebar-accent-foreground: var(--brand-fg);
+  --sidebar-border: rgba(255, 255, 255, 0.18);
+  --sidebar-ring: rgba(255, 122, 0, 0.5);
 }
 
-/* Optional CTA pulse (use on click) */
-@keyframes pulseOrange {0%{box-shadow:0 0 0 0 rgba(242,107,29,.45)} 100%{box-shadow:0 0 0 14px rgba(242,107,29,0)}}
-.pulse-once { animation: pulseOrange .7s ease-out 1; }
-
-/* ==== Hover burst sparks (tiny, classy) ==== */
-.burst {
-  position: absolute; inset: 0; pointer-events: none; overflow: hidden;
-}
-@media (prefers-reduced-motion: no-preference) {
-  .burst-spark {
-    position: absolute; width: 10px; height: 10px; border-radius: 9999px;
-    background: radial-gradient(circle, rgba(255,201,51,.95), rgba(242,107,29,.9) 60%, rgba(242,107,29,0) 70%);
-    filter: blur(.25px); opacity: 0;
-    animation: burst-pop .7s ease-out forwards;
-    mix-blend-mode: screen;
-  }
-  @keyframes burst-pop {
-    0%   { opacity: 0; transform: translate3d(0,0,0) scale(.4); }
-    30%  { opacity: .95; transform: translate3d(var(--dx,6px), var(--dy,-8px), 0) scale(1); }
-    100% { opacity: 0; transform: translate3d(calc(var(--dx,6px) * 2), calc(var(--dy,-8px) * 2), 0) scale(1.4); }
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .burst-spark { display: none; }
+body {
+  background: var(--brand-bg);
+  color: var(--brand-fg);
 }
 
-/* helper for orange emphasis in text */
-.emph { color: var(--brand-orange); }
-
-/* ==== Top Features tiles (same vibe as perks) ==== */
-.feature-grid{
-  display: grid;
-  gap: 14px;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-}
-
-.feature-tile{
-  position: relative;
-  border: 1px solid var(--border);
-  background: var(--panel);
-  border-radius: 16px;
-  padding: 16px 16px 18px;
-  transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease;
-}
-.feature-tile:hover{
-  transform: translateY(-2px);
-  border-color: var(--brand-orange);
-  box-shadow: 0 12px 26px rgba(242,107,29,.09);
-}
-.feature-icon{
-  display:inline-flex; align-items:center; justify-content:center;
-  width: 34px; height: 34px; border-radius: 10px;
-  background: rgba(242,107,29,.12);
-  color: var(--brand-orange);
-  font-size: 18px;
-  margin-bottom: 8px;
-  transition: transform .18s ease;
-}
-.feature-tile:hover .feature-icon{ transform: scale(1.06); }
-
-/* small orange keyline on top edge for definition */
-.feature-tile::before{
-  content: '';
-  position: absolute; left: 10px; right: 10px; top: 8px; height: 2px;
-  border-radius: 2px;
-  background: linear-gradient(90deg, #FFC933 0%, #F26B1D 100%);
-  opacity: .25;
+[data-theme="dark"] body,
+.dark body {
+  background: var(--brand-bg);
+  color: var(--brand-fg);
 }
