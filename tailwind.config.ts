@@ -12,69 +12,69 @@ export default {
       },
       colors: {
         // TEAIM semantic theme tokens (HSL format for opacity support)
-        bg:            'hsl(var(--bg))',
-        fg:            'hsl(var(--fg))',
-        muted:         'hsl(var(--muted))',
-        panel:         'hsl(var(--panel))',
-        panelc:        'hsl(var(--panel-contrast))',
-        border:        'hsl(var(--border))',
+        bg:            'hsl(var(--bg, 224 41% 7%))',
+        fg:            'hsl(var(--fg, 220 22% 92%))',
+        muted:         'hsl(var(--muted, 217 11% 67%))',
+        panel:         'hsl(var(--panel, 222 36% 11%))',
+        panelc:        'hsl(var(--panel-contrast, 222 30% 16%))',
+        border:        'hsl(var(--border, 222 24% 20%))',
 
         // TEAIM specific theme tokens (HSL format for opacity support)
-        'teaim-primary':       'hsl(var(--teaim-primary))',
-        'teaim-secondary':     'hsl(var(--teaim-secondary))',
-        'teaim-accent':        'hsl(var(--teaim-accent))',
+        'teaim-primary':       'hsl(var(--teaim-primary, 36 100% 50%))',
+        'teaim-secondary':     'hsl(var(--teaim-secondary, 42 100% 70%))',
+        'teaim-accent':        'hsl(var(--teaim-accent, 36 100% 50%))',
 
         // Status colors (HSL format for opacity support)
-        success:       'hsl(var(--success))',
-        warning:       'hsl(var(--warning))',
-        error:         'hsl(var(--error))',
+        success:       'hsl(var(--success, 148 60% 44%))',
+        warning:       'hsl(var(--warning, 36 100% 50%))',
+        error:         'hsl(var(--error, 5 80% 56%))',
 
         // Raw brand tokens (HSL format for opacity support)
         brand: {
-          charcoal: 'hsl(var(--brand-charcoal))',
-          orange:   'hsl(var(--brand-orange))',
-          yellow:   'hsl(var(--brand-yellow))',
+          charcoal: 'var(--brand-charcoal, #0b0f1a)',
+          orange:   'var(--brand-orange, #ff9900)',
+          yellow:   'var(--brand-yellow, #ffd166)',
         },
 
         // Keep existing shadcn tokens for compatibility
-        background: "var(--background)",
-        foreground: "var(--foreground)",
+        background: "var(--background, #0b0f1a)",
+        foreground: "var(--foreground, #e6e9ef)",
         primary: {
-          DEFAULT: "hsl(var(--primary))",
-          foreground: "hsl(var(--primary-fg))",
+          DEFAULT: "hsl(var(--primary, 36 100% 50%))",
+          foreground: "hsl(var(--primary-fg, 224 41% 7%))",
         },
         card: {
-          DEFAULT: "var(--card)",
-          foreground: "var(--card-foreground)",
+          DEFAULT: "var(--card, #121826)",
+          foreground: "var(--card-foreground, #e6e9ef)",
         },
         popover: {
-          DEFAULT: "var(--popover)",
-          foreground: "var(--popover-foreground)",
+          DEFAULT: "var(--popover, #1a2333)",
+          foreground: "var(--popover-foreground, #e6e9ef)",
         },
         secondary: {
-          DEFAULT: "var(--secondary)",
-          foreground: "var(--secondary-foreground)",
+          DEFAULT: "var(--secondary, #1a2333)",
+          foreground: "var(--secondary-foreground, #e6e9ef)",
         },
         muted: {
-          DEFAULT: "var(--muted)",
-          foreground: "var(--muted-foreground)",
+          DEFAULT: "var(--muted, #1a2333)",
+          foreground: "var(--muted-foreground, #a1a8b3)",
         },
         accent: {
-          DEFAULT: "var(--accent)",
-          foreground: "var(--accent-foreground)",
+          DEFAULT: "hsl(var(--accent, 42 100% 70%))",
+          foreground: "hsl(var(--accent-foreground, 224 41% 7%))",
         },
         destructive: {
-          DEFAULT: "var(--destructive)",
-          foreground: "var(--destructive-foreground)",
+          DEFAULT: "var(--destructive, #f25f5c)",
+          foreground: "var(--destructive-foreground, #0b0f1a)",
         },
-        input: "var(--input)",
-        ring: "var(--ring)",
+        input: "var(--input, #1a2333)",
+        ring: "var(--ring, rgba(255, 153, 0, 0.45))",
         chart: {
-          "1": "var(--chart-1)",
-          "2": "var(--chart-2)",
-          "3": "var(--chart-3)",
-          "4": "var(--chart-4)",
-          "5": "var(--chart-5)",
+          "1": "var(--chart-1, #ff9900)",
+          "2": "var(--chart-2, #ffd166)",
+          "3": "var(--chart-3, #3dd2a2)",
+          "4": "var(--chart-4, #5c7cfa)",
+          "5": "var(--chart-5, #f25f5c)",
         },
         sidebar: {
           DEFAULT: "var(--sidebar-background)",

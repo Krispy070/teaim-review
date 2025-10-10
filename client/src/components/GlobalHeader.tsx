@@ -55,7 +55,7 @@ export default function GlobalHeader({ className = "" }: GlobalHeaderProps) {
           {presence}
           <header
             className={cn(
-              "brand-surface header sticky top-0 z-50 w-full border-b border-border bg-background/95 backdrop-blur",
+              "brand-surface header sticky top-0 z-50 w-full border-b border-border bg-[var(--brand-surface)]",
               className
             )}
           >
@@ -98,12 +98,16 @@ export default function GlobalHeader({ className = "" }: GlobalHeaderProps) {
         <BrandTheme projectId={projectId} />
         <header
           className={cn(
-            "brand-surface header sticky top-0 z-50 w-full border-b border-border bg-background/95 backdrop-blur",
+            "brand-surface header sticky top-0 z-50 w-full border-b border-border bg-[var(--brand-surface)]",
             className
           )}
         >
           <div className="mx-auto flex h-16 max-w-[1320px] items-center justify-between gap-4 px-4">
-            <a href="/" className="flex items-center gap-2 shrink-0" aria-label="TEAIM home">
+            <a
+              href={projectId ? `/projects/${projectId}/dashboard` : "/"}
+              className="flex items-center gap-2 shrink-0"
+              aria-label="TEAIM home"
+            >
               <img src="/teaim-logo.svg" alt="TEAIM" className="h-6 md:h-7" />
             </a>
 
@@ -158,7 +162,7 @@ export default function GlobalHeader({ className = "" }: GlobalHeaderProps) {
       {presence}
       <header
         className={cn(
-          "brand-surface sticky top-0 z-40 w-full border-b border-border bg-background/95 backdrop-blur",
+          "brand-surface sticky top-0 z-40 w-full border-b border-border bg-[var(--brand-surface)]",
           className
         )}
       >
