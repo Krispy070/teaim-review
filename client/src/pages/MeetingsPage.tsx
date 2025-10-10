@@ -1,5 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
-import SidebarV2 from "@/components/SidebarV2";
 import { getProjectId } from "@/lib/project";
 import { fetchWithAuth } from "@/lib/supabase";
 import { useEffect, useState } from "react";
@@ -43,7 +41,7 @@ export default function MeetingsPage() {
   }
 
   return (
-    <AppFrame sidebar={<SidebarV2 />}>
+    
       <div className="p-6 space-y-4">
         <div className="flex items-center justify-between">
           <h1 className="text-2xl font-semibold">Meetings</h1>
@@ -164,6 +162,6 @@ export default function MeetingsPage() {
           </table>
         </section>
       </div>
-    </AppFrame>
+    
   );
 }

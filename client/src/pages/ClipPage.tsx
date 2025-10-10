@@ -1,4 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
 import { getProjectId } from "@/lib/project";
 import { fetchWithAuth } from "@/lib/supabase";
 import { useState, useEffect } from "react";
@@ -51,7 +50,7 @@ export default function ClipPage(){
   }
 
   return (
-    <AppFrame>
+    
       <div className="p-6 space-y-6 max-w-3xl">
         <h1 className="text-2xl font-semibold" data-testid="text-page-title">Clip a Conversation</h1>
         
@@ -130,7 +129,7 @@ export default function ClipPage(){
           )}
         </div>
       </div>
-    </AppFrame>
+    
   );
 }
 

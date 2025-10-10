@@ -1,5 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
-import SidebarV2 from "@/components/SidebarV2";
 import { fetchWithAuth } from "@/lib/supabase";
 import { getProjectId } from "@/lib/project";
 import { useEffect, useState } from "react";
@@ -27,7 +25,7 @@ export default function TenantSnapshotsPage(){
   }
 
   return (
-    <AppFrame sidebar={<SidebarV2 />}>
+    
       <div className="p-6 space-y-4">
         <h1 className="text-2xl font-semibold" data-testid="heading-snapshots">Tenant Snapshots</h1>
         <div className="flex items-center gap-2">
@@ -68,6 +66,6 @@ export default function TenantSnapshotsPage(){
           </div>
         )}
       </div>
-    </AppFrame>
+    
   );
 }

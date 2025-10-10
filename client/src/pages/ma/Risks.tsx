@@ -1,5 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
-import SidebarV2 from "@/components/SidebarV2";
 import { getProjectId } from "@/lib/project";
 import { authFetch } from "@/lib/authFetch";
 import { useEffect, useState } from "react";
@@ -36,7 +34,6 @@ export default function MARisks() {
   });
 
   return (
-    <AppFrame sidebar={<SidebarV2/>}>
       <div className="p-6 space-y-4">
         <div className="flex items-center justify-between">
           <h1 className="text-2xl font-semibold">Risks</h1>
@@ -119,6 +116,5 @@ export default function MARisks() {
           {!filtered.length && <li className="opacity-70 text-sm">No risks in this bucket.</li>}
         </ul>
       </div>
-    </AppFrame>
   );
 }

@@ -1,4 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
 import { getProjectId } from "@/lib/project";
 import { authFetch } from "@/lib/authFetch";
 import { useEffect, useState } from "react";
@@ -40,7 +39,7 @@ export default function MALessons() {
   }
 
   return (
-    <AppFrame>
+    
       <div className="p-6 space-y-4">
         <h1 className="text-2xl font-semibold">Lessons Learned</h1>
         <div className="space-y-2">
@@ -86,6 +85,6 @@ export default function MALessons() {
           {!items.length && <li className="opacity-70 text-sm">No lessons yet.</li>}
         </ul>
       </div>
-    </AppFrame>
+    
   );
 }

@@ -1,5 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
-import SidebarV2 from "@/components/SidebarV2";
 import { authFetch } from "@/lib/authFetch";
 import { getProjectId, ensureProjectPath } from "@/lib/project";
 import { useEffect, useState } from "react";
@@ -34,7 +32,7 @@ export default function GlobalSearchPage() {
   }, [page]);
 
   return (
-    <AppFrame sidebar={<SidebarV2 />}>
+    
       <div className="p-6 space-y-4">
         <h1 className="text-2xl font-semibold">Search</h1>
         <div className="flex items-center gap-2">
@@ -155,7 +153,7 @@ export default function GlobalSearchPage() {
           </div>
         )}
       </div>
-    </AppFrame>
+    
   );
 }
 

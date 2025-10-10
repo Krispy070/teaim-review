@@ -1,5 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
-import SidebarV2 from "@/components/SidebarV2";
 import { getProjectId } from "@/lib/project";
 import { authFetch } from "@/lib/authFetch";
 import { useEffect, useState, useRef } from "react";
@@ -53,7 +51,7 @@ export default function MAIntegrations() {
   }
 
   return (
-    <AppFrame sidebar={<SidebarV2/>}>
+    <>
       <div className="p-6 space-y-4">
         <div className="flex items-center justify-between">
           <h1 className="text-2xl font-semibold">Integrations</h1>
@@ -70,7 +68,7 @@ export default function MAIntegrations() {
         {tab==="graph" && summary && <Graph summary={summary} />}
       </div>
       <DetailDrawer id={detailId} onClose={()=>setDetailId(null)} allItems={items} onPatched={reload} readonly={readonly} />
-    </AppFrame>
+    </>
   );
 }
 

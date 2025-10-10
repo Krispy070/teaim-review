@@ -1,5 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
-import SidebarV2 from "@/components/SidebarV2";
 import { getProjectId } from "@/lib/project";
 import { fetchWithAuth } from "@/lib/supabase";
 import OriginBadge from "@/components/OriginBadge";
@@ -27,7 +25,6 @@ export default function DecisionsInsights(){
   const exportUrl = `/api/insights/decisions/export.csv?projectId=${encodeURIComponent(pid!)}${q?`&q=${encodeURIComponent(q)}`:""}${otype?`&originType=${encodeURIComponent(otype)}`:""}`;
 
   return (
-    <AppFrame sidebar={<SidebarV2 />}>
       <div className="p-6 space-y-4">
         <div className="flex items-center justify-between">
           <h1 className="text-2xl font-semibold" data-testid="heading-decisions">Decisions</h1>
@@ -79,6 +76,5 @@ export default function DecisionsInsights(){
           <button data-testid="button-next-page" className="text-xs px-2 py-1 border rounded hover:bg-slate-800/50" onClick={()=>setPage(p=>p+1)}>Next</button>
         </div>
       </div>
-    </AppFrame>
   );
 }

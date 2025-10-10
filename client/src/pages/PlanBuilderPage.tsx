@@ -1,5 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
-import SidebarV2 from "@/components/SidebarV2";
 import { getProjectId, ensureProjectPath } from "@/lib/project";
 import { useQuery } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
@@ -121,7 +119,7 @@ export default function PlanBuilderPage(){
   }
 
   return (
-    <AppFrame sidebar={<SidebarV2 />}>
+    
       <div className="p-6 space-y-4">
         <div className="flex items-center justify-between">
           <h1 className="text-2xl font-semibold" data-testid="heading-plan-builder">Project Plan</h1>
@@ -495,7 +493,7 @@ export default function PlanBuilderPage(){
           </div>
         </div>
       )}
-    </AppFrame>
+    
   );
 
   async function save(body:any){

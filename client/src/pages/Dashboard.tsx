@@ -1,5 +1,3 @@
-import { AppFrame } from "../components/layout/AppFrame";
-import SidebarV2 from "../components/SidebarV2";
 import { Card } from "../components/ui/Card";
 import { Kpi } from "../components/ui/Kpi";
 import { Button } from "../components/ui/Button";
@@ -10,7 +8,7 @@ import { GovernancePanel } from "../components/GovernancePanel";
 
 export default function DashboardPage() {
   return (
-    <AppFrame sidebar={<SidebarV2/>}>
+    <>
       {/* KPIs */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
         <Kpi label="Risks Open" value="3" tone="error"/>
@@ -66,6 +64,6 @@ export default function DashboardPage() {
         </Card>
         <GovernancePanel />
       </div>
-    </AppFrame>
+    </>
   );
 }

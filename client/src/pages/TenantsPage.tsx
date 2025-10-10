@@ -1,5 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
-import SidebarV2 from "@/components/SidebarV2";
 import { getProjectId } from "@/lib/project";
 import { useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
@@ -82,16 +80,16 @@ export default function TenantsPage(){
 
   if (tenantsLoading || migsLoading || asofLoading) {
     return (
-      <AppFrame sidebar={<SidebarV2 />}>
+      
         <div className="flex items-center justify-center p-8">
           <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
         </div>
-      </AppFrame>
+      
     );
   }
 
   return (
-    <AppFrame sidebar={<SidebarV2 />}>
+    
       <div className="p-6 space-y-6">
         <div className="flex items-center justify-between">
           <h1 className="text-2xl font-semibold" data-testid="heading-tenants">Tenants & Migrations</h1>
@@ -119,7 +117,7 @@ export default function TenantsPage(){
           <AsOfGrid items={asof} tenants={tenants} onSave={(row) => asofMutation.mutate(row)} isPending={asofMutation.isPending} />
         </section>
       </div>
-    </AppFrame>
+    
   );
 }
 

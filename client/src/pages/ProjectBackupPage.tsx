@@ -1,5 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
-import SidebarV2 from "@/components/SidebarV2";
 import Guard from "@/components/Guard";
 import { getProjectId } from "@/lib/project";
 import { fetchWithAuth } from "@/lib/supabase";
@@ -94,7 +92,7 @@ function ProjectBackupPageInner(){
   }
 
   return (
-    <AppFrame sidebar={<SidebarV2 />}>
+    
       <div className="p-6 space-y-6 max-w-3xl">
         <h1 className="text-2xl font-semibold" data-testid="heading-backup">Project Backup</h1>
 
@@ -164,6 +162,6 @@ function ProjectBackupPageInner(){
           </div>
         </section>
       </div>
-    </AppFrame>
+    
   );
 }

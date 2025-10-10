@@ -1,5 +1,3 @@
-import { AppFrame } from "@/components/layout/AppFrame";
-import SidebarV2 from "@/components/SidebarV2";
 import { getProjectId } from "@/lib/project";
 import { fetchWithAuth } from "@/lib/supabase";
 import { useEffect, useState } from "react";
@@ -86,7 +84,7 @@ export default function ReleaseTestsPage() {
   const reqCount = items.filter(t=>t.isRequired).length;
 
   return (
-    <AppFrame sidebar={<SidebarV2 />}>
+    
       <div className="p-6 space-y-3">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -308,6 +306,6 @@ export default function ReleaseTestsPage() {
           </table>
         </div>
       </div>
-    </AppFrame>
+    
   );
 }
